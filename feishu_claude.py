@@ -403,8 +403,27 @@ def main():
         time.sleep(5 if pending else current_interval)
 
 
+PID_FILE = os.path.expanduser("~/run/feishu_bot/run.pid")
+
+
+def write_pid():
+    os.makedirs(os.path.dirname(PID_FILE), exist_ok=True)
+    with open(PID_FILE, "w") as f:
+        f.write(str(os.getpid()))
+
+
+def remove_pid():
+    try:
+        os.remove(PID_FILE)
+    except FileNotFoundError:
+        pass
+
+
 if __name__ == "__main__":
+    write_pid()
     try:
         main()
     except KeyboardInterrupt:
         print("\n[feishu-claude-bot] stopped")
+    finally:
+        remove_pid()
