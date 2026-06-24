@@ -329,6 +329,32 @@ def main():
                         reply_message(token, msg["id"], build_sessions_prompt(dir_name, data["list"], data["current"]))
                     continue
 
+                if text.lower() == "/help":
+                    reply_message(token, msg["id"], "\n".join([
+                        "可用命令：",
+                        "/ls        — 列出工作目录，回复序号切换",
+                        "/sessions  — 列出当前目录的对话，回复序号切换",
+                        "/new       — 新建对话（清空历史）",
+                        "/name <名称> — 重命名当前对话",
+                        "/permit    — 开关当前目录写文件/执行命令权限",
+                        "/retry     — 用当前权限重跑上一条任务",
+                        "/help      — 显示此帮助",
+                    ]))
+                    continue
+
+                if text.lower().startswith("/name "):
+                    new_label = text[6:].strip()
+                    if new_label:
+                        data = dir_sessions.get(dir_name)
+                        if data and data["list"]:
+                            data["list"][data["current"]]["label"] = new_label
+                            reply_message(token, msg["id"], f"当前对话已命名为「{new_label}」")
+                        else:
+                            reply_message(token, msg["id"], "当前没有活跃的对话")
+                    else:
+                        reply_message(token, msg["id"], "用法：/name <名称>")
+                    continue
+
                 if text.lower() == "/new":
                     data = dir_sessions.setdefault(dir_name, {"list": [], "current": 0, "history": []})
                     data["list"].append(new_session_entry())
