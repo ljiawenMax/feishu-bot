@@ -53,12 +53,20 @@ def _human(n):
         f /= 1024
 
 
+def _safe_chat(chat_id):
+    return _SAFE_RE.sub("_", (chat_id or "unknown"))[:64] or "unknown"
+
+
+def chat_dir(chat_id):
+    """返回某 chat 的上传目录路径（不创建），供 --add-dir 等只读用途。"""
+    return os.path.join(UPLOAD_ROOT, _safe_chat(chat_id))
+
+
 def _ensure_dir(chat_id):
     """建 root/<chat_id> 目录并显式 chmod 700（规避 umask）。"""
-    safe_chat = _SAFE_RE.sub("_", (chat_id or "unknown"))[:64] or "unknown"
     os.makedirs(UPLOAD_ROOT, exist_ok=True)
     os.chmod(UPLOAD_ROOT, 0o700)
-    d = os.path.join(UPLOAD_ROOT, safe_chat)
+    d = chat_dir(chat_id)
     os.makedirs(d, exist_ok=True)
     os.chmod(d, 0o700)
     return d

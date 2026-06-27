@@ -19,10 +19,13 @@ def build_task_with_history(task, history):
     return "\n".join(lines)
 
 
-def run_claude(task, work_dir, timeout, session_id=None, skip_permissions=False, history=None):
+def run_claude(task, work_dir, timeout, session_id=None, permit=False, extra_dirs=None, history=None):
     cmd = ["claude", "-p", task, "--output-format", "stream-json", "--verbose"]
-    if skip_permissions:
-        cmd.append("--dangerously-skip-permissions")
+    # permit 开启 = acceptEdits：可在工作区（cwd + extra_dirs）内读写/改文件，但不执行任意命令
+    if permit:
+        cmd += ["--permission-mode", "acceptEdits"]
+    for d in (extra_dirs or []):
+        cmd += ["--add-dir", d]
     if session_id:
         cmd += ["--resume", session_id]
 
@@ -55,7 +58,7 @@ def run_claude(task, work_dir, timeout, session_id=None, skip_permissions=False,
                 if session_id and any("No conversation found" in e for e in errors):
                     print(f"[warn] session {session_id[:8]}… expired, rebuilding context")
                     recovered_task = build_task_with_history(task, history or [])
-                    return run_claude(recovered_task, work_dir, timeout, session_id=None, skip_permissions=skip_permissions)
+                    return run_claude(recovered_task, work_dir, timeout, session_id=None, permit=permit, extra_dirs=extra_dirs)
                 return f"[error] {'; '.join(errors) or 'unknown error'}", None
             new_session_id = event.get("session_id")
             result = event.get("result") or "".join(text_parts).strip()
@@ -64,7 +67,7 @@ def run_claude(task, work_dir, timeout, session_id=None, skip_permissions=False,
                 if session_id:
                     print(f"[warn] session {session_id[:8]}… returned empty, retrying fresh")
                     recovered_task = build_task_with_history(task, history or [])
-                    return run_claude(recovered_task, work_dir, timeout, session_id=None, skip_permissions=skip_permissions)
+                    return run_claude(recovered_task, work_dir, timeout, session_id=None, permit=permit, extra_dirs=extra_dirs)
                 return "(no output)", new_session_id
             if timed_out:
                 result += f"\n\n[超时（>{timeout}s），响应可能不完整]"

@@ -103,7 +103,7 @@ tail -f ~/run/log/feishu-bot-local.log
 | `/new` | 在当前目录新建一个对话（清空上下文） |
 | `/name <名称>` | 重命名当前对话 |
 | `/del <序号>` | 删除指定对话（序号见 `/sessions`），同时删除磁盘上的 Claude session 文件 |
-| `/permit` | 开关当前目录的写文件/执行命令权限（对应 `--dangerously-skip-permissions`） |
+| `/permit` | 开关当前目录的文件读写权限（`acceptEdits`，限定当前目录，不执行命令） |
 | `/retry` | 用当前权限重跑上一条任务 |
 
 非命令消息直接作为任务交给 Claude Code 执行。
@@ -116,7 +116,7 @@ tail -f ~/run/log/feishu-bot-local.log
 - **最小权限**：目录 `700`、文件 `600`，**绝不加执行位**；文件名消毒（只取 basename + 白名单字符 + 唯一前缀）防路径穿越；大小上限 50MB（`uploads.py` 的 `MAX_UPLOAD_BYTES` 可调）
 - **不自动解压**压缩包（避免 zip 炸弹 / zip-slip），bot 只存不跑
 - 每次上传记一行到 `uploads` 表（台账，独立于会话）
-- **如何分析**：想让 Claude 处理上传的文件，发一条任务引用回复里的路径（如「解压并看看 /path/xxx.zip」），需先 `/permit` 开权限——执行闸门在你手里
+- **如何分析**：发一条任务引用回复里的路径（如「看看 /path/xxx.jpg」）。该聊天的上传目录始终经 `--add-dir` 纳入 Claude 工作区，所以**只读分析无需 `/permit`**；若要让 Claude 据此**改写文件**，再开 `/permit`（仍不会执行命令）
 - 暂不支持的消息类型（表情/位置/合并转发等）会被忽略
 
 ## Session 持久化与对话历史
@@ -155,7 +155,12 @@ ORDER BY id DESC LIMIT 20;
 
 ## 权限模式
 
-默认情况下 Claude Code 以只读方式运行（不传 `--dangerously-skip-permissions`）。发送 `/permit` 开启写文件/执行命令权限，再次发送 `/permit` 关闭。权限模式按目录独立记录。
+权限按目录独立记录（`/permit` 切换当前目录），分两档：
+
+- **关（默认）**：Claude Code `default` 模式，只读——能读当前 work_dir 与该聊天上传目录里的文件，但不能写、不能执行命令
+- **开**：`--permission-mode acceptEdits`——可在**当前 work_dir 与该聊天上传目录内**新建/修改文件（Write+Edit 都放行），但**仍不能执行任意命令**
+
+设计要点：Claude Code 能把文件操作限定在工作区（cwd + `--add-dir`），但无法把 shell 命令限定在目录（命令以系统用户身份运行）。因此本项目**不再使用** `--dangerously-skip-permissions`（会放开整个文件系统与命令执行），`/permit` 最高只到 `acceptEdits`——文件操作锁在当前目录、永不执行任意命令。该聊天上传目录始终经 `--add-dir` 纳入工作区，便于读取上传文件分析。
 
 ## 自适应轮询与休眠恢复
 
