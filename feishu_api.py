@@ -75,10 +75,37 @@ def fetch_new_messages(token, chat_id, since_ts):
             parsed = _parse_file_message(msg_type, content)
             if parsed:
                 messages.append({**base, **parsed})
-        # 其余类型（sticker/location/post 等）暂不支持
+        elif msg_type == "post":
+            text, images = _parse_post(content)
+            if text or images:
+                messages.append({**base, "kind": "post", "text": text, "images": images})
+        # 其余类型（sticker/location 等）暂不支持
         else:
             print(f"[skip] 暂不支持的消息类型: {msg_type}")
     return messages
+
+
+def _parse_post(content):
+    """解析富文本 post：返回 (拼接的文字, [image_key, ...])。
+    post content 形如 {"title": "..", "content": [[{tag,text/image_key,...}, ...], ...]}"""
+    texts, images = [], []
+    title = content.get("title") if isinstance(content, dict) else None
+    if title:
+        texts.append(title)
+    for para in (content.get("content", []) if isinstance(content, dict) else []):
+        parts = []
+        for el in para:
+            tag = el.get("tag")
+            if tag in ("text", "a"):
+                parts.append(el.get("text", ""))
+            elif tag == "img":
+                key = el.get("image_key")
+                if key:
+                    images.append(key)
+        line = "".join(parts).strip()
+        if line:
+            texts.append(line)
+    return "\n".join(texts).strip(), images
 
 
 def _parse_file_message(msg_type, content):

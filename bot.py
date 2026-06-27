@@ -346,12 +346,40 @@ class Bot:
         ]))
         print(f"[{self.name}][upload] {info['path']} ({info['size_human']})")
 
+    def handle_post_images(self, token, msg):
+        """下载 post 富文本里内嵌的图片，写台账，返回 (文字, [本地路径,...])。"""
+        text = msg.get("text", "")
+        paths = []
+        for idx, image_key in enumerate(msg.get("images", []), 1):
+            synth = {"id": msg["id"], "file_key": image_key,
+                     "resource_type": "image", "file_name": f"img{idx}"}
+            try:
+                info = uploads.save_upload(token, synth, self.chat_id)
+            except Exception as e:
+                print(f"[{self.name}][post-img-error] {e}")
+                continue
+            self.db(db.record_upload, msg["id"], self.chat_id, "image",
+                    info["file_name"], info["path"], info["size"], info["content_type"])
+            paths.append(info["path"])
+        return text, paths
+
     def handle_message(self, token, msg):
         # 文件类消息（图片/文件/压缩包）先分流（这些消息没有 text 字段）
         if msg.get("kind") == "file":
             self.handle_upload(token, msg)
             return
-        text = msg["text"].strip()
+        # 富文本 post：下载内嵌图片；有图则作为带附件的任务，纯文本则按文本继续
+        if msg.get("kind") == "post":
+            ptext, paths = self.handle_post_images(token, msg)
+            if paths:
+                full = (ptext or "请查看随附的图片").rstrip()
+                full += "\n\n[随消息附带的图片，可直接读取]\n" + "\n".join(paths)
+                self.run_task(token, msg, full, self.last_dir["name"])
+                return
+            msg = {**msg, "text": ptext}  # 纯文本 post，降级为普通文本处理
+        text = (msg.get("text") or "").strip()
+        if not text:
+            return
         # 等待序号时，数字消息用于选择
         if self.pending and text.isdigit():
             self.handle_select(token, msg, int(text) - 1)
