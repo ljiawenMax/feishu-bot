@@ -363,10 +363,21 @@ class Bot:
             paths.append(info["path"])
         return text, paths
 
+    def handle_unsupported(self, token, msg):
+        """处理不了的消息（不支持的类型）：留痕到 DB + 回提示。"""
+        mt = msg.get("msg_type", "?")
+        self.db(db.record_unhandled, msg["id"], self.chat_id, mt, msg.get("raw", ""))
+        feishu_api.reply_message(token, msg["id"], f"暂不支持「{mt}」类型的消息，已记录。")
+        print(f"[{self.name}][unhandled] msg_type={mt} id={msg['id']}")
+
     def handle_message(self, token, msg):
         # 文件类消息（图片/文件/压缩包）先分流（这些消息没有 text 字段）
         if msg.get("kind") == "file":
             self.handle_upload(token, msg)
+            return
+        # 处理不了的类型：留痕 + 提示
+        if msg.get("kind") == "unsupported":
+            self.handle_unsupported(token, msg)
             return
         # 富文本 post：下载内嵌图片；有图则作为带附件的任务，纯文本则按文本继续
         if msg.get("kind") == "post":

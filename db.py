@@ -10,7 +10,7 @@ from urllib.parse import quote_plus
 from sqlalchemy import create_engine, delete, select, update
 from sqlalchemy.orm import sessionmaker
 
-from models import Base, BotState, Conversation, Message, Upload
+from models import Base, BotState, Conversation, Message, Unhandled, Upload
 
 
 def init_engine(db_cfg):
@@ -136,4 +136,10 @@ def record_upload(s, message_id, chat_id, resource_type, file_name, path, size, 
     s.add(Upload(
         message_id=message_id, chat_id=chat_id, resource_type=resource_type,
         file_name=file_name, path=path, size=size, content_type=content_type,
+    ))
+
+
+def record_unhandled(s, message_id, chat_id, msg_type, content):
+    s.add(Unhandled(
+        message_id=message_id, chat_id=chat_id, msg_type=msg_type, content=content,
     ))

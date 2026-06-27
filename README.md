@@ -118,7 +118,7 @@ tail -f ~/run/log/feishu-bot-local.log
 - 每次上传记一行到 `uploads` 表（台账，独立于会话）
 - **如何分析**：发一条任务引用回复里的路径（如「看看 /path/xxx.jpg」）。该聊天的上传目录始终经 `--add-dir` 纳入 Claude 工作区，所以**只读分析无需 `/permit`**；若要让 Claude 据此**改写文件**，再开 `/permit`（仍不会执行命令）
 - **富文本（post）消息**：飞书富文本（含截图+文字的那种）会被解析——文字作为任务指令，内嵌图片自动下载并把路径拼进 prompt 交给 Claude，因此「发一张文字截图 + 帮我翻译」这类能直接出结果（读图属只读，无需 `/permit`）
-- 暂不支持的消息类型（表情/位置/合并转发等）会被忽略
+- 暂不支持的消息类型（表情/位置/合并转发等）：不处理，但会**记一行到 `unhandled_messages` 表**（含类型与原始内容）并回复「暂不支持…，已记录」，不再无声丢弃
 
 ## Session 持久化与对话历史
 
@@ -138,6 +138,7 @@ tail -f ~/run/log/feishu-bot-local.log
 | `sessions`（`Conversation`） | 一行一个对话，代理主键 `id`；`claude_session_id` 在首次执行前为 NULL |
 | `messages`（`Message`） | 对话审计日志，每轮用户输入与 LLM 输出各一行，append-only |
 | `uploads`（`Upload`） | 上传文件台账：消息 id、路径、文件名、大小、Content-Type |
+| `unhandled_messages`（`Unhandled`） | 处理不了的消息留痕：消息 id、类型、原始内容 |
 
 ## 对话审计
 

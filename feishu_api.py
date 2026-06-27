@@ -79,9 +79,10 @@ def fetch_new_messages(token, chat_id, since_ts):
             text, images = _parse_post(content)
             if text or images:
                 messages.append({**base, "kind": "post", "text": text, "images": images})
-        # 其余类型（sticker/location 等）暂不支持
+        # 其余类型（sticker/location/合并转发等）暂不支持，仍返回以便留痕+提示
         else:
-            print(f"[skip] 暂不支持的消息类型: {msg_type}")
+            messages.append({**base, "kind": "unsupported", "msg_type": msg_type,
+                             "raw": item.get("body", {}).get("content", "")})
     return messages
 
 

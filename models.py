@@ -85,6 +85,23 @@ class Message(Base):
     created_at: Mapped["DateTime"] = mapped_column(DateTime, server_default=func.now())
 
 
+class Unhandled(Base):
+    """处理不了的消息记录（不支持的类型/解析失败），留痕用。"""
+
+    __tablename__ = "unhandled_messages"
+    __table_args__ = (
+        Index("idx_unhandled_chat", "chat_id", "created_at"),
+        TABLE_KW,
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    message_id: Mapped[str | None] = mapped_column(String(128))
+    chat_id: Mapped[str | None] = mapped_column(String(64))
+    msg_type: Mapped[str | None] = mapped_column(String(32))
+    content: Mapped[str | None] = mapped_column(LONGTEXT)  # 原始 body.content
+    created_at: Mapped["DateTime"] = mapped_column(DateTime, server_default=func.now())
+
+
 class Upload(Base):
     """上传文件台账（独立于会话 messages）。"""
 
