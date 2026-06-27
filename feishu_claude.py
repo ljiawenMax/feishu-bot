@@ -393,26 +393,35 @@ def split_text(text, max_len=3900):
 
 
 def reply_message(token, message_id, text):
+    """回复消息。网络/接口失败时记录日志但不抛出，避免中断消息处理导致结果丢失。
+    返回是否全部分段发送成功。"""
     headers = {
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json",
     }
     chunks = split_text(text)
+    ok = True
     for i, chunk in enumerate(chunks):
         body = {
             "msg_type": "text",
             "content": json.dumps({"text": chunk}),
         }
-        resp = requests.post(
-            f"https://open.feishu.cn/open-apis/im/v1/messages/{message_id}/reply",
-            headers=headers,
-            json=body,
-            timeout=10,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        if data.get("code") != 0:
-            print(f"[warn] reply chunk {i+1}/{len(chunks)} failed: {data}")
+        try:
+            resp = requests.post(
+                f"https://open.feishu.cn/open-apis/im/v1/messages/{message_id}/reply",
+                headers=headers,
+                json=body,
+                timeout=10,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            if data.get("code") != 0:
+                ok = False
+                print(f"[warn] reply chunk {i+1}/{len(chunks)} failed: {data}")
+        except requests.RequestException as e:
+            ok = False
+            print(f"[warn] reply chunk {i+1}/{len(chunks)} network error: {e}")
+    return ok
 
 
 def main():
