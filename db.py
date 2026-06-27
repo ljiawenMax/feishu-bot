@@ -5,6 +5,8 @@
 commit/rollback。engine 由 launcher 创建一次、多线程共享，连接池负责重连。
 """
 
+from urllib.parse import quote_plus
+
 from sqlalchemy import create_engine, delete, select, update
 from sqlalchemy.orm import sessionmaker
 
@@ -13,10 +15,11 @@ from models import Base, BotState, Conversation, Message
 
 def init_engine(db_cfg):
     url = (
-        f"postgresql+psycopg2://{db_cfg['user']}:{db_cfg['password']}"
-        f"@{db_cfg['host']}:{db_cfg['port']}/{db_cfg['dbname']}"
+        f"mysql+pymysql://{quote_plus(db_cfg['user'])}:{quote_plus(db_cfg['password'])}"
+        f"@{db_cfg['host']}:{db_cfg['port']}/{db_cfg['dbname']}?charset=utf8mb4"
     )
-    return create_engine(url, pool_pre_ping=True, future=True)
+    # pool_recycle：MySQL 默认 8h 断空闲连接，主动回收避免用到失效连接
+    return create_engine(url, pool_pre_ping=True, pool_recycle=3600, future=True)
 
 
 def create_all(engine):

@@ -1,6 +1,6 @@
 """Bot：单个飞书机器人（一个 chat_id）的消息处理与会话编排。
 
-每个 Bot 实例对应一个 chat_id，状态持久化在 PostgreSQL。同一 chat_id 的消息在
+每个 Bot 实例对应一个 chat_id，状态持久化在 MySQL。同一 chat_id 的消息在
 Bot.run() 的单循环里串行处理，天然无并发。多机器人通过多进程（每个一份 .env.<name>）
 运行，互不阻塞。
 """
@@ -26,7 +26,7 @@ HELP_TEXT = "\n".join([
 
 
 class Bot:
-    """飞书消息驱动 Claude Code 的轮询服务，状态持久化在 PostgreSQL。"""
+    """飞书消息驱动 Claude Code 的轮询服务，状态持久化在 MySQL。"""
 
     def __init__(self, bot_cfg, session_factory, poll_interval, task_timeout):
         self.name = bot_cfg["name"]
