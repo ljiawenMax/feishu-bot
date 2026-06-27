@@ -112,7 +112,7 @@ tail -f ~/run/log/feishu-bot-local.log
 
 在群里发**图片 / 文件 / 压缩包 / 音视频**，bot 会下载并存到隔离目录，然后回复保存路径。
 
-- **存储位置**：`~/run/feishu_bot/uploads/<chat_id>/`，在所有 work_dir 与代码库之外
+- **存储位置**：`~/run/uploads/feishu_bot/<chat_id>/`，在所有 work_dir 与代码库之外
 - **最小权限**：目录 `700`、文件 `600`，**绝不加执行位**；文件名消毒（只取 basename + 白名单字符 + 唯一前缀）防路径穿越；大小上限 50MB（`uploads.py` 的 `MAX_UPLOAD_BYTES` 可调）
 - **不自动解压**压缩包（避免 zip 炸弹 / zip-slip），bot 只存不跑
 - 每次上传记一行到 `uploads` 表（台账，独立于会话）
@@ -175,7 +175,7 @@ claude_runner.py   # 调用 claude CLI + 删除磁盘 session 文件
 restart.sh         # 按配置名停止旧进程并重启
 .env               # 配置模板（入 git，值留空）
 .env.local         # 实际配置（不入 git）：DB + BOTS 列表
-~/run/feishu_bot/uploads/<chat_id>/   # 上传文件隔离目录（700）
+~/run/uploads/feishu_bot/<chat_id>/   # 上传文件隔离目录（700）
 ~/run/feishu_bot/<name>.pid    # PID 文件（默认 local.pid）
 ~/run/log/feishu-bot-<name>.log   # 运行日志（默认 feishu-bot-local.log）
 ```

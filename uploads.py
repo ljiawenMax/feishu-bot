@@ -1,7 +1,7 @@
 """上传文件的安全下载与存储。
 
 把飞书消息里的图片/文件/压缩包下载到隔离目录
-~/run/feishu_bot/uploads/<chat_id>/，最小权限（目录 700、文件 600、绝不加执行位），
+~/run/uploads/feishu_bot/<chat_id>/，最小权限（目录 700、文件 600、绝不加执行位），
 文件名消毒防路径穿越，不自动解压，超过大小上限拒绝。bot 只存不跑。
 """
 
@@ -10,7 +10,7 @@ import re
 
 import feishu_api
 
-UPLOAD_ROOT = os.path.expanduser("~/run/feishu_bot/uploads")
+UPLOAD_ROOT = os.path.expanduser("~/run/uploads/feishu_bot")
 MAX_UPLOAD_BYTES = 50 * 1024 * 1024  # 50MB（可调；飞书硬上限 100MB）
 
 # 文件名白名单：字母数字 . _ - 与中文，其余替换为 _
