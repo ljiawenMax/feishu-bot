@@ -367,7 +367,7 @@ class Bot:
         """处理不了的消息（不支持的类型）：留痕到 DB + 回提示。"""
         mt = msg.get("msg_type", "?")
         self.db(db.record_unhandled, msg["id"], self.chat_id, mt, msg.get("raw", ""))
-        feishu_api.reply_message(token, msg["id"], f"暂不支持「{mt}」类型的消息，已记录。")
+        feishu_api.reply_message(token, msg["id"], "不支持处理当前消息类型")
         print(f"[{self.name}][unhandled] msg_type={mt} id={msg['id']}")
 
     def handle_message(self, token, msg):
