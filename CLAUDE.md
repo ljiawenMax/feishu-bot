@@ -8,17 +8,19 @@
 
 ## 文件说明
 
-代码按职责拆为 5 个模块（依赖单向：`feishu_claude → bot → {db, feishu_api, claude_runner}`）：
+代码按职责拆为 6 个模块（依赖单向：`feishu_claude → bot → {db→models, feishu_api, claude_runner}`）：
 
-- `feishu_claude.py` — 入口：解析 `--env`、加载 `.env.<name>`、管理 PID、启动 `Bot`
-- `bot.py` — `Bot` 类：消息分发、命令处理、会话编排（业务主体，改功能主要看这里）
-- `db.py` — 数据库层：建表 + 所有 `db_*` 持久化/审计操作（PostgreSQL）
+- `feishu_claude.py` — 入口：解析 `.env.<name>`、建 DB engine、为 `BOTS` 列表每项起一个线程、管理 PID
+- `bot.py` — `Bot` 类：单个机器人的消息分发、命令处理、会话编排（业务主体，改功能主要看这里）
+- `models.py` — SQLAlchemy ORM 模型：`BotState` / `Conversation`(表 sessions) / `Message`
+- `db.py` — 数据库层：engine/session 管理 + 基于 ORM 的数据访问（不再手写 SQL）
 - `feishu_api.py` — 飞书 API：token、拉取/回复消息、文本分段与构造
 - `claude_runner.py` — 调用 `claude` CLI、解析 stream-json、删除磁盘 session 文件
-- `.env.<name>` — 每个机器人一份配置（飞书凭证 + DB 连接），不入 git
+- `.env` — 配置模板（入 git）；`.env.local` — 实际配置（不入 git）
 
-配置改用 `.env.<name>` 文件（不再是 config.json）。多机器人：每份 `.env.<name>` 一个进程，
-同一 chat_id 串行、无并发；状态持久化在 PostgreSQL，按 `chat_id` 隔离。
+配置统一为 `.env.local`（默认），含共享项 + `BOTS` JSON 列表。多机器人：**单进程多线程**，
+每个机器人（`BOTS` 一项，一个 chat_id）一个线程，同一 chat_id 串行无并发、不同机器人并行。
+DB 访问走 SQLAlchemy ORM；每次操作开短生命周期 Session（线程安全），状态按 `chat_id` 隔离。
 
 ## config.json 字段说明
 

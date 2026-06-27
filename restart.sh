@@ -2,8 +2,8 @@
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-ENV="${1:-prod}"
-# 每个机器人独立的 PID 与日志，多机器人可并行重启互不干扰
+ENV="${1:-local}"
+# 一份配置一个进程（进程内可多机器人）；PID 与日志按配置名区分
 PID_FILE="$HOME/run/feishu_bot/$ENV.pid"
 LOG_FILE="$HOME/run/log/feishu-bot-$ENV.log"
 mkdir -p "$(dirname "$LOG_FILE")"

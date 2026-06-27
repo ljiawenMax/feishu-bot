@@ -19,46 +19,52 @@
 
 | 文件 | 职责 |
 |------|------|
-| `feishu_claude.py` | 入口：解析 `--env`、加载配置、管理 PID、启动 `Bot` |
-| `bot.py` | `Bot` 类：消息分发、命令处理、会话编排（业务主体） |
-| `db.py` | 数据库层：建表 + 所有 `db_*` 持久化/审计操作 |
+| `feishu_claude.py` | 入口：解析配置、建 DB engine、按 `BOTS` 列表为每个机器人起线程、管理 PID |
+| `bot.py` | `Bot` 类：单个机器人的消息分发、命令处理、会话编排（业务主体） |
+| `models.py` | SQLAlchemy ORM 模型：`BotState` / `Conversation`(表 sessions) / `Message` |
+| `db.py` | 数据库层：engine/session 管理 + 基于 ORM 的数据访问 |
 | `feishu_api.py` | 飞书 API：获取 token、拉取/回复消息、文本分段与构造 |
 | `claude_runner.py` | 调用 `claude` CLI、解析 stream-json、删除磁盘 session 文件 |
 
-依赖方向单向：`feishu_claude → bot → {db, feishu_api, claude_runner}`。
+依赖方向单向：`feishu_claude → bot → {db→models, feishu_api, claude_runner}`。
+数据访问用 **SQLAlchemy ORM**（不再手写 SQL），表结构由模型定义、`create_all()` 自动建表。
 
-### 多机器人
+### 多机器人（单进程多线程）
 
-每个机器人 = 一份 `.env.<name>` 配置（自己的 app/chat_id/工作目录）= 一个进程。同一
-`chat_id` 的消息在该进程的单循环里**串行处理**，无并发；不同机器人是独立进程，互不阻塞。
-数据库三张表按 `chat_id` 隔离，多机器人共享同一套表。token 缓存按 `app_id` 分键。
+一个进程内可运行多个机器人——`.env.local` 的 `BOTS` 列表里每一项就是一个机器人（自己的
+app 凭证、chat_id、工作目录）。每个机器人在**自己的线程**里跑独立的轮询循环：
+
+- 同一 `chat_id` 的消息在该机器人线程里**串行处理**，无并发
+- 不同机器人并行、互不阻塞（一个机器人跑长任务不影响其它机器人）
+- 共享一个数据库 engine；每次 DB 操作开短生命周期 Session，天然线程安全
+- token 缓存按 `app_id` 分键；数据库三张表按 `chat_id` 隔离
 
 ## 配置文件
 
-使用 `.env.<env>` 格式的文件，默认读 `.env.prod`：
+配置统一放 `.env.local`（不入 git；模板见仓库里的 `.env`），启动默认读它。共享项扁平，
+机器人放 `BOTS` JSON 数组：
 
 ```dotenv
-APP_ID=cli_xxxxxxxx
-APP_SECRET=xxxxxxxxxxxxxxxx
-CHAT_ID=oc_xxxxxxxxxxxxxxxx
-WORK_DIRS={"daily-assistant":"/home/user/projects/assistant","web-project":"/home/user/projects/web"}
-POLL_INTERVAL=60
-TASK_TIMEOUT=300
 DB_HOST=127.0.0.1
 DB_PORT=5432
 DB_NAME=financial_report
 DB_USER=admin
 DB_PASSWORD=xxxxxxxx
+POLL_INTERVAL=5
+TASK_TIMEOUT=600
+BOTS=[{"name":"prod","app_id":"cli_xxx","app_secret":"xxx","chat_id":"oc_xxx","work_dirs":{"别名":"/abs/path"}}]
 ```
 
 | 字段 | 说明 |
 |------|------|
-| `APP_ID` / `APP_SECRET` | 飞书自建应用凭证 |
-| `CHAT_ID` | 监听的群聊 ID（格式 `oc_xxxxxx`），同时作为数据库中区分群/环境的键 |
-| `WORK_DIRS` | JSON 对象，`目录别名 → 绝对路径`，支持多目录切换 |
+| `DB_*` | PostgreSQL 连接信息，用于 session 持久化与对话审计 |
 | `POLL_INTERVAL` | 空闲时最大轮询间隔（秒），有消息时退回 5s |
 | `TASK_TIMEOUT` | 单次 Claude Code 执行超时（秒） |
-| `DB_*` | PostgreSQL 连接信息，用于 session 持久化与对话审计 |
+| `BOTS` | JSON 数组，每项一个机器人；多机器人就追加数组项 |
+| `BOTS[].name` | 机器人名（用于日志前缀，区分多机器人） |
+| `BOTS[].app_id` / `app_secret` | 飞书自建应用凭证 |
+| `BOTS[].chat_id` | 监听的群聊 ID（`oc_xxxxxx`），同时是数据库里区分机器人的键 |
+| `BOTS[].work_dirs` | JSON 对象，`目录别名 → 绝对路径`，支持多目录切换 |
 
 ### 飞书应用配置
 
@@ -71,21 +77,20 @@ DB_PASSWORD=xxxxxxxx
 
 ```bash
 # 首次安装依赖（使用项目虚拟环境）
-python -m venv .venv && .venv/bin/pip install requests psycopg2-binary
+python -m venv .venv && .venv/bin/pip install requests psycopg2-binary sqlalchemy
 
-# 后台启动（prod 机器人，读 .env.prod）
+# 后台启动（默认读 .env.local，按其中 BOTS 列表起线程）
 ./restart.sh
 
-# 启动其它机器人（每个 .env.<name> 一个，独立进程并行运行）
-./restart.sh test
-./restart.sh mybot
-
-# 查看某个机器人的日志
-tail -f ~/run/log/feishu-bot-prod.log
+# 查看日志（单进程，所有机器人日志按 name 前缀区分）
+tail -f ~/run/log/feishu-bot-local.log
 ```
 
-`restart.sh <name>` 会按机器人名停止旧进程（`~/run/feishu_bot/<name>.pid`）再 nohup 重启，
-不同机器人互不影响。日志分文件：`~/run/log/feishu-bot-<name>.log`。
+需要多机器人时，往 `.env.local` 的 `BOTS` 数组追加配置项即可，无需起多个进程。
+（仍支持 `./restart.sh <name>` 读取 `.env.<name>`，用于隔离的多套部署。）
+
+`restart.sh <name>` 会按配置名停止旧进程（`~/run/feishu_bot/<name>.pid`）再 nohup 重启，
+日志写到 `~/run/log/feishu-bot-<name>.log`。默认 `<name>` 为 `local`。
 
 ## 群聊命令
 
@@ -112,13 +117,13 @@ tail -f ~/run/log/feishu-bot-prod.log
 
 ## 数据库表
 
-启动时自动建表（`CREATE TABLE IF NOT EXISTS`），无需手动迁移：
+表由 `models.py` 的 ORM 模型定义，启动时 `Base.metadata.create_all()` 自动建表（对已存在的表幂等跳过），无需手动迁移：
 
-| 表 | 用途 |
+| 表（ORM 类） | 用途 |
 |----|------|
-| `bot_state` | 每个 `chat_id` 的 UI 状态：当前目录、各目录权限模式 |
-| `sessions` | 一行一个对话，代理主键 `id`；`claude_session_id` 在首次执行前为 NULL |
-| `messages` | 对话审计日志，每轮用户输入与 LLM 输出各一行，append-only |
+| `bot_state`（`BotState`） | 每个 `chat_id` 的 UI 状态：当前目录、各目录权限模式 |
+| `sessions`（`Conversation`） | 一行一个对话，代理主键 `id`；`claude_session_id` 在首次执行前为 NULL |
+| `messages`（`Message`） | 对话审计日志，每轮用户输入与 LLM 输出各一行，append-only |
 
 ## 对话审计
 
@@ -147,13 +152,15 @@ ORDER BY id DESC LIMIT 20;
 ## 文件结构
 
 ```
-feishu_claude.py   # 入口：参数解析 + PID 管理 + 启动 Bot
-bot.py             # Bot 类：消息分发、命令处理、会话编排
-db.py              # 数据库层：建表 + 持久化/审计
+feishu_claude.py   # 入口：解析配置 + 建 engine + 起线程 + PID 管理
+bot.py             # Bot 类：单机器人消息分发、命令处理、会话编排
+models.py          # SQLAlchemy ORM 模型（BotState/Conversation/Message）
+db.py              # 数据库层：engine/session + ORM 数据访问
 feishu_api.py      # 飞书 API：token / 拉取 / 回复 / 文本构造
 claude_runner.py   # 调用 claude CLI + 删除磁盘 session 文件
-restart.sh         # 按机器人名停止旧进程并重启
-.env.<name>        # 每个机器人一份配置（不入 git）
-~/run/feishu_bot/<name>.pid   # 各机器人的 PID 文件
-~/run/log/feishu-bot-<name>.log   # 各机器人的运行日志
+restart.sh         # 按配置名停止旧进程并重启
+.env               # 配置模板（入 git，值留空）
+.env.local         # 实际配置（不入 git）：DB + BOTS 列表
+~/run/feishu_bot/<name>.pid    # PID 文件（默认 local.pid）
+~/run/log/feishu-bot-<name>.log   # 运行日志（默认 feishu-bot-local.log）
 ```
