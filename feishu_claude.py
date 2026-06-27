@@ -41,6 +41,7 @@ def load_config(env_name):
         },
         "poll_interval": int(env["POLL_INTERVAL"]),
         "task_timeout": int(env["TASK_TIMEOUT"]),
+        "models": json.loads(env.get("MODELS") or '["opus","sonnet","haiku"]'),
         "bots": json.loads(env["BOTS"]),
     }
 
@@ -70,9 +71,11 @@ def main():
     cfg = load_config(args.env)
     engine = db.init_engine(cfg["db"])
     db.create_all(engine)
+    db.migrate(engine)
     session_factory = db.make_session_factory(engine)
 
-    bots = [Bot(bc, session_factory, cfg["poll_interval"], cfg["task_timeout"]) for bc in cfg["bots"]]
+    bots = [Bot(bc, session_factory, cfg["poll_interval"], cfg["task_timeout"], cfg["models"])
+            for bc in cfg["bots"]]
     print(f"[feishu-claude-bot] env={args.env}, bots={[b.name for b in bots]}")
 
     pidf = pid_file(args.env)

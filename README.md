@@ -104,6 +104,7 @@ tail -f ~/run/log/feishu-bot-local.log
 | `/name <名称>` | 重命名当前对话 |
 | `/del <序号>` | 删除指定对话（序号见 `/sessions`），同时删除磁盘上的 Claude session 文件 |
 | `/permit` | 开关当前目录的文件读写权限（`acceptEdits`，限定当前目录，不执行命令） |
+| `/model` | 选择**当前对话**使用的模型（回复序号；`/new` 新对话重置为默认） |
 | `/retry` | 用当前权限重跑上一条任务 |
 
 非命令消息直接作为任务交给 Claude Code 执行。
@@ -136,7 +137,7 @@ tail -f ~/run/log/feishu-bot-local.log
 |----|------|
 | `bot_state`（`BotState`） | 每个 `chat_id` 的 UI 状态：当前目录、各目录权限模式 |
 | `sessions`（`Conversation`） | 一行一个对话，代理主键 `id`；`claude_session_id` 在首次执行前为 NULL |
-| `messages`（`Message`） | 对话审计日志，每轮用户输入与 LLM 输出各一行，append-only |
+| `messages`（`Message`） | 对话审计日志，每轮用户输入与 LLM 输出各一行（含实际所用 `model`），append-only |
 | `uploads`（`Upload`） | 上传文件台账：消息 id、路径、文件名、大小、Content-Type |
 | `unhandled_messages`（`Unhandled`） | 处理不了的消息留痕：消息 id、类型、原始内容 |
 
@@ -154,6 +155,13 @@ SELECT role, left(content, 80), created_at FROM messages
 WHERE chat_id = 'oc_xxx' AND dir_name = 'feishu-bot'
 ORDER BY id DESC LIMIT 20;
 ```
+
+## 模型选择
+
+- `/model` 列出可选模型，回复序号选择——**作用于当前对话**（按 session），`/new` 新对话重置为「默认（不指定）」
+- 选定后任务以 `claude --model <名称>` 运行；未选则用 Claude Code 默认模型
+- 可选清单由 `.env.local` 的 `MODELS`（JSON 数组）配置，默认 `["opus","sonnet","haiku"]`
+- 每次任务**实际所用模型**（从 stream-json 的 assistant 事件捕获）会：① 在回复末尾显示「（模型：…）」；② 写入 `messages.model` 审计列
 
 ## 权限模式
 

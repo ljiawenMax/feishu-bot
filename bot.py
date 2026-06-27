@@ -22,6 +22,7 @@ HELP_TEXT = "\n".join([
     "/name <名称> — 重命名当前对话",
     "/del <序号> — 删除指定对话（序号见 /sessions）",
     "/permit    — 开关当前目录的文件读写（acceptEdits，不跑命令）",
+    "/model     — 选择当前对话使用的模型",
     "/retry     — 用当前权限重跑上一条任务",
     "/help      — 显示此帮助",
 ])
@@ -30,7 +31,7 @@ HELP_TEXT = "\n".join([
 class Bot:
     """飞书消息驱动 Claude Code 的轮询服务，状态持久化在 MySQL。"""
 
-    def __init__(self, bot_cfg, session_factory, poll_interval, task_timeout):
+    def __init__(self, bot_cfg, session_factory, poll_interval, task_timeout, models=None):
         self.name = bot_cfg["name"]
         self.app_id = bot_cfg["app_id"]
         self.app_secret = bot_cfg["app_secret"]
@@ -39,6 +40,7 @@ class Bot:
         self.dir_names = list(self.work_dirs.keys())
         self.poll_interval = poll_interval
         self.task_timeout = task_timeout
+        self.models = models or ["opus", "sonnet", "haiku"]  # /model 可选清单
         self.default_name = self.dir_names[0] if self.dir_names else "daily-assistant"
 
         self.Session = session_factory
@@ -63,6 +65,7 @@ class Bot:
             "/name": self.cmd_name,
             "/new": self.cmd_new,
             "/permit": self.cmd_permit,
+            "/model": self.cmd_model,
             "/del": self.cmd_del,
             "/retry": self.cmd_retry,
         }
@@ -94,7 +97,13 @@ class Bot:
 
     def new_entry(self, label=None):
         ts = time.strftime("%m-%d %H:%M")
-        return {"id": None, "label": label or f"新对话 {ts}", "_row_id": None}
+        return {"id": None, "label": label or f"新对话 {ts}", "model": None, "_row_id": None}
+
+    def current_entry(self, dir_name):
+        data = self.dir_sessions.get(dir_name)
+        if not data or not data.get("list"):
+            return None
+        return data["list"][data["current"]]
 
     def make_session(self, dir_name, label=None):
         """创建内存 session 条目并在 DB 中建行，返回条目（含 _row_id）。"""
@@ -123,7 +132,7 @@ class Bot:
         if entry.get("_row_id"):
             self.db(db.update_session, entry["_row_id"], claude_sid=session_id, label=new_label)
 
-    def audit(self, dir_name, user_text, result, new_session_id):
+    def audit(self, dir_name, user_text, result, new_session_id, used_model=None):
         """把一轮对话（用户输入 + LLM 输出）写入审计表。"""
         data = self.dir_sessions.get(dir_name, {})
         entry = data["list"][data["current"]] if data.get("list") else None
@@ -131,26 +140,29 @@ class Bot:
         sid = (entry.get("id") if entry else None) or new_session_id
         self.db(db.append_message, row_id, self.chat_id, dir_name, sid, "user", user_text)
         self.db(db.append_message, row_id, self.chat_id, dir_name, sid, "assistant", result,
-                result.startswith("[error]"), "超时" in result)
+                result.startswith("[error]"), "超时" in result, model=used_model)
 
     def execute_claude(self, text, dir_name, session_id, history=None, first_task=None):
-        """调用 Claude Code，处理超时/异常，成功时同步 session_id 到 DB。"""
+        """调用 Claude Code，处理超时/异常，成功时同步 session_id 到 DB。
+        返回 (result, new_sid, used_model)。"""
         permit = self.permit_modes.get(dir_name, False)
         # 始终把该聊天上传目录纳入工作区（存在才加），让 Claude 能读上传文件
         up = uploads.chat_dir(self.chat_id)
         extra_dirs = [up] if os.path.isdir(up) else []
+        entry = self.current_entry(dir_name)
+        model = entry.get("model") if entry else None
         try:
-            result, new_sid = claude_runner.run_claude(
+            result, new_sid, used_model = claude_runner.run_claude(
                 text, self.work_dirs[dir_name], self.task_timeout,
-                session_id, permit=permit, extra_dirs=extra_dirs, history=history,
+                session_id, permit=permit, extra_dirs=extra_dirs, history=history, model=model,
             )
             if new_sid:
                 self.update_session(dir_name, new_sid, first_task=first_task)
         except subprocess.TimeoutExpired:
-            result, new_sid = f"[error] 任务超时（>{self.task_timeout}s）", None
+            result, new_sid, used_model = f"[error] 任务超时（>{self.task_timeout}s）", None, None
         except Exception as e:
-            result, new_sid = f"[error] 执行失败: {e}", None
-        return result, new_sid
+            result, new_sid, used_model = f"[error] 执行失败: {e}", None, None
+        return result, new_sid, used_model
 
     # ------------------------------------------------------------- commands
 
@@ -208,6 +220,25 @@ class Bot:
         if on and self.last_task:
             feishu_api.reply_message(token, msg["id"], "是否用新权限重跑上一条任务？发送 /retry 确认")
 
+    def cmd_model(self, token, msg, arg):
+        """列出可选模型，回复序号选择（作用于当前对话）。"""
+        dir_name = self.last_dir["name"]
+        # 确保当前目录有一个 session 承载模型选择（无则按首用初始化）
+        if self.dir_sessions.get(dir_name) is None:
+            entry = self.make_session(dir_name)
+            self.dir_sessions[dir_name] = {"list": [entry], "current": 0, "history": []}
+            self.set_current(dir_name, entry)
+        cur = self.current_entry(dir_name)
+        cur_model = cur.get("model") if cur else None
+        options = ["默认（不指定）"] + list(self.models)  # 序号 1=默认，2..=各模型
+        # 当前选中项在 options 里的下标
+        cur_pos = 0 if not cur_model else (self.models.index(cur_model) + 1 if cur_model in self.models else -1)
+        lines = ["选择当前对话使用的模型，回复序号："]
+        for i, name in enumerate(options, 1):
+            lines.append(f"{i}. {name}{' ◀ 当前' if i - 1 == cur_pos else ''}")
+        self.pending = "model"
+        feishu_api.reply_message(token, msg["id"], "\n".join(lines))
+
     def cmd_del(self, token, msg, arg):
         dir_name = self.last_dir["name"]
         data = self.dir_sessions.get(dir_name)
@@ -248,15 +279,24 @@ class Bot:
         feishu_api.reply_message(token, msg["id"], f"[{dir_name}] 已删除对话「{removed['label']}」（剩 {len(data['list'])} 个）")
         print(f"[del] {dir_name} removed idx={didx} row={removed.get('_row_id')}")
 
+    @staticmethod
+    def _model_suffix(used_model):
+        """成功结果末尾追加「（模型：…）」；去掉 claude- 前缀。"""
+        if not used_model:
+            return ""
+        short = used_model[7:] if used_model.startswith("claude-") else used_model
+        return f"\n\n（模型：{short}）"
+
     def cmd_retry(self, token, msg, arg):
         t = self.last_task
         if not t:
             feishu_api.reply_message(token, msg["id"], "没有可重跑的任务")
             return
         feishu_api.reply_message(token, msg["id"], f"正在 [{t['dir_name']}] 重跑任务，请稍候…")
-        result, new_sid = self.execute_claude(t["text"], t["dir_name"], t["session_id"])
-        self.audit(t["dir_name"], t["text"], result, new_sid)
-        feishu_api.reply_message(token, t["msg_id"], result)
+        result, new_sid, used_model = self.execute_claude(t["text"], t["dir_name"], t["session_id"])
+        self.audit(t["dir_name"], t["text"], result, new_sid, used_model)
+        suffix = "" if result.startswith("[error]") else self._model_suffix(used_model)
+        feishu_api.reply_message(token, t["msg_id"], result + suffix)
         print("[retry] done")
 
     # --------------------------------------------------------------- 任务执行
@@ -279,7 +319,7 @@ class Bot:
               f"session={'new' if is_new else session_id[:8] + '…'} | {text[:60]}")
         feishu_api.reply_message(token, msg["id"], f"正在 [{dir_name}] 执行任务，请稍候…")
 
-        result, new_sid = self.execute_claude(
+        result, new_sid, used_model = self.execute_claude(
             text, dir_name, session_id, history=history,
             first_task=text if is_new else None,
         )
@@ -292,9 +332,10 @@ class Bot:
             if len(data["history"]) > 40:  # 20 轮 × 2
                 data["history"] = data["history"][-40:]
 
-        self.audit(dir_name, text, result, new_sid)
-        feishu_api.reply_message(token, msg["id"], result)
-        print(f"[{self.name}][done] replied to {msg['id']}")
+        self.audit(dir_name, text, result, new_sid, used_model)
+        suffix = "" if result.startswith("[error]") else self._model_suffix(used_model)
+        feishu_api.reply_message(token, msg["id"], result + suffix)
+        print(f"[{self.name}][done] replied to {msg['id']} model={used_model}")
 
     # ---------------------------------------------------------- 消息处理 / 主循环
 
@@ -323,6 +364,20 @@ class Bot:
                 print(f"[session] {dir_name} switched to idx={idx}")
             else:
                 feishu_api.reply_message(token, msg["id"], f"无效序号，请输入 1～{len(sessions)}")
+        elif self.pending == "model":
+            options = ["默认（不指定）"] + list(self.models)  # idx 0=默认
+            if 0 <= idx < len(options):
+                model = None if idx == 0 else self.models[idx - 1]
+                entry = self.current_entry(dir_name)
+                self.pending = None
+                if entry:
+                    entry["model"] = model
+                    if entry.get("_row_id"):
+                        self.db(db.set_session_model, entry["_row_id"], model)
+                feishu_api.reply_message(token, msg["id"], f"当前对话模型已设为：{options[idx]}")
+                print(f"[model] {dir_name} -> {model}")
+            else:
+                feishu_api.reply_message(token, msg["id"], f"无效序号，请输入 1～{len(options)}")
 
     def handle_upload(self, token, msg):
         """下载并安全存储上传的图片/文件/压缩包，写台账，回复保存路径。"""

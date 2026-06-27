@@ -57,6 +57,7 @@ class Conversation(Base):
     dir_name: Mapped[str] = mapped_column(String(128), nullable=False)
     claude_session_id: Mapped[str | None] = mapped_column(String(64))
     label: Mapped[str | None] = mapped_column(String(255))
+    model: Mapped[str | None] = mapped_column(String(64))  # 该对话选定的模型，NULL=默认
     is_current: Mapped[bool] = mapped_column(Boolean, default=False)
     position: Mapped[int] = mapped_column(Integer, default=0)
     created_at: Mapped["DateTime"] = mapped_column(DateTime, server_default=func.now())
@@ -80,6 +81,7 @@ class Message(Base):
     claude_session_id: Mapped[str | None] = mapped_column(String(64))
     role: Mapped[str | None] = mapped_column(String(16))
     content: Mapped[str | None] = mapped_column(LONGTEXT)
+    model: Mapped[str | None] = mapped_column(String(64))  # 该轮实际所用模型
     is_error: Mapped[bool] = mapped_column(Boolean, default=False)
     timed_out: Mapped[bool] = mapped_column(Boolean, default=False)
     created_at: Mapped["DateTime"] = mapped_column(DateTime, server_default=func.now())

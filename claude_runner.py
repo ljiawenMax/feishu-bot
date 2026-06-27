@@ -19,13 +19,16 @@ def build_task_with_history(task, history):
     return "\n".join(lines)
 
 
-def run_claude(task, work_dir, timeout, session_id=None, permit=False, extra_dirs=None, history=None):
+def run_claude(task, work_dir, timeout, session_id=None, permit=False, extra_dirs=None,
+               history=None, model=None):
     cmd = ["claude", "-p", task, "--output-format", "stream-json", "--verbose"]
     # permit 开启 = acceptEdits：可在工作区（cwd + extra_dirs）内读写/改文件，但不执行任意命令
     if permit:
         cmd += ["--permission-mode", "acceptEdits"]
     for d in (extra_dirs or []):
         cmd += ["--add-dir", d]
+    if model:
+        cmd += ["--model", model]
     if session_id:
         cmd += ["--resume", session_id]
 
@@ -40,6 +43,7 @@ def run_claude(task, work_dir, timeout, session_id=None, permit=False, extra_dir
 
     text_parts = []
     new_session_id = None
+    used_model = None  # 实际产出答复的主模型（取最后一条 assistant 的 model）
 
     for line in stdout.splitlines():
         line = line.strip()
@@ -58,8 +62,9 @@ def run_claude(task, work_dir, timeout, session_id=None, permit=False, extra_dir
                 if session_id and any("No conversation found" in e for e in errors):
                     print(f"[warn] session {session_id[:8]}… expired, rebuilding context")
                     recovered_task = build_task_with_history(task, history or [])
-                    return run_claude(recovered_task, work_dir, timeout, session_id=None, permit=permit, extra_dirs=extra_dirs)
-                return f"[error] {'; '.join(errors) or 'unknown error'}", None
+                    return run_claude(recovered_task, work_dir, timeout, session_id=None,
+                                      permit=permit, extra_dirs=extra_dirs, model=model)
+                return f"[error] {'; '.join(errors) or 'unknown error'}", None, used_model
             new_session_id = event.get("session_id")
             result = event.get("result") or "".join(text_parts).strip()
             # result 为空说明 session 状态异常（如权限拒绝后的残留），清掉重跑
@@ -67,20 +72,24 @@ def run_claude(task, work_dir, timeout, session_id=None, permit=False, extra_dir
                 if session_id:
                     print(f"[warn] session {session_id[:8]}… returned empty, retrying fresh")
                     recovered_task = build_task_with_history(task, history or [])
-                    return run_claude(recovered_task, work_dir, timeout, session_id=None, permit=permit, extra_dirs=extra_dirs)
-                return "(no output)", new_session_id
+                    return run_claude(recovered_task, work_dir, timeout, session_id=None,
+                                      permit=permit, extra_dirs=extra_dirs, model=model)
+                return "(no output)", new_session_id, used_model
             if timed_out:
                 result += f"\n\n[超时（>{timeout}s），响应可能不完整]"
-            return result, new_session_id
+            return result, new_session_id, used_model
         elif etype == "assistant":
-            for block in event.get("message", {}).get("content", []):
+            msg = event.get("message", {})
+            if msg.get("model"):
+                used_model = msg["model"]
+            for block in msg.get("content", []):
                 if isinstance(block, dict) and block.get("type") == "text":
                     text_parts.append(block.get("text", ""))
 
     result = "".join(text_parts).strip() or stderr.strip() or "(no output)"
     if timed_out:
         result += f"\n\n[超时（>{timeout}s），以上为已生成内容]"
-    return result, new_session_id
+    return result, new_session_id, used_model
 
 
 def delete_claude_session(claude_session_id, work_dir):

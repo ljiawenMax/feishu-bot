@@ -26,6 +26,24 @@ def create_all(engine):
     Base.metadata.create_all(engine)
 
 
+def migrate(engine):
+    """给已存在的表补列（create_all 不会改已存在表）。幂等。"""
+    from sqlalchemy import text
+    adds = [
+        ("sessions", "model", "VARCHAR(64)"),
+        ("messages", "model", "VARCHAR(64)"),
+    ]
+    with engine.begin() as c:
+        for tbl, col, typ in adds:
+            exists = c.execute(text(
+                "SELECT 1 FROM information_schema.columns "
+                "WHERE table_schema=DATABASE() AND table_name=:t AND column_name=:col"
+            ), {"t": tbl, "col": col}).first()
+            if not exists:
+                c.execute(text(f"ALTER TABLE {tbl} ADD COLUMN {col} {typ}"))
+                print(f"[migrate] {tbl}.{col} 已添加")
+
+
 def make_session_factory(engine):
     return sessionmaker(engine)
 
@@ -51,7 +69,8 @@ def load_state(s, chat_id):
         data = state["dir_sessions"].setdefault(
             conv.dir_name, {"list": [], "current": 0, "history": []}
         )
-        data["list"].append({"id": conv.claude_session_id, "label": conv.label, "_row_id": conv.id})
+        data["list"].append({"id": conv.claude_session_id, "label": conv.label,
+                             "model": conv.model, "_row_id": conv.id})
         if conv.is_current:
             data["current"] = len(data["list"]) - 1
 
@@ -109,6 +128,11 @@ def update_session(s, row_id, claude_sid=None, label=None):
     s.execute(update(Conversation).where(Conversation.id == row_id).values(**values))
 
 
+def set_session_model(s, row_id, model):
+    """设置某 session 的模型（model 可为 None，表示用默认）。"""
+    s.execute(update(Conversation).where(Conversation.id == row_id).values(model=model))
+
+
 def set_current(s, chat_id, dir_name, row_id):
     """把 row_id 置为当前 session，同 (chat_id, dir_name) 下其余置 FALSE"""
     s.execute(
@@ -124,11 +148,11 @@ def delete_session(s, row_id):
 
 
 def append_message(s, session_row_id, chat_id, dir_name, claude_sid,
-                   role, content, is_error=False, timed_out=False):
+                   role, content, is_error=False, timed_out=False, model=None):
     s.add(Message(
         session_id=session_row_id, chat_id=chat_id, dir_name=dir_name,
         claude_session_id=claude_sid, role=role, content=content,
-        is_error=is_error, timed_out=timed_out,
+        is_error=is_error, timed_out=timed_out, model=model,
     ))
 
 
