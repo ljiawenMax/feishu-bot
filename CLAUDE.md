@@ -8,8 +8,17 @@
 
 ## 文件说明
 
-- `feishu_claude.py` — 主服务脚本，轮询飞书消息并驱动 Claude Code 执行
-- `config.json` — 运行配置（需填写真实的飞书凭证）
+代码按职责拆为 5 个模块（依赖单向：`feishu_claude → bot → {db, feishu_api, claude_runner}`）：
+
+- `feishu_claude.py` — 入口：解析 `--env`、加载 `.env.<name>`、管理 PID、启动 `Bot`
+- `bot.py` — `Bot` 类：消息分发、命令处理、会话编排（业务主体，改功能主要看这里）
+- `db.py` — 数据库层：建表 + 所有 `db_*` 持久化/审计操作（PostgreSQL）
+- `feishu_api.py` — 飞书 API：token、拉取/回复消息、文本分段与构造
+- `claude_runner.py` — 调用 `claude` CLI、解析 stream-json、删除磁盘 session 文件
+- `.env.<name>` — 每个机器人一份配置（飞书凭证 + DB 连接），不入 git
+
+配置改用 `.env.<name>` 文件（不再是 config.json）。多机器人：每份 `.env.<name>` 一个进程，
+同一 chat_id 串行、无并发；状态持久化在 PostgreSQL，按 `chat_id` 隔离。
 
 ## config.json 字段说明
 

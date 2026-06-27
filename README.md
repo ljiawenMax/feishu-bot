@@ -8,12 +8,30 @@
 飞书群聊 → 轮询拉取消息 → 解析指令/任务 → 调用 Claude Code CLI → 回复结果到飞书
 ```
 
-核心脚本 `feishu_claude.py` 在一个循环中：
+`Bot` 在一个循环中：
 
 1. 调用飞书 API 拉取最新群消息（带自适应退避，闲置时最长 `POLL_INTERVAL` 秒）
 2. 识别是命令（`/` 开头）还是普通任务文本
 3. 以 `claude -p <task> --output-format stream-json` 执行任务
 4. 将结果分段（每段 ≤ 3900 字符）回复到飞书
+
+### 代码结构（按职责分层）
+
+| 文件 | 职责 |
+|------|------|
+| `feishu_claude.py` | 入口：解析 `--env`、加载配置、管理 PID、启动 `Bot` |
+| `bot.py` | `Bot` 类：消息分发、命令处理、会话编排（业务主体） |
+| `db.py` | 数据库层：建表 + 所有 `db_*` 持久化/审计操作 |
+| `feishu_api.py` | 飞书 API：获取 token、拉取/回复消息、文本分段与构造 |
+| `claude_runner.py` | 调用 `claude` CLI、解析 stream-json、删除磁盘 session 文件 |
+
+依赖方向单向：`feishu_claude → bot → {db, feishu_api, claude_runner}`。
+
+### 多机器人
+
+每个机器人 = 一份 `.env.<name>` 配置（自己的 app/chat_id/工作目录）= 一个进程。同一
+`chat_id` 的消息在该进程的单循环里**串行处理**，无并发；不同机器人是独立进程，互不阻塞。
+数据库三张表按 `chat_id` 隔离，多机器人共享同一套表。token 缓存按 `app_id` 分键。
 
 ## 配置文件
 
@@ -55,17 +73,19 @@ DB_PASSWORD=xxxxxxxx
 # 首次安装依赖（使用项目虚拟环境）
 python -m venv .venv && .venv/bin/pip install requests psycopg2-binary
 
-# 后台启动（prod 环境）
+# 后台启动（prod 机器人，读 .env.prod）
 ./restart.sh
 
-# 指定 test 环境
+# 启动其它机器人（每个 .env.<name> 一个，独立进程并行运行）
 ./restart.sh test
+./restart.sh mybot
 
-# 查看日志
-tail -f ~/run/log/feishu-bot.log
+# 查看某个机器人的日志
+tail -f ~/run/log/feishu-bot-prod.log
 ```
 
-`restart.sh` 会自动停止旧进程（通过 `~/run/feishu_bot/run.pid`），再以 nohup 启动新进程。
+`restart.sh <name>` 会按机器人名停止旧进程（`~/run/feishu_bot/<name>.pid`）再 nohup 重启，
+不同机器人互不影响。日志分文件：`~/run/log/feishu-bot-<name>.log`。
 
 ## 群聊命令
 
@@ -127,10 +147,13 @@ ORDER BY id DESC LIMIT 20;
 ## 文件结构
 
 ```
-feishu_claude.py   # 主服务脚本
-restart.sh         # 停止旧进程并重新启动
-.env.prod          # 生产环境配置（不入 git）
-.env.test          # 测试环境配置（不入 git）
-~/run/feishu_bot/run.pid   # 运行时 PID 文件
-~/run/log/feishu-bot.log   # 运行日志
+feishu_claude.py   # 入口：参数解析 + PID 管理 + 启动 Bot
+bot.py             # Bot 类：消息分发、命令处理、会话编排
+db.py              # 数据库层：建表 + 持久化/审计
+feishu_api.py      # 飞书 API：token / 拉取 / 回复 / 文本构造
+claude_runner.py   # 调用 claude CLI + 删除磁盘 session 文件
+restart.sh         # 按机器人名停止旧进程并重启
+.env.<name>        # 每个机器人一份配置（不入 git）
+~/run/feishu_bot/<name>.pid   # 各机器人的 PID 文件
+~/run/log/feishu-bot-<name>.log   # 各机器人的运行日志
 ```

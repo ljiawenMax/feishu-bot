@@ -2,9 +2,11 @@
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-PID_FILE="$HOME/run/feishu_bot/run.pid"
-LOG_FILE="$HOME/run/log/feishu-bot.log"
 ENV="${1:-prod}"
+# 每个机器人独立的 PID 与日志，多机器人可并行重启互不干扰
+PID_FILE="$HOME/run/feishu_bot/$ENV.pid"
+LOG_FILE="$HOME/run/log/feishu-bot-$ENV.log"
+mkdir -p "$(dirname "$LOG_FILE")"
 
 # 停止旧进程
 if [ -f "$PID_FILE" ]; then
