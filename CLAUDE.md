@@ -12,9 +12,10 @@
 
 - `feishu_claude.py` — 入口：解析 `.env.<name>`、建 DB engine、为 `BOTS` 列表每项起一个线程、管理 PID
 - `bot.py` — `Bot` 类：单个机器人的消息分发、命令处理、会话编排（业务主体，改功能主要看这里）
-- `models.py` — SQLAlchemy ORM 模型：`BotState` / `Conversation`(表 sessions) / `Message`
+- `models.py` — SQLAlchemy ORM 模型：`BotState` / `Conversation`(表 sessions) / `Message` / `Upload`(表 uploads)
 - `db.py` — 数据库层：engine/session 管理 + 基于 ORM 的数据访问（不再手写 SQL）
-- `feishu_api.py` — 飞书 API：token、拉取/回复消息、文本分段与构造
+- `feishu_api.py` — 飞书 API：token、拉取/回复消息、下载资源、文本分段与构造
+- `uploads.py` — 上传图片/文件/压缩包的安全下载与存储（隔离目录 700、文件 600、文件名消毒、不自动解压）
 - `claude_runner.py` — 调用 `claude` CLI、解析 stream-json、删除磁盘 session 文件
 - `.env` — 配置模板（入 git）；`.env.local` — 实际配置（不入 git）
 

@@ -11,6 +11,7 @@ import time
 import claude_runner
 import db
 import feishu_api
+import uploads
 
 HELP_TEXT = "\n".join([
     "可用命令：",
@@ -319,7 +320,33 @@ class Bot:
             else:
                 feishu_api.reply_message(token, msg["id"], f"无效序号，请输入 1～{len(sessions)}")
 
+    def handle_upload(self, token, msg):
+        """下载并安全存储上传的图片/文件/压缩包，写台账，回复保存路径。"""
+        try:
+            info = uploads.save_upload(token, msg, self.chat_id)
+        except uploads.TooLarge:
+            mb = uploads.MAX_UPLOAD_BYTES // (1024 * 1024)
+            feishu_api.reply_message(token, msg["id"], f"文件超过大小上限（>{mb}MB），未保存")
+            return
+        except Exception as e:
+            feishu_api.reply_message(token, msg["id"], f"[error] 保存上传文件失败: {e}")
+            print(f"[{self.name}][upload-error] {e}")
+            return
+        self.db(db.record_upload, msg["id"], self.chat_id, msg.get("resource_type"),
+                info["file_name"], info["path"], info["size"], info["content_type"])
+        feishu_api.reply_message(token, msg["id"], "\n".join([
+            "已保存上传文件：",
+            info["path"],
+            f"大小 {info['size_human']}",
+            "（如需分析，发任务引用此路径）",
+        ]))
+        print(f"[{self.name}][upload] {info['path']} ({info['size_human']})")
+
     def handle_message(self, token, msg):
+        # 文件类消息（图片/文件/压缩包）先分流（这些消息没有 text 字段）
+        if msg.get("kind") == "file":
+            self.handle_upload(token, msg)
+            return
         text = msg["text"].strip()
         # 等待序号时，数字消息用于选择
         if self.pending and text.isdigit():

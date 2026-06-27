@@ -83,3 +83,23 @@ class Message(Base):
     is_error: Mapped[bool] = mapped_column(Boolean, default=False)
     timed_out: Mapped[bool] = mapped_column(Boolean, default=False)
     created_at: Mapped["DateTime"] = mapped_column(DateTime, server_default=func.now())
+
+
+class Upload(Base):
+    """上传文件台账（独立于会话 messages）。"""
+
+    __tablename__ = "uploads"
+    __table_args__ = (
+        Index("idx_uploads_chat", "chat_id", "created_at"),
+        TABLE_KW,
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    message_id: Mapped[str | None] = mapped_column(String(128))
+    chat_id: Mapped[str | None] = mapped_column(String(64))
+    resource_type: Mapped[str | None] = mapped_column(String(16))  # image/file/media/audio
+    file_name: Mapped[str | None] = mapped_column(String(255))
+    path: Mapped[str | None] = mapped_column(String(1024))
+    size: Mapped[int | None] = mapped_column(BigInteger)
+    content_type: Mapped[str | None] = mapped_column(String(128))
+    created_at: Mapped["DateTime"] = mapped_column(DateTime, server_default=func.now())

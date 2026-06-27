@@ -55,24 +55,71 @@ def fetch_new_messages(token, chat_id, since_ts):
     items = data.get("data", {}).get("items", [])
     messages = []
     for item in items:
-        if item.get("msg_type") != "text":
-            continue
         # 过滤 bot 自身发出的消息
         if item.get("sender", {}).get("sender_type") != "user":
             continue
+        msg_type = item.get("msg_type")
         try:
             content = json.loads(item["body"]["content"])
-            text = content.get("text", "").strip()
         except Exception:
             continue
-        if not text:
-            continue
-        messages.append({
-            "id": item["message_id"],
-            "text": text,
-            "create_time": item["create_time"],
-        })
+
+        base = {"id": item["message_id"], "create_time": item["create_time"]}
+
+        if msg_type == "text":
+            text = content.get("text", "").strip()
+            if not text:
+                continue
+            messages.append({**base, "kind": "text", "text": text})
+        elif msg_type in ("image", "file", "media", "audio"):
+            parsed = _parse_file_message(msg_type, content)
+            if parsed:
+                messages.append({**base, **parsed})
+        # 其余类型（sticker/location/post 等）暂不支持
+        else:
+            print(f"[skip] 暂不支持的消息类型: {msg_type}")
     return messages
+
+
+def _parse_file_message(msg_type, content):
+    """把图片/文件/音视频消息解析成统一结构，返回 None 表示无法处理。
+    返回 {kind, resource_type, file_key, file_name}。"""
+    if msg_type == "image":
+        key = content.get("image_key")
+        if not key:
+            return None
+        return {"kind": "file", "resource_type": "image", "file_key": key, "file_name": ""}
+    # file / media / audio 都走 type=file 下载
+    key = content.get("file_key")
+    if not key:
+        return None
+    return {
+        "kind": "file",
+        "resource_type": "file",
+        "file_key": key,
+        "file_name": content.get("file_name", ""),
+    }
+
+
+def download_to_file(token, message_id, file_key, resource_type, fileobj, max_bytes):
+    """流式下载消息资源到 fileobj，超过 max_bytes 抛 ValueError。
+    resource_type: 'image' 用 type=image，其它用 type=file。返回 (size, content_type)。"""
+    rtype = "image" if resource_type == "image" else "file"
+    headers = {"Authorization": f"Bearer {token}"}
+    url = f"https://open.feishu.cn/open-apis/im/v1/messages/{message_id}/resources/{file_key}"
+    with requests.get(url, headers=headers, params={"type": rtype},
+                      stream=True, timeout=60) as resp:
+        resp.raise_for_status()
+        content_type = resp.headers.get("Content-Type", "")
+        size = 0
+        for chunk in resp.iter_content(chunk_size=65536):
+            if not chunk:
+                continue
+            size += len(chunk)
+            if size > max_bytes:
+                raise ValueError(f"资源超过大小上限 {max_bytes} 字节")
+            fileobj.write(chunk)
+    return size, content_type
 
 
 def split_text(text, max_len=3900):

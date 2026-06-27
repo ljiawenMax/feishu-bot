@@ -21,12 +21,13 @@
 |------|------|
 | `feishu_claude.py` | 入口：解析配置、建 DB engine、按 `BOTS` 列表为每个机器人起线程、管理 PID |
 | `bot.py` | `Bot` 类：单个机器人的消息分发、命令处理、会话编排（业务主体） |
-| `models.py` | SQLAlchemy ORM 模型：`BotState` / `Conversation`(表 sessions) / `Message` |
+| `models.py` | SQLAlchemy ORM 模型：`BotState` / `Conversation`(表 sessions) / `Message` / `Upload` |
 | `db.py` | 数据库层：engine/session 管理 + 基于 ORM 的数据访问 |
-| `feishu_api.py` | 飞书 API：获取 token、拉取/回复消息、文本分段与构造 |
+| `feishu_api.py` | 飞书 API：获取 token、拉取/回复消息、下载资源、文本分段与构造 |
+| `uploads.py` | 上传文件的安全下载与存储（隔离目录、最小权限、文件名消毒） |
 | `claude_runner.py` | 调用 `claude` CLI、解析 stream-json、删除磁盘 session 文件 |
 
-依赖方向单向：`feishu_claude → bot → {db→models, feishu_api, claude_runner}`。
+依赖方向单向：`feishu_claude → bot → {db→models, feishu_api, uploads→feishu_api, claude_runner}`。
 数据访问用 **SQLAlchemy ORM**（不再手写 SQL），表结构由模型定义、`create_all()` 自动建表。
 
 ### 多机器人（单进程多线程）
@@ -107,6 +108,17 @@ tail -f ~/run/log/feishu-bot-local.log
 
 非命令消息直接作为任务交给 Claude Code 执行。
 
+## 文件上传
+
+在群里发**图片 / 文件 / 压缩包 / 音视频**，bot 会下载并存到隔离目录，然后回复保存路径。
+
+- **存储位置**：`~/run/feishu_bot/uploads/<chat_id>/`，在所有 work_dir 与代码库之外
+- **最小权限**：目录 `700`、文件 `600`，**绝不加执行位**；文件名消毒（只取 basename + 白名单字符 + 唯一前缀）防路径穿越；大小上限 50MB（`uploads.py` 的 `MAX_UPLOAD_BYTES` 可调）
+- **不自动解压**压缩包（避免 zip 炸弹 / zip-slip），bot 只存不跑
+- 每次上传记一行到 `uploads` 表（台账，独立于会话）
+- **如何分析**：想让 Claude 处理上传的文件，发一条任务引用回复里的路径（如「解压并看看 /path/xxx.zip」），需先 `/permit` 开权限——执行闸门在你手里
+- 暂不支持的消息类型（表情/位置/合并转发等）会被忽略
+
 ## Session 持久化与对话历史
 
 - 每个工作目录独立维护 session 列表，支持创建多个对话并按序号切换
@@ -124,6 +136,7 @@ tail -f ~/run/log/feishu-bot-local.log
 | `bot_state`（`BotState`） | 每个 `chat_id` 的 UI 状态：当前目录、各目录权限模式 |
 | `sessions`（`Conversation`） | 一行一个对话，代理主键 `id`；`claude_session_id` 在首次执行前为 NULL |
 | `messages`（`Message`） | 对话审计日志，每轮用户输入与 LLM 输出各一行，append-only |
+| `uploads`（`Upload`） | 上传文件台账：消息 id、路径、文件名、大小、Content-Type |
 
 ## 对话审计
 
@@ -154,13 +167,15 @@ ORDER BY id DESC LIMIT 20;
 ```
 feishu_claude.py   # 入口：解析配置 + 建 engine + 起线程 + PID 管理
 bot.py             # Bot 类：单机器人消息分发、命令处理、会话编排
-models.py          # SQLAlchemy ORM 模型（BotState/Conversation/Message）
+models.py          # SQLAlchemy ORM 模型（BotState/Conversation/Message/Upload）
 db.py              # 数据库层：engine/session + ORM 数据访问
-feishu_api.py      # 飞书 API：token / 拉取 / 回复 / 文本构造
+feishu_api.py      # 飞书 API：token / 拉取 / 回复 / 下载资源 / 文本构造
+uploads.py         # 上传文件安全下载与存储（隔离目录、最小权限）
 claude_runner.py   # 调用 claude CLI + 删除磁盘 session 文件
 restart.sh         # 按配置名停止旧进程并重启
 .env               # 配置模板（入 git，值留空）
 .env.local         # 实际配置（不入 git）：DB + BOTS 列表
+~/run/feishu_bot/uploads/<chat_id>/   # 上传文件隔离目录（700）
 ~/run/feishu_bot/<name>.pid    # PID 文件（默认 local.pid）
 ~/run/log/feishu-bot-<name>.log   # 运行日志（默认 feishu-bot-local.log）
 ```
