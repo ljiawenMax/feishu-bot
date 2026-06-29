@@ -105,6 +105,7 @@ tail -f ~/run/log/feishu-bot-local.log
 | `/del <序号>` | 删除指定对话（序号见 `/sessions`），同时删除磁盘上的 Claude session 文件 |
 | `/permit` | 开关当前目录的文件读写权限（`acceptEdits`，限定当前目录，不执行命令） |
 | `/model` | 选择**当前对话**使用的模型（回复序号；`/new` 新对话重置为默认） |
+| `/usage` | 查看 Claude 订阅用量（5 小时窗 / 7 天利用率与重置时间） |
 | `/retry` | 用当前权限重跑上一条任务 |
 
 非命令消息直接作为任务交给 Claude Code 执行。
@@ -162,6 +163,15 @@ ORDER BY id DESC LIMIT 20;
 - 选定后任务以 `claude --model <名称>` 运行；未选则用 Claude Code 默认模型
 - 可选清单由 `.env.local` 的 `MODELS`（JSON 数组）配置，默认 `["opus","sonnet","haiku"]`
 - 每次任务**实际所用模型**（从 stream-json 的 assistant 事件捕获）会：① 在回复末尾显示「（模型：…）」；② 写入 `messages.model` 审计列
+
+## 订阅用量
+
+`/usage` 查看 Claude 订阅（Pro/Max）的实时用量：5 小时窗、7 天的利用率百分比与重置时间。
+
+- 数据来源：官方端点 `GET https://api.anthropic.com/api/oauth/usage`（Claude Code 交互式 `/usage` 背后的同一接口）
+- 需要本机**已登录过 claude**（读取 `~/.claude/.credentials.json` 的 OAuth token；token 仅本机直连 Anthropic 官方端点）
+- 该端点未公开且限流很严：本命令**按需调用 + 60s 内复用缓存**，绝不轮询；被限流（429）时回退显示上次结果
+- token 一般是新鲜的（bot 频繁跑 `claude`，Claude Code 会自动刷新凭证）；若过期会提示在终端跑一次 claude 刷新
 
 ## 权限模式
 

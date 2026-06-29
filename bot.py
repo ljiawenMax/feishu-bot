@@ -13,6 +13,7 @@ import claude_runner
 import db
 import feishu_api
 import uploads
+import usage
 
 HELP_TEXT = "\n".join([
     "可用命令：",
@@ -23,6 +24,7 @@ HELP_TEXT = "\n".join([
     "/del <序号> — 删除指定对话（序号见 /sessions）",
     "/permit    — 开关当前目录的文件读写（acceptEdits，不跑命令）",
     "/model     — 选择当前对话使用的模型",
+    "/usage     — 查看 Claude 订阅用量（5 小时窗 / 7 天）",
     "/retry     — 用当前权限重跑上一条任务",
     "/help      — 显示此帮助",
 ])
@@ -66,6 +68,7 @@ class Bot:
             "/new": self.cmd_new,
             "/permit": self.cmd_permit,
             "/model": self.cmd_model,
+            "/usage": self.cmd_usage,
             "/del": self.cmd_del,
             "/retry": self.cmd_retry,
         }
@@ -238,6 +241,21 @@ class Bot:
             lines.append(f"{i}. {name}{' ◀ 当前' if i - 1 == cur_pos else ''}")
         self.pending = "model"
         feishu_api.reply_message(token, msg["id"], "\n".join(lines))
+
+    def cmd_usage(self, token, msg, arg):
+        """查看 Claude 订阅用量（官方 oauth/usage 端点，按需+缓存）。"""
+        try:
+            text = usage.report()
+        except usage.NoCredentials as e:
+            text = f"查不到用量：{e}"
+        except usage.TokenExpired as e:
+            text = str(e)
+        except usage.RateLimited:
+            text = "用量端点暂时限流，请稍后再试"
+        except Exception as e:
+            text = f"[error] 查询用量失败: {e}"
+        feishu_api.reply_message(token, msg["id"], text)
+        print(f"[{self.name}][usage] queried")
 
     def cmd_del(self, token, msg, arg):
         dir_name = self.last_dir["name"]
