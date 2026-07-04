@@ -20,10 +20,13 @@ def build_task_with_history(task, history):
 
 
 def run_claude(task, work_dir, timeout, session_id=None, permit=False, extra_dirs=None,
-               history=None, model=None):
+               history=None, model=None, unsafe=False):
     cmd = ["claude", "-p", task, "--output-format", "stream-json", "--verbose"]
-    # permit 开启 = acceptEdits：可在工作区（cwd + extra_dirs）内读写/改文件，但不执行任意命令
-    if permit:
+    # unsafe 优先级最高：跳过全部权限校验（可执行任意命令，含 bash）
+    # permit = acceptEdits：可在工作区（cwd + extra_dirs）内读写/改文件，但不执行任意命令
+    if unsafe:
+        cmd += ["--dangerously-skip-permissions"]
+    elif permit:
         cmd += ["--permission-mode", "acceptEdits"]
     for d in (extra_dirs or []):
         cmd += ["--add-dir", d]
@@ -63,7 +66,7 @@ def run_claude(task, work_dir, timeout, session_id=None, permit=False, extra_dir
                     print(f"[warn] session {session_id[:8]}… expired, rebuilding context")
                     recovered_task = build_task_with_history(task, history or [])
                     return run_claude(recovered_task, work_dir, timeout, session_id=None,
-                                      permit=permit, extra_dirs=extra_dirs, model=model)
+                                      permit=permit, extra_dirs=extra_dirs, model=model, unsafe=unsafe)
                 return f"[error] {'; '.join(errors) or 'unknown error'}", None, used_model
             new_session_id = event.get("session_id")
             result = event.get("result") or "".join(text_parts).strip()
@@ -73,7 +76,7 @@ def run_claude(task, work_dir, timeout, session_id=None, permit=False, extra_dir
                     print(f"[warn] session {session_id[:8]}… returned empty, retrying fresh")
                     recovered_task = build_task_with_history(task, history or [])
                     return run_claude(recovered_task, work_dir, timeout, session_id=None,
-                                      permit=permit, extra_dirs=extra_dirs, model=model)
+                                      permit=permit, extra_dirs=extra_dirs, model=model, unsafe=unsafe)
                 return "(no output)", new_session_id, used_model
             if timed_out:
                 result += f"\n\n[超时（>{timeout}s），响应可能不完整]"

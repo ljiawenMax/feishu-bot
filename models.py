@@ -41,7 +41,8 @@ class BotState(Base):
 
     chat_id: Mapped[str] = mapped_column(String(64), primary_key=True)
     last_dir_name: Mapped[str | None] = mapped_column(String(128))
-    permit_modes: Mapped[dict] = mapped_column(JSON, default=dict)
+    permit_modes: Mapped[dict] = mapped_column(JSON, default=dict)  # {dir: bool} acceptEdits
+    unsafe_modes: Mapped[dict] = mapped_column(JSON, default=dict)  # {dir: bool} 跳过全部权限
     updated_at: Mapped["DateTime"] = mapped_column(DateTime, server_default=func.now())
 
 

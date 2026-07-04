@@ -23,6 +23,7 @@ HELP_TEXT = "\n".join([
     "/name <名称> — 重命名当前对话",
     "/del <序号> — 删除指定对话（序号见 /sessions）",
     "/permit    — 开关当前目录的文件读写（acceptEdits，不跑命令）",
+    "/unsafe    — 开关当前目录的最高权限（跳过全部权限校验，可执行 bash 命令，谨慎）",
     "/model     — 选择当前对话使用的模型",
     "/usage     — 查看 Claude 订阅用量（5 小时窗 / 7 天）",
     "/retry     — 用当前权限重跑上一条任务",
@@ -54,7 +55,8 @@ class Bot:
         self.last_dir = {"name": name, "path": self.work_dirs[name]}
         # {dir_name: {"list": [{id, label, _row_id}, ...], "current": idx, "history": [...]}}
         self.dir_sessions = state.get("dir_sessions", {})
-        self.permit_modes = state.get("permit_modes", {})  # {dir_name: bool}
+        self.permit_modes = state.get("permit_modes", {})  # {dir_name: bool} acceptEdits
+        self.unsafe_modes = state.get("unsafe_modes", {})  # {dir_name: bool} 跳过全部权限
 
         self.pending = None   # "dir" | "session"，当前等待用户回复序号的类型
         self.last_task = None  # {"text", "msg_id", "dir_name", "session_id"}，用于 /retry 重跑
@@ -67,6 +69,7 @@ class Bot:
             "/name": self.cmd_name,
             "/new": self.cmd_new,
             "/permit": self.cmd_permit,
+            "/unsafe": self.cmd_unsafe,
             "/model": self.cmd_model,
             "/usage": self.cmd_usage,
             "/del": self.cmd_del,
@@ -88,7 +91,8 @@ class Bot:
                 return None
 
     def save_bot_state(self):
-        self.db(db.save_bot_state, self.chat_id, self.last_dir["name"], self.permit_modes)
+        self.db(db.save_bot_state, self.chat_id, self.last_dir["name"],
+                self.permit_modes, self.unsafe_modes)
 
     # -------------------------------------------------------------- session
 
@@ -149,6 +153,7 @@ class Bot:
         """调用 Claude Code，处理超时/异常，成功时同步 session_id 到 DB。
         返回 (result, new_sid, used_model)。"""
         permit = self.permit_modes.get(dir_name, False)
+        unsafe = self.unsafe_modes.get(dir_name, False)
         # 始终把该聊天上传目录纳入工作区（存在才加），让 Claude 能读上传文件
         up = uploads.chat_dir(self.chat_id)
         extra_dirs = [up] if os.path.isdir(up) else []
@@ -157,7 +162,8 @@ class Bot:
         try:
             result, new_sid, used_model = claude_runner.run_claude(
                 text, self.work_dirs[dir_name], self.task_timeout,
-                session_id, permit=permit, extra_dirs=extra_dirs, history=history, model=model,
+                session_id, permit=permit, extra_dirs=extra_dirs, history=history,
+                model=model, unsafe=unsafe,
             )
             if new_sid:
                 self.update_session(dir_name, new_sid, first_task=first_task)
@@ -171,7 +177,7 @@ class Bot:
 
     def cmd_ls(self, token, msg, arg):
         self.pending = "dir"
-        feishu_api.reply_message(token, msg["id"], feishu_api.build_dir_prompt(self.dir_names))
+        feishu_api.reply_message(token, msg["id"], feishu_api.build_dir_prompt(self.dir_names, self.last_dir["name"]))
 
     def cmd_sessions(self, token, msg, arg):
         dir_name = self.last_dir["name"]
@@ -220,6 +226,18 @@ class Bot:
         status = "已开启（可在当前目录读写/修改文件，不执行命令）" if on else "已关闭"
         feishu_api.reply_message(token, msg["id"], f"[{dir_name}] 权限模式 {status}")
         print(f"[permit] {dir_name}={on}")
+        if on and self.last_task:
+            feishu_api.reply_message(token, msg["id"], "是否用新权限重跑上一条任务？发送 /retry 确认")
+
+    def cmd_unsafe(self, token, msg, arg):
+        dir_name = self.last_dir["name"]
+        self.unsafe_modes[dir_name] = not self.unsafe_modes.get(dir_name, False)
+        on = self.unsafe_modes[dir_name]
+        self.save_bot_state()
+        status = ("已开启（跳过全部权限校验，可执行任意命令含 bash，请谨慎）"
+                  if on else "已关闭")
+        feishu_api.reply_message(token, msg["id"], f"[{dir_name}] 最高权限 {status}")
+        print(f"[unsafe] {dir_name}={on}")
         if on and self.last_task:
             feishu_api.reply_message(token, msg["id"], "是否用新权限重跑上一条任务？发送 /retry 确认")
 
@@ -333,7 +351,8 @@ class Bot:
         history = self.dir_sessions.get(dir_name, {}).get("history", [])
         self.last_task = {"text": text, "msg_id": msg["id"], "dir_name": dir_name, "session_id": session_id}
         permit_mode = self.permit_modes.get(dir_name, False)
-        print(f"[{self.name}][task] dir={dir_name} permit={permit_mode} "
+        unsafe_mode = self.unsafe_modes.get(dir_name, False)
+        print(f"[{self.name}][task] dir={dir_name} permit={permit_mode} unsafe={unsafe_mode} "
               f"session={'new' if is_new else session_id[:8] + '…'} | {text[:60]}")
         feishu_api.reply_message(token, msg["id"], f"正在 [{dir_name}] 执行任务，请稍候…")
 

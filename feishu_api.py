@@ -202,10 +202,11 @@ def reply_message(token, message_id, text):
     return ok
 
 
-def build_dir_prompt(dir_names):
+def build_dir_prompt(dir_names, current_name=None):
     lines = ["请选择工作目录，回复序号："]
     for i, name in enumerate(dir_names, 1):
-        lines.append(f"{i}. {name}")
+        marker = " ◀ 当前" if name == current_name else ""
+        lines.append(f"{i}. {name}{marker}")
     return "\n".join(lines)
 
 

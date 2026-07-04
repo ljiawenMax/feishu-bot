@@ -32,6 +32,7 @@ def migrate(engine):
     adds = [
         ("sessions", "model", "VARCHAR(64)"),
         ("messages", "model", "VARCHAR(64)"),
+        ("bot_state", "unsafe_modes", "JSON"),
     ]
     with engine.begin() as c:
         for tbl, col, typ in adds:
@@ -52,12 +53,13 @@ def make_session_factory(engine):
 
 def load_state(s, chat_id):
     """从 DB 恢复 last_dir_name / permit_modes / dir_sessions（含 _row_id 与 history）"""
-    state = {"last_dir_name": None, "permit_modes": {}, "dir_sessions": {}}
+    state = {"last_dir_name": None, "permit_modes": {}, "unsafe_modes": {}, "dir_sessions": {}}
 
     bs = s.get(BotState, chat_id)
     if bs:
         state["last_dir_name"] = bs.last_dir_name
         state["permit_modes"] = bs.permit_modes or {}
+        state["unsafe_modes"] = bs.unsafe_modes or {}
 
     # 重建每个目录的 session 列表
     rows = s.scalars(
@@ -101,8 +103,9 @@ def load_history(s, chat_id, claude_sid, limit=40):
     return [{"role": r[0], "content": r[1]} for r in reversed(rows)]
 
 
-def save_bot_state(s, chat_id, last_dir_name, permit_modes):
-    s.merge(BotState(chat_id=chat_id, last_dir_name=last_dir_name, permit_modes=permit_modes))
+def save_bot_state(s, chat_id, last_dir_name, permit_modes, unsafe_modes):
+    s.merge(BotState(chat_id=chat_id, last_dir_name=last_dir_name,
+                     permit_modes=permit_modes, unsafe_modes=unsafe_modes))
 
 
 def insert_session(s, chat_id, dir_name, label, position, claude_sid=None):
