@@ -222,9 +222,14 @@ class Bot:
         dir_name = self.last_dir["name"]
         self.permit_modes[dir_name] = not self.permit_modes.get(dir_name, False)
         on = self.permit_modes[dir_name]
+        # 与 unsafe 互斥：开 permit 则关掉 unsafe
+        cleared = on and self.unsafe_modes.get(dir_name, False)
+        if on:
+            self.unsafe_modes[dir_name] = False
         self.save_bot_state()
         status = "已开启（可在当前目录读写/修改文件，不执行命令）" if on else "已关闭"
-        feishu_api.reply_message(token, msg["id"], f"[{dir_name}] 权限模式 {status}")
+        note = "（已自动关闭最高权限 unsafe）" if cleared else ""
+        feishu_api.reply_message(token, msg["id"], f"[{dir_name}] 权限模式 {status}{note}")
         print(f"[permit] {dir_name}={on}")
         if on and self.last_task:
             feishu_api.reply_message(token, msg["id"], "是否用新权限重跑上一条任务？发送 /retry 确认")
@@ -233,10 +238,15 @@ class Bot:
         dir_name = self.last_dir["name"]
         self.unsafe_modes[dir_name] = not self.unsafe_modes.get(dir_name, False)
         on = self.unsafe_modes[dir_name]
+        # 与 permit 互斥：开 unsafe 则关掉 permit
+        cleared = on and self.permit_modes.get(dir_name, False)
+        if on:
+            self.permit_modes[dir_name] = False
         self.save_bot_state()
         status = ("已开启（跳过全部权限校验，可执行任意命令含 bash，请谨慎）"
                   if on else "已关闭")
-        feishu_api.reply_message(token, msg["id"], f"[{dir_name}] 最高权限 {status}")
+        note = "（已自动关闭文件读写 permit）" if cleared else ""
+        feishu_api.reply_message(token, msg["id"], f"[{dir_name}] 最高权限 {status}{note}")
         print(f"[unsafe] {dir_name}={on}")
         if on and self.last_task:
             feishu_api.reply_message(token, msg["id"], "是否用新权限重跑上一条任务？发送 /retry 确认")
@@ -323,16 +333,27 @@ class Bot:
         short = used_model[7:] if used_model.startswith("claude-") else used_model
         return f"\n\n（模型：{short}）"
 
+    def _permit_banner(self, dir_name):
+        """当前目录若开着 permit/unsafe，返回提醒文案（防止开启后忘关）。互斥后至多一条。"""
+        if self.unsafe_modes.get(dir_name, False):
+            return f"⚠️ [{dir_name}] 最高权限(unsafe)开启中，可执行任意命令 — 用完发 /unsafe 关闭"
+        if self.permit_modes.get(dir_name, False):
+            return f"🔓 [{dir_name}] 文件读写(permit)开启中 — 用完发 /permit 关闭"
+        return ""
+
     def cmd_retry(self, token, msg, arg):
         t = self.last_task
         if not t:
             feishu_api.reply_message(token, msg["id"], "没有可重跑的任务")
             return
-        feishu_api.reply_message(token, msg["id"], f"正在 [{t['dir_name']}] 重跑任务，请稍候…")
+        banner = self._permit_banner(t["dir_name"])
+        start = f"正在 [{t['dir_name']}] 重跑任务，请稍候…" + (("\n" + banner) if banner else "")
+        feishu_api.reply_message(token, msg["id"], start)
         result, new_sid, used_model = self.execute_claude(t["text"], t["dir_name"], t["session_id"])
         self.audit(t["dir_name"], t["text"], result, new_sid, used_model)
         suffix = "" if result.startswith("[error]") else self._model_suffix(used_model)
-        feishu_api.reply_message(token, t["msg_id"], result + suffix)
+        tail = suffix + (("\n\n" + banner) if banner else "")
+        feishu_api.reply_message(token, t["msg_id"], result + tail)
         print("[retry] done")
 
     # --------------------------------------------------------------- 任务执行
@@ -354,7 +375,9 @@ class Bot:
         unsafe_mode = self.unsafe_modes.get(dir_name, False)
         print(f"[{self.name}][task] dir={dir_name} permit={permit_mode} unsafe={unsafe_mode} "
               f"session={'new' if is_new else session_id[:8] + '…'} | {text[:60]}")
-        feishu_api.reply_message(token, msg["id"], f"正在 [{dir_name}] 执行任务，请稍候…")
+        banner = self._permit_banner(dir_name)
+        start = f"正在 [{dir_name}] 执行任务，请稍候…" + (("\n" + banner) if banner else "")
+        feishu_api.reply_message(token, msg["id"], start)
 
         result, new_sid, used_model = self.execute_claude(
             text, dir_name, session_id, history=history,
@@ -371,7 +394,8 @@ class Bot:
 
         self.audit(dir_name, text, result, new_sid, used_model)
         suffix = "" if result.startswith("[error]") else self._model_suffix(used_model)
-        feishu_api.reply_message(token, msg["id"], result + suffix)
+        tail = suffix + (("\n\n" + banner) if banner else "")
+        feishu_api.reply_message(token, msg["id"], result + tail)
         print(f"[{self.name}][done] replied to {msg['id']} model={used_model}")
 
     # ---------------------------------------------------------- 消息处理 / 主循环
