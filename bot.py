@@ -7,6 +7,7 @@ Bot.run() 的单循环里串行处理，天然无并发。多机器人通过多�
 
 import os
 import subprocess
+import threading
 import time
 
 import claude_runner
@@ -34,7 +35,8 @@ HELP_TEXT = "\n".join([
 class Bot:
     """飞书消息驱动 Claude Code 的轮询服务，状态持久化在 MySQL。"""
 
-    def __init__(self, bot_cfg, session_factory, poll_interval, task_timeout, models=None):
+    def __init__(self, bot_cfg, session_factory, poll_interval, task_timeout, models=None,
+                 heartbeat_interval=60):
         self.name = bot_cfg["name"]
         self.app_id = bot_cfg["app_id"]
         self.app_secret = bot_cfg["app_secret"]
@@ -44,6 +46,7 @@ class Bot:
         self.poll_interval = poll_interval
         self.task_timeout = task_timeout
         self.models = models or ["opus", "sonnet", "haiku"]  # /model 可选清单
+        self.heartbeat_interval = heartbeat_interval  # 长任务心跳间隔秒数，0=禁用
         self.default_name = self.dir_names[0] if self.dir_names else "daily-assistant"
 
         self.Session = session_factory
@@ -341,6 +344,23 @@ class Bot:
             return f"🔓 [{dir_name}] 文件读写(permit)开启中 — 用完发 /permit 关闭"
         return ""
 
+    def _start_heartbeat(self, token, msg_id, dir_name):
+        """长任务期间周期回「仍在处理」，返回 stop_event；调用方在 finally 里 .set()。"""
+        stop = threading.Event()
+        if self.heartbeat_interval <= 0:
+            return stop
+        started = time.time()
+
+        def beat():
+            interval = self.heartbeat_interval
+            while not stop.wait(interval):          # 被 set 时立即返回 True 退出
+                elapsed = int(time.time() - started)
+                feishu_api.reply_message(token, msg_id, f"⏳ [{dir_name}] 仍在处理中，已用 {elapsed}s…")
+                interval = min(interval * 2, 600)   # 逐步加倍、上限 10 分钟，防刷屏
+
+        threading.Thread(target=beat, name="heartbeat", daemon=True).start()
+        return stop
+
     def cmd_retry(self, token, msg, arg):
         t = self.last_task
         if not t:
@@ -349,7 +369,11 @@ class Bot:
         banner = self._permit_banner(t["dir_name"])
         start = f"正在 [{t['dir_name']}] 重跑任务，请稍候…" + (("\n" + banner) if banner else "")
         feishu_api.reply_message(token, msg["id"], start)
-        result, new_sid, used_model = self.execute_claude(t["text"], t["dir_name"], t["session_id"])
+        stop = self._start_heartbeat(token, t["msg_id"], t["dir_name"])
+        try:
+            result, new_sid, used_model = self.execute_claude(t["text"], t["dir_name"], t["session_id"])
+        finally:
+            stop.set()
         self.audit(t["dir_name"], t["text"], result, new_sid, used_model)
         suffix = "" if result.startswith("[error]") else self._model_suffix(used_model)
         tail = suffix + (("\n\n" + banner) if banner else "")
@@ -379,10 +403,14 @@ class Bot:
         start = f"正在 [{dir_name}] 执行任务，请稍候…" + (("\n" + banner) if banner else "")
         feishu_api.reply_message(token, msg["id"], start)
 
-        result, new_sid, used_model = self.execute_claude(
-            text, dir_name, session_id, history=history,
-            first_task=text if is_new else None,
-        )
+        stop = self._start_heartbeat(token, msg["id"], dir_name)
+        try:
+            result, new_sid, used_model = self.execute_claude(
+                text, dir_name, session_id, history=history,
+                first_task=text if is_new else None,
+            )
+        finally:
+            stop.set()
         # 更新对话历史（保留最近 20 轮避免 prompt 过长）
         if not result.startswith("[error]"):
             data = self.dir_sessions.setdefault(dir_name, {"list": [], "current": 0, "history": []})

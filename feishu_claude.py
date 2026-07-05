@@ -41,6 +41,7 @@ def load_config(env_name):
         },
         "poll_interval": int(env["POLL_INTERVAL"]),
         "task_timeout": int(env["TASK_TIMEOUT"]),
+        "heartbeat_interval": int(env.get("HEARTBEAT_INTERVAL", 60)),
         "models": json.loads(env.get("MODELS") or '["opus","sonnet","haiku"]'),
         "bots": json.loads(env["BOTS"]),
     }
@@ -74,7 +75,8 @@ def main():
     db.migrate(engine)
     session_factory = db.make_session_factory(engine)
 
-    bots = [Bot(bc, session_factory, cfg["poll_interval"], cfg["task_timeout"], cfg["models"])
+    bots = [Bot(bc, session_factory, cfg["poll_interval"], cfg["task_timeout"], cfg["models"],
+                cfg["heartbeat_interval"])
             for bc in cfg["bots"]]
     print(f"[feishu-claude-bot] env={args.env}, bots={[b.name for b in bots]}")
 
