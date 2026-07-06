@@ -19,9 +19,17 @@ def build_task_with_history(task, history):
     return "\n".join(lines)
 
 
+SYNC_SYSTEM_PROMPT = (
+    "你在一次性非交互环境中执行任务：没有独立后台进程，也无法在结束后主动通知用户。"
+    "请在本次运行内同步完成全部工作（含数据下载、解析、计算与分析），把最终结果直接作为回复输出。"
+    "即使耗时很久也要持续执行到真正完成，严禁回复「已在后台运行」「稍后通知你」之类未完成的话。"
+)
+
+
 def run_claude(task, work_dir, timeout, session_id=None, permit=False, extra_dirs=None,
                history=None, model=None, unsafe=False):
-    cmd = ["claude", "-p", task, "--output-format", "stream-json", "--verbose"]
+    cmd = ["claude", "-p", task, "--output-format", "stream-json", "--verbose",
+           "--append-system-prompt", SYNC_SYSTEM_PROMPT]
     # unsafe 优先级最高：跳过全部权限校验（可执行任意命令，含 bash）
     # permit = acceptEdits：可在工作区（cwd + extra_dirs）内读写/改文件，但不执行任意命令
     if unsafe:
