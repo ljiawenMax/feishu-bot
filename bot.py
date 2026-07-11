@@ -19,13 +19,12 @@ import usage
 
 HELP_TEXT = "\n".join([
     "可用命令：",
-    "/ls        — 列出工作目录，回复序号切换",
-    "/sessions  — 列出当前目录的对话，回复序号切换",
+    "/sessions  — 列出对话，回复序号切换",
     "/new       — 新建对话（清空历史）",
     "/name <名称> — 重命名当前对话",
     "/del <序号> — 删除指定对话（序号见 /sessions）",
-    "/permit    — 开关当前目录的文件读写（acceptEdits，不跑命令）",
-    "/unsafe    — 开关当前目录的最高权限（跳过全部权限校验，可执行 bash 命令，谨慎）",
+    "/permit    — 开关工作区文件读写（acceptEdits，不跑命令）",
+    "/unsafe    — 开关最高权限（跳过全部权限校验，可执行 bash 命令，谨慎）",
     "/model     — 选择当前对话使用的模型",
     "/usage     — 查看 Claude 订阅用量（5 小时窗 / 7 天）",
     "/retry     — 用当前权限重跑上一条任务",
@@ -42,28 +41,24 @@ class Bot:
         self.app_id = bot_cfg["app_id"]
         self.app_secret = bot_cfg["app_secret"]
         self.chat_id = bot_cfg["chat_id"]
-        self.work_dirs = bot_cfg["work_dirs"]  # 已是 dict
-        self.dir_names = list(self.work_dirs.keys())
+        # 一 chat 一 work_dir；省略时回退家目录，配置值支持 ~
+        self.work_dir = os.path.expanduser(bot_cfg.get("work_dir") or "~")
         self.poll_interval = poll_interval
         self.task_timeout = task_timeout
         self.models = models or ["opus", "sonnet", "haiku"]  # /model 可选清单
         self.heartbeat_interval = heartbeat_interval  # 长任务心跳间隔秒数，0=禁用
-        self.default_name = self.dir_names[0] if self.dir_names else "daily-assistant"
 
         self.Session = session_factory
 
-        # 恢复持久化状态
+        # 恢复持久化状态（单一会话列表 + 单一权限开关）
         state = self.db(db.load_state, self.chat_id) or {}
-        saved = state.get("last_dir_name")
-        name = saved if saved in self.work_dirs else self.default_name
-        self.last_dir = {"name": name, "path": self.work_dirs[name]}
-        # {dir_name: {"list": [{id, label, _row_id}, ...], "current": idx, "history": [...]}}
-        self.dir_sessions = state.get("dir_sessions", {})
-        self.permit_modes = state.get("permit_modes", {})  # {dir_name: bool} acceptEdits
-        self.unsafe_modes = state.get("unsafe_modes", {})  # {dir_name: bool} 跳过全部权限
+        # {"list": [{id, label, model, _row_id}, ...], "current": idx, "history": [...]}
+        self.sessions = state.get("sessions") or {"list": [], "current": 0, "history": []}
+        self.permit_mode = state.get("permit", False)  # acceptEdits：工作区内读写文件
+        self.unsafe_mode = state.get("unsafe", False)  # 跳过全部权限校验
 
-        self.pending = None   # "dir" | "session"，当前等待用户回复序号的类型
-        self.last_task = None  # {"text", "msg_id", "dir_name", "session_id"}，用于 /retry 重跑
+        self.pending = None   # "session" | "model"，当前等待用户回复序号的类型
+        self.last_task = None  # {"text", "msg_id", "session_id"}，用于 /retry 重跑
 
         # 异步执行：任务丢后台 worker 串行跑，主循环不阻塞；lock 护共享会话状态的短临界区
         self.task_queue = queue.Queue()
@@ -71,7 +66,6 @@ class Bot:
 
         # 命令分发表：命令 -> 处理方法(token, msg, arg)
         self.commands = {
-            "/ls": self.cmd_ls,
             "/sessions": self.cmd_sessions,
             "/help": self.cmd_help,
             "/name": self.cmd_name,
@@ -99,14 +93,13 @@ class Bot:
                 return None
 
     def save_bot_state(self):
-        self.db(db.save_bot_state, self.chat_id, self.last_dir["name"],
-                self.permit_modes, self.unsafe_modes)
+        self.db(db.save_bot_state, self.chat_id, self.permit_mode, self.unsafe_mode)
 
     # -------------------------------------------------------------- session
 
-    def current_session_id(self, dir_name):
-        data = self.dir_sessions.get(dir_name)
-        if not data:
+    def current_session_id(self):
+        data = self.sessions
+        if not data["list"]:
             return None
         return data["list"][data["current"]]["id"]
 
@@ -114,31 +107,33 @@ class Bot:
         ts = time.strftime("%m-%d %H:%M")
         return {"id": None, "label": label or f"新对话 {ts}", "model": None, "_row_id": None}
 
-    def current_entry(self, dir_name):
-        data = self.dir_sessions.get(dir_name)
-        if not data or not data.get("list"):
+    def current_entry(self):
+        data = self.sessions
+        if not data["list"]:
             return None
         return data["list"][data["current"]]
 
-    def make_session(self, dir_name, label=None):
+    def make_session(self, label=None):
         """创建内存 session 条目并在 DB 中建行，返回条目（含 _row_id）。"""
         entry = self.new_entry(label)
-        position = len(self.dir_sessions.get(dir_name, {}).get("list", []))
-        entry["_row_id"] = self.db(db.insert_session, self.chat_id, dir_name, entry["label"], position)
+        position = len(self.sessions["list"])
+        entry["_row_id"] = self.db(db.insert_session, self.chat_id, entry["label"], position)
         return entry
 
-    def set_current(self, dir_name, entry):
+    def set_current(self, entry):
         if entry.get("_row_id"):
-            self.db(db.set_current, self.chat_id, dir_name, entry["_row_id"])
+            self.db(db.set_current, self.chat_id, entry["_row_id"])
 
     def load_history(self, claude_sid):
         return self.db(db.load_history, self.chat_id, claude_sid) or []
 
-    def update_session(self, dir_name, session_id, first_task=None):
+    def update_session(self, session_id, first_task=None):
         """首次执行时写入 session_id 和标签，并同步到 DB。
         在 worker 线程于长调用之后运行，加锁与主循环的会话增删改互斥。"""
         with self.lock:
-            data = self.dir_sessions.setdefault(dir_name, {"list": [], "current": 0})
+            data = self.sessions
+            if not data["list"]:
+                return
             entry = data["list"][data["current"]]
             entry["id"] = session_id
             new_label = None
@@ -149,34 +144,33 @@ class Bot:
             if entry.get("_row_id"):
                 self.db(db.update_session, entry["_row_id"], claude_sid=session_id, label=new_label)
 
-    def audit(self, dir_name, user_text, result, new_session_id, used_model=None):
+    def audit(self, user_text, result, new_session_id, used_model=None):
         """把一轮对话（用户输入 + LLM 输出）写入审计表。"""
-        data = self.dir_sessions.get(dir_name, {})
-        entry = data["list"][data["current"]] if data.get("list") else None
+        entry = self.current_entry()
         row_id = entry.get("_row_id") if entry else None
         sid = (entry.get("id") if entry else None) or new_session_id
-        self.db(db.append_message, row_id, self.chat_id, dir_name, sid, "user", user_text)
-        self.db(db.append_message, row_id, self.chat_id, dir_name, sid, "assistant", result,
+        self.db(db.append_message, row_id, self.chat_id, sid, "user", user_text)
+        self.db(db.append_message, row_id, self.chat_id, sid, "assistant", result,
                 result.startswith("[error]"), "超时" in result, model=used_model)
 
-    def execute_claude(self, text, dir_name, session_id, history=None, first_task=None):
+    def execute_claude(self, text, session_id, history=None, first_task=None):
         """调用 Claude Code，处理超时/异常，成功时同步 session_id 到 DB。
         返回 (result, new_sid, used_model)。"""
-        permit = self.permit_modes.get(dir_name, False)
-        unsafe = self.unsafe_modes.get(dir_name, False)
+        permit = self.permit_mode
+        unsafe = self.unsafe_mode
         # 始终把该聊天上传目录纳入工作区（存在才加），让 Claude 能读上传文件
         up = uploads.chat_dir(self.chat_id)
         extra_dirs = [up] if os.path.isdir(up) else []
-        entry = self.current_entry(dir_name)
+        entry = self.current_entry()
         model = entry.get("model") if entry else None
         try:
             result, new_sid, used_model = claude_runner.run_claude(
-                text, self.work_dirs[dir_name], self.task_timeout,
+                text, self.work_dir, self.task_timeout,
                 session_id, permit=permit, extra_dirs=extra_dirs, history=history,
                 model=model, unsafe=unsafe,
             )
             if new_sid:
-                self.update_session(dir_name, new_sid, first_task=first_task)
+                self.update_session(new_sid, first_task=first_task)
         except subprocess.TimeoutExpired:
             result, new_sid, used_model = f"[error] 任务超时（>{self.task_timeout}s）", None, None
         except Exception as e:
@@ -185,18 +179,13 @@ class Bot:
 
     # ------------------------------------------------------------- commands
 
-    def cmd_ls(self, token, msg, arg):
-        self.pending = "dir"
-        feishu_api.reply_message(token, msg["id"], feishu_api.build_dir_prompt(self.dir_names, self.last_dir["name"]))
-
     def cmd_sessions(self, token, msg, arg):
-        dir_name = self.last_dir["name"]
-        data = self.dir_sessions.get(dir_name)
-        if not data or not data["list"]:
-            feishu_api.reply_message(token, msg["id"], f"[{dir_name}] 当前只有 1 个对话，发送 /new 创建新对话")
+        data = self.sessions
+        if len(data["list"]) <= 1:
+            feishu_api.reply_message(token, msg["id"], "当前只有 1 个对话，发送 /new 创建新对话")
         else:
             self.pending = "session"
-            feishu_api.reply_message(token, msg["id"], feishu_api.build_sessions_prompt(dir_name, data["list"], data["current"]))
+            feishu_api.reply_message(token, msg["id"], feishu_api.build_sessions_prompt(data["list"], data["current"]))
 
     def cmd_help(self, token, msg, arg):
         feishu_api.reply_message(token, msg["id"], HELP_TEXT)
@@ -205,9 +194,8 @@ class Bot:
         if not arg:
             feishu_api.reply_message(token, msg["id"], "用法：/name <名称>")
             return
-        dir_name = self.last_dir["name"]
-        data = self.dir_sessions.get(dir_name)
-        if data and data["list"]:
+        data = self.sessions
+        if data["list"]:
             entry = data["list"][data["current"]]
             entry["label"] = arg
             if entry.get("_row_id"):
@@ -217,61 +205,57 @@ class Bot:
             feishu_api.reply_message(token, msg["id"], "当前没有活跃的对话")
 
     def cmd_new(self, token, msg, arg):
-        dir_name = self.last_dir["name"]
         with self.lock:  # 与 worker 的 update_session 互斥，防会话列表被并发改乱
-            data = self.dir_sessions.setdefault(dir_name, {"list": [], "current": 0, "history": []})
-            entry = self.make_session(dir_name)
+            data = self.sessions
+            entry = self.make_session()
             data["list"].append(entry)
             data["current"] = len(data["list"]) - 1
             data["history"] = []  # 清空历史，真正从零开始
-            self.set_current(dir_name, entry)
+            self.set_current(entry)
             total = len(data["list"])
         self.pending = None
-        feishu_api.reply_message(token, msg["id"], f"[{dir_name}] 已创建新对话（共 {total} 个），发送任务即可开始")
-        print(f"[new-session] {dir_name} total={total}")
+        feishu_api.reply_message(token, msg["id"], f"已创建新对话（共 {total} 个），发送任务即可开始")
+        print(f"[{self.name}][new-session] total={total}")
 
     def cmd_permit(self, token, msg, arg):
-        dir_name = self.last_dir["name"]
-        self.permit_modes[dir_name] = not self.permit_modes.get(dir_name, False)
-        on = self.permit_modes[dir_name]
+        self.permit_mode = not self.permit_mode
+        on = self.permit_mode
         # 与 unsafe 互斥：开 permit 则关掉 unsafe
-        cleared = on and self.unsafe_modes.get(dir_name, False)
+        cleared = on and self.unsafe_mode
         if on:
-            self.unsafe_modes[dir_name] = False
+            self.unsafe_mode = False
         self.save_bot_state()
-        status = "已开启（可在当前目录读写/修改文件，不执行命令）" if on else "已关闭"
+        status = "已开启（可在工作区读写/修改文件，不执行命令）" if on else "已关闭"
         note = "（已自动关闭最高权限 unsafe）" if cleared else ""
-        feishu_api.reply_message(token, msg["id"], f"[{dir_name}] 权限模式 {status}{note}")
-        print(f"[permit] {dir_name}={on}")
+        feishu_api.reply_message(token, msg["id"], f"权限模式 {status}{note}")
+        print(f"[{self.name}][permit]={on}")
         if on and self.last_task:
             feishu_api.reply_message(token, msg["id"], "是否用新权限重跑上一条任务？发送 /retry 确认")
 
     def cmd_unsafe(self, token, msg, arg):
-        dir_name = self.last_dir["name"]
-        self.unsafe_modes[dir_name] = not self.unsafe_modes.get(dir_name, False)
-        on = self.unsafe_modes[dir_name]
+        self.unsafe_mode = not self.unsafe_mode
+        on = self.unsafe_mode
         # 与 permit 互斥：开 unsafe 则关掉 permit
-        cleared = on and self.permit_modes.get(dir_name, False)
+        cleared = on and self.permit_mode
         if on:
-            self.permit_modes[dir_name] = False
+            self.permit_mode = False
         self.save_bot_state()
         status = ("已开启（跳过全部权限校验，可执行任意命令含 bash，请谨慎）"
                   if on else "已关闭")
         note = "（已自动关闭文件读写 permit）" if cleared else ""
-        feishu_api.reply_message(token, msg["id"], f"[{dir_name}] 最高权限 {status}{note}")
-        print(f"[unsafe] {dir_name}={on}")
+        feishu_api.reply_message(token, msg["id"], f"最高权限 {status}{note}")
+        print(f"[{self.name}][unsafe]={on}")
         if on and self.last_task:
             feishu_api.reply_message(token, msg["id"], "是否用新权限重跑上一条任务？发送 /retry 确认")
 
     def cmd_model(self, token, msg, arg):
         """列出可选模型，回复序号选择（作用于当前对话）。"""
-        dir_name = self.last_dir["name"]
-        # 确保当前目录有一个 session 承载模型选择（无则按首用初始化）
-        if self.dir_sessions.get(dir_name) is None:
-            entry = self.make_session(dir_name)
-            self.dir_sessions[dir_name] = {"list": [entry], "current": 0, "history": []}
-            self.set_current(dir_name, entry)
-        cur = self.current_entry(dir_name)
+        # 确保有一个 session 承载模型选择（无则按首用初始化）
+        if not self.sessions["list"]:
+            entry = self.make_session()
+            self.sessions = {"list": [entry], "current": 0, "history": []}
+            self.set_current(entry)
+        cur = self.current_entry()
         cur_model = cur.get("model") if cur else None
         options = ["默认（不指定）"] + list(self.models)  # 序号 1=默认，2..=各模型
         # 当前选中项在 options 里的下标
@@ -298,13 +282,12 @@ class Bot:
         print(f"[{self.name}][usage] queried")
 
     def cmd_del(self, token, msg, arg):
-        dir_name = self.last_dir["name"]
-        data = self.dir_sessions.get(dir_name)
+        data = self.sessions
         if not arg.isdigit():
             feishu_api.reply_message(token, msg["id"], "用法：/del <序号>（序号见 /sessions）")
             return
-        if not data or not data["list"]:
-            feishu_api.reply_message(token, msg["id"], f"[{dir_name}] 当前没有可删除的对话")
+        if not data["list"]:
+            feishu_api.reply_message(token, msg["id"], "当前没有可删除的对话")
             return
         didx = int(arg) - 1
         if not (0 <= didx < len(data["list"])):
@@ -315,7 +298,7 @@ class Bot:
             # 删磁盘上的 Claude session 文件
             if removed["id"]:
                 try:
-                    claude_runner.delete_claude_session(removed["id"], self.work_dirs[dir_name])
+                    claude_runner.delete_claude_session(removed["id"], self.work_dir)
                 except Exception as e:
                     print(f"[del] remove claude session file failed: {e}")
             # 删 DB session 行（审计记录经 ON DELETE SET NULL 保留）
@@ -323,21 +306,21 @@ class Bot:
                 self.db(db.delete_session, removed["_row_id"])
             # 修正 current 指针
             if not data["list"]:
-                new_entry = self.make_session(dir_name)  # 删空了，补一个新的空对话
+                new_entry = self.make_session()  # 删空了，补一个新的空对话
                 data["list"].append(new_entry)
                 data["current"] = 0
                 data["history"] = []
-                self.set_current(dir_name, new_entry)
+                self.set_current(new_entry)
             else:
                 if didx <= data["current"]:
                     data["current"] = max(0, data["current"] - 1)
                 cur_entry = data["list"][data["current"]]
-                self.set_current(dir_name, cur_entry)
+                self.set_current(cur_entry)
                 data["history"] = self.load_history(cur_entry["id"])
             remaining = len(data["list"])
         self.pending = None
-        feishu_api.reply_message(token, msg["id"], f"[{dir_name}] 已删除对话「{removed['label']}」（剩 {remaining} 个）")
-        print(f"[del] {dir_name} removed idx={didx} row={removed.get('_row_id')}")
+        feishu_api.reply_message(token, msg["id"], f"已删除对话「{removed['label']}」（剩 {remaining} 个）")
+        print(f"[{self.name}][del] removed idx={didx} row={removed.get('_row_id')}")
 
     @staticmethod
     def _model_suffix(used_model):
@@ -347,15 +330,15 @@ class Bot:
         short = used_model[7:] if used_model.startswith("claude-") else used_model
         return f"\n\n（模型：{short}）"
 
-    def _permit_banner(self, dir_name):
-        """当前目录若开着 permit/unsafe，返回提醒文案（防止开启后忘关）。互斥后至多一条。"""
-        if self.unsafe_modes.get(dir_name, False):
-            return f"⚠️ [{dir_name}] 最高权限(unsafe)开启中，可执行任意命令 — 用完发 /unsafe 关闭"
-        if self.permit_modes.get(dir_name, False):
-            return f"🔓 [{dir_name}] 文件读写(permit)开启中 — 用完发 /permit 关闭"
+    def _permit_banner(self):
+        """若开着 permit/unsafe，返回提醒文案（防止开启后忘关）。互斥后至多一条。"""
+        if self.unsafe_mode:
+            return "⚠️ 最高权限(unsafe)开启中，可执行任意命令 — 用完发 /unsafe 关闭"
+        if self.permit_mode:
+            return "🔓 文件读写(permit)开启中 — 用完发 /permit 关闭"
         return ""
 
-    def _start_heartbeat(self, msg_id, dir_name):
+    def _start_heartbeat(self, msg_id):
         """长任务期间周期回「仍在处理」，返回 stop_event；调用方在 finally 里 .set()。
         每次发送都现取新鲜 token（token 仅 2h 有效，10h 任务复用旧的必失效）。"""
         stop = threading.Event()
@@ -369,7 +352,7 @@ class Bot:
                 elapsed = int(time.time() - started)
                 try:
                     token = feishu_api.get_token(self.app_id, self.app_secret)
-                    feishu_api.reply_message(token, msg_id, f"⏳ [{dir_name}] 仍在处理中，已用 {self._human_elapsed(elapsed)}…")
+                    feishu_api.reply_message(token, msg_id, f"⏳ 仍在处理中，已用 {self._human_elapsed(elapsed)}…", tag="heartbeat")
                 except Exception as e:
                     print(f"[{self.name}][heartbeat-error] {e}")
                 interval = min(interval * 2, 600)   # 逐步加倍、上限 10 分钟，防刷屏
@@ -393,32 +376,32 @@ class Bot:
             feishu_api.reply_message(token, msg["id"], "没有可重跑的任务")
             return
         self._enqueue({"kind": "retry", "text": t["text"], "msg_id": t["msg_id"],
-                       "dir_name": t["dir_name"], "session_id": t["session_id"]},
-                      token, msg["id"], t["dir_name"], verb="重跑")
+                       "session_id": t["session_id"]},
+                      token, msg["id"], verb="重跑")
 
     # --------------------------------------------------------------- 任务执行（异步）
 
-    def run_task(self, token, msg, text, dir_name):
+    def run_task(self, token, msg, text):
         """主线程只做入队 + 立即回执，真正执行在后台 worker，故长任务不冻结 bot。"""
         self.pending = None
         with self.lock:
-            self.last_task = {"text": text, "msg_id": msg["id"], "dir_name": dir_name,
-                              "session_id": self.current_session_id(dir_name)}
-        self._enqueue({"kind": "task", "text": text, "msg_id": msg["id"], "dir_name": dir_name},
-                      token, msg["id"], dir_name, verb="执行")
+            self.last_task = {"text": text, "msg_id": msg["id"],
+                              "session_id": self.current_session_id()}
+        self._enqueue({"kind": "task", "text": text, "msg_id": msg["id"]},
+                      token, msg["id"], verb="执行")
 
-    def _enqueue(self, job, token, msg_id, dir_name, verb):
+    def _enqueue(self, job, token, msg_id, verb):
         """把任务丢后台队列，立即回执（不阻塞主循环）。"""
         ahead = self.task_queue.qsize()
         self.task_queue.put(job)
-        lines = [f"✅ 已接收，[{dir_name}] 任务进入后台{verb}，完成后把结果发给你"]
+        lines = [f"✅ 已接收，任务进入后台{verb}，完成后把结果发给你"]
         if ahead > 0:
             lines.append(f"（前面还有 {ahead} 个任务在排队）")
-        banner = self._permit_banner(dir_name)
+        banner = self._permit_banner()
         if banner:
             lines.append(banner)
         feishu_api.reply_message(token, msg_id, "\n".join(lines))
-        print(f"[{self.name}][enqueue] {verb} dir={dir_name} qsize={ahead + 1} | {job['text'][:60]}")
+        print(f"[{self.name}][enqueue] {verb} qsize={ahead + 1} | {job['text'][:60]}")
 
     def _worker(self):
         """后台串行执行 claude 任务；串行是 905MB 硬件下防并发 OOM 的刻意取舍。"""
@@ -432,7 +415,7 @@ class Bot:
                 self.task_queue.task_done()
 
     def _execute_job(self, job):
-        text, msg_id, dir_name = job["text"], job["msg_id"], job["dir_name"]
+        text, msg_id = job["text"], job["msg_id"]
         is_retry = job["kind"] == "retry"
 
         # 锁内：准备会话状态、快照 history（短临界区，不含长调用）
@@ -441,42 +424,53 @@ class Bot:
                 session_id, history, first_task = job.get("session_id"), None, None
                 is_new = session_id is None
             else:
-                is_new = self.dir_sessions.get(dir_name) is None or self.current_session_id(dir_name) is None
-                if self.dir_sessions.get(dir_name) is None:  # 首用该目录，建 session 条目
-                    entry = self.make_session(dir_name)
-                    self.dir_sessions[dir_name] = {"list": [entry], "current": 0, "history": []}
-                    self.set_current(dir_name, entry)
-                session_id = self.current_session_id(dir_name)
-                history = list(self.dir_sessions.get(dir_name, {}).get("history", []))
+                is_new = self.current_session_id() is None
+                if not self.sessions["list"]:  # 首用，建 session 条目
+                    entry = self.make_session()
+                    self.sessions = {"list": [entry], "current": 0, "history": []}
+                    self.set_current(entry)
+                session_id = self.current_session_id()
+                history = list(self.sessions.get("history", []))
                 first_task = text if is_new else None
-            permit_mode = self.permit_modes.get(dir_name, False)
-            unsafe_mode = self.unsafe_modes.get(dir_name, False)
+            permit_mode = self.permit_mode
+            unsafe_mode = self.unsafe_mode
 
-        print(f"[{self.name}][{'retry' if is_retry else 'task'}] dir={dir_name} permit={permit_mode} "
+        print(f"[{self.name}][{'retry' if is_retry else 'task'}] permit={permit_mode} "
               f"unsafe={unsafe_mode} session={'new' if is_new else str(session_id)[:8] + '…'} | {text[:60]}")
 
         # 锁外：长耗时执行 + 心跳（此期间主循环命令不被阻塞）
-        stop = self._start_heartbeat(msg_id, dir_name)
+        t0 = time.time()
+        stop = self._start_heartbeat(msg_id)
         try:
             result, new_sid, used_model = self.execute_claude(
-                text, dir_name, session_id, history=history, first_task=first_task,
+                text, session_id, history=history, first_task=first_task,
             )
         finally:
             stop.set()
 
+        # LLM 响应审计：耗时 / 模型 / 是否出错 / 输出规模 / 新 session（同时落库）
+        elapsed = time.time() - t0
+        is_err = result.startswith("[error]")
+        print(f"[{self.name}][llm] elapsed={self._human_elapsed(int(elapsed))} "
+              f"model={used_model} error={is_err} timed_out={'超时' in result} chars={len(result)} "
+              f"sid={str(new_sid)[:8] + '…' if new_sid else '-'} | {result[:120].replace(chr(10), ' ')}")
+        self.db(db.record_audit, self.chat_id, "llm", "retry" if is_retry else "task",
+                message_id=msg_id, ok=not is_err, model=used_model,
+                elapsed_ms=int(elapsed * 1000), chars=len(result), detail=result[:2000])
+
         # 锁内：更新对话历史（保留最近 20 轮）+ 审计
         with self.lock:
             if not is_retry and not result.startswith("[error]"):
-                data = self.dir_sessions.setdefault(dir_name, {"list": [], "current": 0, "history": []})
+                data = self.sessions
                 data.setdefault("history", [])
                 data["history"].append({"role": "user", "content": text})
                 data["history"].append({"role": "assistant", "content": result})
                 if len(data["history"]) > 40:  # 20 轮 × 2
                     data["history"] = data["history"][-40:]
-            self.audit(dir_name, text, result, new_sid, used_model)
+            self.audit(text, result, new_sid, used_model)
 
         # 主动推送结果（带失败重试，避免网络抖动丢结果）
-        banner = self._permit_banner(dir_name)
+        banner = self._permit_banner()
         suffix = "" if result.startswith("[error]") else self._model_suffix(used_model)
         self._push_reply(msg_id, result + suffix + (("\n\n" + banner) if banner else ""))
         print(f"[{self.name}][done] pushed to {msg_id} model={used_model}")
@@ -486,7 +480,9 @@ class Bot:
         for i in range(attempts):
             try:
                 token = feishu_api.get_token(self.app_id, self.app_secret)
-                if feishu_api.reply_message(token, msg_id, text):
+                res = feishu_api.reply_message(token, msg_id, text, tag="push")
+                self._audit_sends(msg_id, "push", res)
+                if res:
                     return True
             except Exception as e:
                 print(f"[{self.name}][push-error] attempt {i + 1}/{attempts}: {e}")
@@ -495,46 +491,42 @@ class Bot:
         print(f"[{self.name}][push-failed] 结果推送失败 msg={msg_id}（结果已存审计表，可查库）")
         return False
 
+    def _audit_sends(self, msg_id, tag, res):
+        """把一次飞书外发的每段响应写入审计表。"""
+        for s in res.sends:
+            self.db(db.record_audit, self.chat_id, "feishu", tag, message_id=msg_id,
+                    ok=s["ok"], code=s["code"], chars=s.get("chars"),
+                    detail=(f"sent_id={s.get('sent_id')}" if s["ok"] else s.get("msg")))
+
     # ---------------------------------------------------------- 消息处理 / 主循环
 
     def handle_select(self, token, msg, idx):
-        """pending 状态下用数字消息选择目录 / 对话。"""
-        dir_name = self.last_dir["name"]
-        if self.pending == "dir":
-            if 0 <= idx < len(self.dir_names):
-                name = self.dir_names[idx]
-                self.last_dir = {"name": name, "path": self.work_dirs[name]}
-                self.pending = None
-                self.save_bot_state()
-                feishu_api.reply_message(token, msg["id"], f"已切换到 [{name}]")
-                print(f"[dir] switched to {name}")
-            else:
-                feishu_api.reply_message(token, msg["id"], f"无效序号，请输入 1～{len(self.dir_names)}")
-        elif self.pending == "session":
-            sessions = self.dir_sessions.get(dir_name, {}).get("list", [])
+        """pending 状态下用数字消息选择对话 / 模型。"""
+        if self.pending == "session":
+            sessions = self.sessions["list"]
             if 0 <= idx < len(sessions):
                 with self.lock:  # 与 worker 的 update_session 互斥
-                    self.dir_sessions[dir_name]["current"] = idx
+                    self.sessions["current"] = idx
                     entry = sessions[idx]
-                    self.set_current(dir_name, entry)
-                    self.dir_sessions[dir_name]["history"] = self.load_history(entry["id"])
+                    self.set_current(entry)
+                    self.sessions["history"] = self.load_history(entry["id"])
                 self.pending = None
                 feishu_api.reply_message(token, msg["id"], f"已切换到对话 {idx + 1}：{entry['label']}")
-                print(f"[session] {dir_name} switched to idx={idx}")
+                print(f"[{self.name}][session] switched to idx={idx}")
             else:
                 feishu_api.reply_message(token, msg["id"], f"无效序号，请输入 1～{len(sessions)}")
         elif self.pending == "model":
             options = ["默认（不指定）"] + list(self.models)  # idx 0=默认
             if 0 <= idx < len(options):
                 model = None if idx == 0 else self.models[idx - 1]
-                entry = self.current_entry(dir_name)
+                entry = self.current_entry()
                 self.pending = None
                 if entry:
                     entry["model"] = model
                     if entry.get("_row_id"):
                         self.db(db.set_session_model, entry["_row_id"], model)
                 feishu_api.reply_message(token, msg["id"], f"当前对话模型已设为：{options[idx]}")
-                print(f"[model] {dir_name} -> {model}")
+                print(f"[{self.name}][model] -> {model}")
             else:
                 feishu_api.reply_message(token, msg["id"], f"无效序号，请输入 1～{len(options)}")
 
@@ -599,7 +591,7 @@ class Bot:
             if paths:
                 full = (ptext or "请查看随附的图片").rstrip()
                 full += "\n\n[随消息附带的图片，可直接读取]\n" + "\n".join(paths)
-                self.run_task(token, msg, full, self.last_dir["name"])
+                self.run_task(token, msg, full)
                 return
             msg = {**msg, "text": ptext}  # 纯文本 post，降级为普通文本处理
         text = (msg.get("text") or "").strip()
@@ -616,12 +608,11 @@ class Bot:
             handler(token, msg, rest.strip())
             return
         # 普通任务
-        self.run_task(token, msg, text, self.last_dir["name"])
+        self.run_task(token, msg, text)
 
     def run(self):
         print(f"[{self.name}] started, chat_id={self.chat_id}, "
-              f"work_dirs={self.dir_names}, default={self.default_name}, "
-              f"backoff 5s~{self.poll_interval}s")
+              f"work_dir={self.work_dir}, backoff 5s~{self.poll_interval}s")
 
         # 后台 worker：任务串行执行，主循环只入队，长任务不冻结轮询/命令
         threading.Thread(target=self._worker, name=f"{self.name}-worker", daemon=True).start()

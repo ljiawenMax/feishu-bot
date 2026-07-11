@@ -170,15 +170,31 @@ def split_text(text, max_len=3900):
     return chunks
 
 
-def reply_message(token, message_id, text):
+class SendResult:
+    """reply_message 的返回：布尔上下文里等价于「是否全部成功」，
+    同时用 .sends 暴露每段飞书响应明细（供审计落库）。"""
+
+    def __init__(self, sends):
+        self.sends = sends  # list of {ok, code, msg, sent_id, chars}
+
+    @property
+    def ok(self):
+        return all(s["ok"] for s in self.sends) if self.sends else True
+
+    def __bool__(self):
+        return self.ok
+
+
+def reply_message(token, message_id, text, tag="reply"):
     """回复消息。网络/接口失败时记录日志但不抛出，避免中断消息处理导致结果丢失。
-    返回是否全部分段发送成功。"""
+    每段都审计飞书响应（返回的 message_id / code / msg）。返回 SendResult（可当 bool 用）。"""
     headers = {
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json",
     }
     chunks = split_text(text)
-    ok = True
+    total = len(chunks)
+    sends = []
     for i, chunk in enumerate(chunks):
         body = {
             "msg_type": "text",
@@ -193,26 +209,26 @@ def reply_message(token, message_id, text):
             )
             resp.raise_for_status()
             data = resp.json()
-            if data.get("code") != 0:
-                ok = False
-                print(f"[warn] reply chunk {i+1}/{len(chunks)} failed: {data}")
+            code = data.get("code")
+            sent_id = (data.get("data") or {}).get("message_id")
+            snd = {"ok": code == 0, "code": code, "msg": data.get("msg"),
+                   "sent_id": sent_id, "chars": len(chunk)}
+            if code == 0:
+                print(f"[feishu][{tag}][ok] reply_to={message_id} {i+1}/{total} "
+                      f"sent_id={sent_id} chars={len(chunk)}")
+            else:
+                print(f"[feishu][{tag}][fail] reply_to={message_id} {i+1}/{total} "
+                      f"code={code} msg={data.get('msg')}")
         except requests.RequestException as e:
-            ok = False
-            print(f"[warn] reply chunk {i+1}/{len(chunks)} network error: {e}")
-    return ok
+            snd = {"ok": False, "code": None, "msg": str(e), "sent_id": None, "chars": len(chunk)}
+            print(f"[feishu][{tag}][error] reply_to={message_id} {i+1}/{total} {e}")
+        sends.append(snd)
+    return SendResult(sends)
 
 
-def build_dir_prompt(dir_names, current_name=None):
-    lines = ["请选择工作目录，回复序号："]
-    for i, name in enumerate(dir_names, 1):
-        marker = " ◀ 当前" if name == current_name else ""
-        lines.append(f"{i}. {name}{marker}")
-    return "\n".join(lines)
-
-
-def build_sessions_prompt(dir_name, sessions, current_idx):
+def build_sessions_prompt(sessions, current_idx):
     """sessions: list of {"id": session_id_or_None, "label": str}"""
-    lines = [f"[{dir_name}] 的对话列表，回复序号切换："]
+    lines = ["对话列表，回复序号切换："]
     for i, s in enumerate(sessions, 1):
         marker = " ◀ 当前" if i - 1 == current_idx else ""
         lines.append(f"{i}. {s['label']}{marker}")

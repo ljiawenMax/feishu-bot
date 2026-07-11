@@ -10,7 +10,7 @@ from urllib.parse import quote_plus
 from sqlalchemy import create_engine, delete, select, update
 from sqlalchemy.orm import sessionmaker
 
-from models import Base, BotState, Conversation, Message, Unhandled, Upload
+from models import AuditLog, Base, BotState, Conversation, Message, Unhandled, Upload
 
 
 def init_engine(db_cfg):
@@ -32,7 +32,6 @@ def migrate(engine):
     adds = [
         ("sessions", "model", "VARCHAR(64)"),
         ("messages", "model", "VARCHAR(64)"),
-        ("bot_state", "unsafe_modes", "JSON"),
     ]
     with engine.begin() as c:
         for tbl, col, typ in adds:
@@ -52,34 +51,30 @@ def make_session_factory(engine):
 # --------------------------------------------------------------- 数据访问
 
 def load_state(s, chat_id):
-    """从 DB 恢复 last_dir_name / permit_modes / dir_sessions（含 _row_id 与 history）"""
-    state = {"last_dir_name": None, "permit_modes": {}, "unsafe_modes": {}, "dir_sessions": {}}
+    """从 DB 恢复 permit / unsafe + 单一会话列表（含 _row_id 与 history）"""
+    state = {"permit": False, "unsafe": False,
+             "sessions": {"list": [], "current": 0, "history": []}}
 
     bs = s.get(BotState, chat_id)
     if bs:
-        state["last_dir_name"] = bs.last_dir_name
-        state["permit_modes"] = bs.permit_modes or {}
-        state["unsafe_modes"] = bs.unsafe_modes or {}
+        state["permit"] = bool(bs.permit)
+        state["unsafe"] = bool(bs.unsafe)
 
-    # 重建每个目录的 session 列表
+    # 重建该 chat 的 session 列表（一 chat 一 work_dir，扁平单列）
+    data = state["sessions"]
     rows = s.scalars(
         select(Conversation)
         .where(Conversation.chat_id == chat_id)
-        .order_by(Conversation.dir_name, Conversation.position, Conversation.id)
+        .order_by(Conversation.position, Conversation.id)
     ).all()
     for conv in rows:
-        data = state["dir_sessions"].setdefault(
-            conv.dir_name, {"list": [], "current": 0, "history": []}
-        )
         data["list"].append({"id": conv.claude_session_id, "label": conv.label,
                              "model": conv.model, "_row_id": conv.id})
         if conv.is_current:
             data["current"] = len(data["list"]) - 1
 
-    # 为每个目录的当前 session 重建对话历史（最近 40 条）
-    for dir_name, data in state["dir_sessions"].items():
-        if not data["list"]:
-            continue
+    # 为当前 session 重建对话历史（最近 40 条）
+    if data["list"]:
         cur_entry = data["list"][data["current"]]
         data["history"] = load_history(s, chat_id, cur_entry["id"])
 
@@ -103,15 +98,14 @@ def load_history(s, chat_id, claude_sid, limit=40):
     return [{"role": r[0], "content": r[1]} for r in reversed(rows)]
 
 
-def save_bot_state(s, chat_id, last_dir_name, permit_modes, unsafe_modes):
-    s.merge(BotState(chat_id=chat_id, last_dir_name=last_dir_name,
-                     permit_modes=permit_modes, unsafe_modes=unsafe_modes))
+def save_bot_state(s, chat_id, permit, unsafe):
+    s.merge(BotState(chat_id=chat_id, permit=permit, unsafe=unsafe))
 
 
-def insert_session(s, chat_id, dir_name, label, position, claude_sid=None):
+def insert_session(s, chat_id, label, position, claude_sid=None):
     """新建一条 session 行，返回其代理主键 _row_id"""
     conv = Conversation(
-        chat_id=chat_id, dir_name=dir_name,
+        chat_id=chat_id,
         claude_session_id=claude_sid, label=label, position=position,
     )
     s.add(conv)
@@ -136,11 +130,11 @@ def set_session_model(s, row_id, model):
     s.execute(update(Conversation).where(Conversation.id == row_id).values(model=model))
 
 
-def set_current(s, chat_id, dir_name, row_id):
-    """把 row_id 置为当前 session，同 (chat_id, dir_name) 下其余置 FALSE"""
+def set_current(s, chat_id, row_id):
+    """把 row_id 置为当前 session，同 chat_id 下其余置 FALSE"""
     s.execute(
         update(Conversation)
-        .where(Conversation.chat_id == chat_id, Conversation.dir_name == dir_name)
+        .where(Conversation.chat_id == chat_id)
         .values(is_current=(Conversation.id == row_id))
     )
 
@@ -150,10 +144,10 @@ def delete_session(s, row_id):
     s.execute(delete(Conversation).where(Conversation.id == row_id))
 
 
-def append_message(s, session_row_id, chat_id, dir_name, claude_sid,
+def append_message(s, session_row_id, chat_id, claude_sid,
                    role, content, is_error=False, timed_out=False, model=None):
     s.add(Message(
-        session_id=session_row_id, chat_id=chat_id, dir_name=dir_name,
+        session_id=session_row_id, chat_id=chat_id,
         claude_session_id=claude_sid, role=role, content=content,
         is_error=is_error, timed_out=timed_out, model=model,
     ))
@@ -163,6 +157,15 @@ def record_upload(s, message_id, chat_id, resource_type, file_name, path, size, 
     s.add(Upload(
         message_id=message_id, chat_id=chat_id, resource_type=resource_type,
         file_name=file_name, path=path, size=size, content_type=content_type,
+    ))
+
+
+def record_audit(s, chat_id, kind, tag, message_id=None, ok=True, code=None,
+                 model=None, elapsed_ms=None, chars=None, detail=None):
+    """审计：LLM 执行 / 飞书外发的响应信息落库。"""
+    s.add(AuditLog(
+        chat_id=chat_id, kind=kind, tag=tag, message_id=message_id, ok=ok,
+        code=code, model=model, elapsed_ms=elapsed_ms, chars=chars, detail=detail,
     ))
 
 

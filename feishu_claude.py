@@ -16,15 +16,48 @@ from bot import Bot
 BASE_DIR = os.path.dirname(__file__)
 
 
+def _bracket_balance(text):
+    """返回 text 中未闭合的 [ / { 数量（字符串内的括号不计），用于识别跨行 JSON 值。"""
+    depth = 0
+    in_str = esc = False
+    for ch in text:
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+        elif ch == '"':
+            in_str = True
+        elif ch in "[{":
+            depth += 1
+        elif ch in "]}":
+            depth -= 1
+    return depth
+
+
 def load_env_file(env_name):
     env_file = os.path.join(BASE_DIR, f".env.{env_name}")
     env_vars = {}
     with open(env_file) as f:
-        for line in f:
-            line = line.strip()
-            if line and not line.startswith("#") and "=" in line:
-                key, _, value = line.partition("=")
-                env_vars[key.strip()] = value.strip()
+        lines = f.readlines()
+    i, n = 0, len(lines)
+    while i < n:
+        stripped = lines[i].strip()
+        i += 1
+        if not stripped or stripped.startswith("#") or "=" not in stripped:
+            continue
+        key, _, value = stripped.partition("=")
+        key, value = key.strip(), value.strip()
+        # 值含未闭合的 [ 或 {（如多行 JSON 的 BOTS/MODELS），继续拼接后续行直到括号闭合
+        if _bracket_balance(value) > 0:
+            parts = [value]
+            while i < n and _bracket_balance("".join(parts)) > 0:
+                parts.append(lines[i].rstrip("\n"))
+                i += 1
+            value = "".join(parts).strip()
+        env_vars[key] = value
     return env_vars
 
 

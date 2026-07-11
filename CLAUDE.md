@@ -23,18 +23,23 @@
 每个机器人（`BOTS` 一项，一个 chat_id）一个线程，同一 chat_id 串行无并发、不同机器人并行。
 DB 访问走 SQLAlchemy ORM；每次操作开短生命周期 Session（线程安全），状态按 `chat_id` 隔离。
 
-## config.json 字段说明
+**一 chat_id 一 work_dir**：每个机器人绑定一个群（chat_id）+ 一个工作目录（`work_dir` 单字符串，
+省略回退家目录 `~`），chat_id 唯一。视觉隔离靠分群；一个群内用 `/new`、`/sessions` 手动管理多个对话
+（不在群内切换目录）。会话与 `permit`/`unsafe` 权限均按 `chat_id` 分区，持久化在 `bot_state` 表。
+
+## BOTS 每项字段说明（`.env.local` 里的 `BOTS` JSON 列表）
 
 ```json
 {
+  "name": "机器人名称（日志标识）",
   "app_id": "飞书应用 App ID",
   "app_secret": "飞书应用 App Secret",
-  "chat_id": "监听的群聊 ID（格式 oc_xxxxxx）",
-  "work_dir": "Claude Code 执行任务时的工作目录（绝对路径）",
-  "poll_interval": 5,
-  "task_timeout": 300
+  "chat_id": "监听的群聊 ID（格式 oc_xxxxxx，唯一）",
+  "work_dir": "Claude Code 执行任务的工作目录（绝对路径，可省略→家目录 ~）"
 }
 ```
+
+`poll_interval` / `task_timeout` / `heartbeat_interval` / `models` 为共享项，写在 `.env.local` 顶层。
 
 ## 飞书开放平台前置配置
 

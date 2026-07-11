@@ -14,7 +14,6 @@ MySQL 适配要点：
 """
 
 from sqlalchemy import (
-    JSON,
     BigInteger,
     Boolean,
     DateTime,
@@ -40,9 +39,8 @@ class BotState(Base):
     __table_args__ = TABLE_KW
 
     chat_id: Mapped[str] = mapped_column(String(64), primary_key=True)
-    last_dir_name: Mapped[str | None] = mapped_column(String(128))
-    permit_modes: Mapped[dict] = mapped_column(JSON, default=dict)  # {dir: bool} acceptEdits
-    unsafe_modes: Mapped[dict] = mapped_column(JSON, default=dict)  # {dir: bool} 跳过全部权限
+    permit: Mapped[bool] = mapped_column(Boolean, default=False)  # acceptEdits：工作区内读写文件
+    unsafe: Mapped[bool] = mapped_column(Boolean, default=False)  # 跳过全部权限校验
     updated_at: Mapped["DateTime"] = mapped_column(DateTime, server_default=func.now())
 
 
@@ -55,7 +53,6 @@ class Conversation(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     chat_id: Mapped[str] = mapped_column(String(64), nullable=False)
-    dir_name: Mapped[str] = mapped_column(String(128), nullable=False)
     claude_session_id: Mapped[str | None] = mapped_column(String(64))
     label: Mapped[str | None] = mapped_column(String(255))
     model: Mapped[str | None] = mapped_column(String(64))  # 该对话选定的模型，NULL=默认
@@ -69,7 +66,7 @@ class Message(Base):
     __tablename__ = "messages"
     __table_args__ = (
         Index("idx_messages_session", "session_id"),
-        Index("idx_messages_chat_dir", "chat_id", "dir_name", "created_at"),
+        Index("idx_messages_chat_time", "chat_id", "created_at"),
         TABLE_KW,
     )
 
@@ -78,13 +75,35 @@ class Message(Base):
         Integer, ForeignKey("sessions.id", ondelete="SET NULL")
     )
     chat_id: Mapped[str | None] = mapped_column(String(64))
-    dir_name: Mapped[str | None] = mapped_column(String(128))
     claude_session_id: Mapped[str | None] = mapped_column(String(64))
     role: Mapped[str | None] = mapped_column(String(16))
     content: Mapped[str | None] = mapped_column(LONGTEXT)
     model: Mapped[str | None] = mapped_column(String(64))  # 该轮实际所用模型
     is_error: Mapped[bool] = mapped_column(Boolean, default=False)
     timed_out: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_at: Mapped["DateTime"] = mapped_column(DateTime, server_default=func.now())
+
+
+class AuditLog(Base):
+    """审计日志：记录每次 LLM 执行与飞书外发的响应信息（独立于会话内容 messages）。"""
+
+    __tablename__ = "audit_logs"
+    __table_args__ = (
+        Index("idx_audit_chat", "chat_id", "created_at"),
+        TABLE_KW,
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    chat_id: Mapped[str | None] = mapped_column(String(64))
+    kind: Mapped[str | None] = mapped_column(String(16))       # 'llm' | 'feishu'
+    tag: Mapped[str | None] = mapped_column(String(32))        # llm:task/retry；feishu:reply/push/heartbeat
+    message_id: Mapped[str | None] = mapped_column(String(128))  # 关联的飞书消息
+    ok: Mapped[bool] = mapped_column(Boolean, default=True)
+    code: Mapped[int | None] = mapped_column(Integer)          # 飞书返回 code
+    model: Mapped[str | None] = mapped_column(String(64))      # LLM 实际所用模型
+    elapsed_ms: Mapped[int | None] = mapped_column(Integer)    # LLM 耗时
+    chars: Mapped[int | None] = mapped_column(Integer)         # 输出/发送字符数
+    detail: Mapped[str | None] = mapped_column(LONGTEXT)       # 飞书 msg/sent_id 或 LLM 摘要/错误
     created_at: Mapped["DateTime"] = mapped_column(DateTime, server_default=func.now())
 
 
