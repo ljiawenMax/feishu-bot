@@ -20,8 +20,10 @@
 - `.env` — 配置模板（入 git）；`.env.local` — 实际配置（不入 git）
 
 配置统一为 `.env.local`（默认），含共享项 + `BOTS` JSON 列表。多机器人：**单进程多线程**，
-每个机器人（`BOTS` 一项，一个 chat_id）一个线程，同一 chat_id 串行无并发、不同机器人并行。
-DB 访问走 SQLAlchemy ORM；每次操作开短生命周期 Session（线程安全），状态按 `chat_id` 隔离。
+每个机器人（`BOTS` 一项，一个 chat_id）一个轮询线程 + 一个后台 worker。**同一 chat_id 串行保序、
+不同 chat_id 并行**；所有机器人共享一个全局并发闸（`MAX_CONCURRENT`，`threading.BoundedSemaphore`），
+限制同时运行的 claude 进程数，防止内存被打满。DB 访问走 SQLAlchemy ORM；每次操作开短生命周期
+Session（线程安全），状态按 `chat_id` 隔离。
 
 **一 chat_id 一 work_dir**：每个机器人绑定一个群（chat_id）+ 一个工作目录（`work_dir` 单字符串，
 省略回退家目录 `~`），chat_id 唯一。视觉隔离靠分群；一个群内用 `/new`、`/sessions` 手动管理多个对话

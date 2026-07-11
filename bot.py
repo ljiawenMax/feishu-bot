@@ -36,7 +36,7 @@ class Bot:
     """飞书消息驱动 Claude Code 的轮询服务，状态持久化在 MySQL。"""
 
     def __init__(self, bot_cfg, session_factory, poll_interval, task_timeout, models=None,
-                 heartbeat_interval=60):
+                 heartbeat_interval=60, run_slot=None):
         self.name = bot_cfg["name"]
         self.app_id = bot_cfg["app_id"]
         self.app_secret = bot_cfg["app_secret"]
@@ -47,6 +47,8 @@ class Bot:
         self.task_timeout = task_timeout
         self.models = models or ["opus", "sonnet", "haiku"]  # /model 可选清单
         self.heartbeat_interval = heartbeat_interval  # 长任务心跳间隔秒数，0=禁用
+        # 全局并发闸（所有 bot 共享一个）：限制同时运行的 claude 进程数；未传时不限流
+        self.run_slot = run_slot or threading.BoundedSemaphore(1000)
 
         self.Session = session_factory
 
@@ -404,7 +406,8 @@ class Bot:
         print(f"[{self.name}][enqueue] {verb} qsize={ahead + 1} | {job['text'][:60]}")
 
     def _worker(self):
-        """后台串行执行 claude 任务；串行是 905MB 硬件下防并发 OOM 的刻意取舍。"""
+        """后台执行 claude 任务：同一 chat_id 由本 worker 单线程串行处理、保序；
+        不同 chat_id 各有自己的 worker 可并行——真正的同时并发数由全局 run_slot 上限约束。"""
         while True:
             job = self.task_queue.get()
             try:
@@ -439,17 +442,20 @@ class Bot:
               f"unsafe={unsafe_mode} session={'new' if is_new else str(session_id)[:8] + '…'} | {text[:60]}")
 
         # 锁外：长耗时执行 + 心跳（此期间主循环命令不被阻塞）
-        t0 = time.time()
+        # 全局并发闸：不同 chat_id 可并行，但同时运行的 claude 进程数受 run_slot 上限约束；
+        # 心跳在闸外启动，等待空位期间也会回「仍在处理中」。elapsed 只计实际执行、不含排队等待。
         stop = self._start_heartbeat(msg_id)
         try:
-            result, new_sid, used_model = self.execute_claude(
-                text, session_id, history=history, first_task=first_task,
-            )
+            with self.run_slot:
+                t0 = time.time()
+                result, new_sid, used_model = self.execute_claude(
+                    text, session_id, history=history, first_task=first_task,
+                )
+                elapsed = time.time() - t0
         finally:
             stop.set()
 
         # LLM 响应审计：耗时 / 模型 / 是否出错 / 输出规模 / 新 session（同时落库）
-        elapsed = time.time() - t0
         is_err = result.startswith("[error]")
         print(f"[{self.name}][llm] elapsed={self._human_elapsed(int(elapsed))} "
               f"model={used_model} error={is_err} timed_out={'超时' in result} chars={len(result)} "
