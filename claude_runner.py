@@ -103,6 +103,65 @@ def run_claude(task, work_dir, timeout, session_id=None, permit=False, extra_dir
     return result, new_session_id, used_model
 
 
+def session_context(claude_session_id, work_dir):
+    """读取磁盘 session 文件，返回最近一轮的 context 占用信息。
+
+    返回 dict（无文件/无用量记录时返回 None）：
+      input          本轮新输入 token
+      cache_creation 本轮写入缓存 token
+      cache_read     本轮命中缓存 token
+      output         本轮输出 token
+      total_input    input+cache_creation+cache_read ≈ 当前 context 窗口占用
+      model          最近一条 assistant 消息的模型
+      user_turns     文件中真实用户消息条数（不含工具结果）
+    """
+    project_key = work_dir.replace("/", "-")
+    path = os.path.expanduser(f"~/.claude/projects/{project_key}/{claude_session_id}.jsonl")
+    if not os.path.exists(path):
+        return None
+    last_usage = None
+    last_model = None
+    user_turns = 0
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            etype = event.get("type")
+            if etype == "assistant":
+                msg = event.get("message", {})
+                usage = msg.get("usage")
+                if usage:
+                    last_usage = usage
+                    last_model = msg.get("model") or last_model
+            elif etype == "user":
+                # 只数真正的用户输入；工具结果也是 user 事件，content 为 list，需排除
+                content = event.get("message", {}).get("content")
+                if isinstance(content, str) or (
+                    isinstance(content, list)
+                    and not any(isinstance(b, dict) and b.get("type") == "tool_result" for b in content)
+                ):
+                    user_turns += 1
+    if not last_usage:
+        return None
+    inp = last_usage.get("input_tokens", 0)
+    cc = last_usage.get("cache_creation_input_tokens", 0)
+    cr = last_usage.get("cache_read_input_tokens", 0)
+    return {
+        "input": inp,
+        "cache_creation": cc,
+        "cache_read": cr,
+        "output": last_usage.get("output_tokens", 0),
+        "total_input": inp + cc + cr,
+        "model": last_model,
+        "user_turns": user_turns,
+    }
+
+
 def delete_claude_session(claude_session_id, work_dir):
     """删除 Claude Code 在磁盘上保存的 session 文件"""
     project_key = work_dir.replace("/", "-")

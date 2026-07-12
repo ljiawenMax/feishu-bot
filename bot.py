@@ -17,6 +17,9 @@ import feishu_api
 import uploads
 import usage
 
+# Claude 标准上下文窗口大小（token）；用于 /context 计算占用百分比
+CONTEXT_WINDOW = 200000
+
 HELP_TEXT = "\n".join([
     "可用命令：",
     "/sessions  — 列出对话，回复序号切换",
@@ -26,6 +29,7 @@ HELP_TEXT = "\n".join([
     "/permit    — 开关工作区文件读写（acceptEdits，不跑命令）",
     "/unsafe    — 开关最高权限（跳过全部权限校验，可执行 bash 命令，谨慎）",
     "/model     — 选择当前对话使用的模型",
+    "/context   — 查看当前对话的 context 窗口占用",
     "/usage     — 查看 Claude 订阅用量（5 小时窗 / 7 天）",
     "/retry     — 用当前权限重跑上一条任务",
     "/help      — 显示此帮助",
@@ -75,6 +79,7 @@ class Bot:
             "/permit": self.cmd_permit,
             "/unsafe": self.cmd_unsafe,
             "/model": self.cmd_model,
+            "/context": self.cmd_context,
             "/usage": self.cmd_usage,
             "/del": self.cmd_del,
             "/retry": self.cmd_retry,
@@ -267,6 +272,50 @@ class Bot:
             lines.append(f"{i}. {name}{' ◀ 当前' if i - 1 == cur_pos else ''}")
         self.pending = "model"
         feishu_api.reply_message(token, msg["id"], "\n".join(lines))
+
+    def cmd_context(self, token, msg, arg):
+        """查看当前对话的 context 窗口占用（读磁盘 session 文件的最近一轮用量）。"""
+        entry = self.current_entry()
+        if not entry or not entry.get("id"):
+            feishu_api.reply_message(token, msg["id"],
+                                     "当前对话还没开始，暂无 context 信息（先发一条任务）")
+            return
+        info = claude_runner.session_context(entry["id"], self.work_dir)
+        if not info:
+            feishu_api.reply_message(token, msg["id"],
+                                     "读不到当前对话的 context 记录（session 文件不存在或尚无用量）")
+            return
+        feishu_api.reply_message(token, msg["id"], self._format_context(entry, info))
+        print(f"[{self.name}][context] used={info['total_input']} model={info.get('model')}")
+
+    @staticmethod
+    def _fmt_tokens(n):
+        """token 数人性化：42299→42.3k、200000→200k、856→856。"""
+        if n >= 1000:
+            v = n / 1000
+            return f"{v:.0f}k" if v == int(v) else f"{v:.1f}k"
+        return str(n)
+
+    def _format_context(self, entry, info):
+        used = info["total_input"]
+        pct = min(used / CONTEXT_WINDOW * 100, 100)
+        filled = round(pct / 10)
+        bar = "▓" * filled + "░" * (10 - filled)
+        model = info.get("model") or entry.get("model") or "默认"
+        if model.startswith("claude-"):
+            model = model[7:]
+        # 本地历史每轮 = user+assistant 两条
+        turns = len(self.sessions.get("history", [])) // 2
+        return "\n".join([
+            f"📊 当前对话「{entry['label']}」",
+            f"模型：{model}",
+            f"Context：{self._fmt_tokens(used)} / {self._fmt_tokens(CONTEXT_WINDOW)} tokens（{pct:.0f}%）",
+            f"{bar} {pct:.0f}%",
+            f"├ 缓存读取：{self._fmt_tokens(info['cache_read'])}",
+            f"├ 缓存创建：{self._fmt_tokens(info['cache_creation'])}",
+            f"└ 新输入：{self._fmt_tokens(info['input'])}",
+            f"本地历史：{turns} 轮（session 失效时用于重建 context）",
+        ])
 
     def cmd_usage(self, token, msg, arg):
         """查看 Claude 订阅用量（官方 oauth/usage 端点，按需+缓存）。"""
