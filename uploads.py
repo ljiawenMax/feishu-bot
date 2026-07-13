@@ -79,9 +79,10 @@ def _safe_remove(p):
         pass
 
 
-def save_upload(token, msg, chat_id):
+def save_upload(client, msg, chat_id):
     """下载并安全存储一个上传文件。返回 {path, file_name, size, size_human, content_type}。
-    超过大小上限抛 TooLarge；其它失败抛原异常（已清理临时文件）。"""
+    超过大小上限抛 TooLarge；其它失败抛原异常（已清理临时文件）。
+    client 为 lark-oapi SDK 客户端（token 由其内部管理）。"""
     d = _ensure_dir(chat_id)
     prefix = _safe_filename(msg["id"])[-16:] or "msg"  # 唯一前缀，避免覆盖
     raw = msg.get("file_name") or ""
@@ -100,7 +101,7 @@ def save_upload(token, msg, chat_id):
     try:
         with os.fdopen(fd, "wb") as f:
             size, content_type = feishu_api.download_to_file(
-                token, msg["id"], msg["file_key"], msg.get("resource_type"),
+                client, msg["id"], msg["file_key"], msg.get("resource_type"),
                 f, MAX_UPLOAD_BYTES,
             )
     except ValueError as e:  # 超过大小上限

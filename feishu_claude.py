@@ -1,16 +1,20 @@
-"""入口：解析 --env <name>，读取 .env.<name>（默认 local），单进程内为每个机器人
-起一个线程。
+"""入口：解析 --env <name>，读取 .env.<name>（默认 local），单进程内驱动多机器人。
 
-一个进程跑 1~N 个机器人（.env 里的 BOTS 列表），共享数据库 engine；每个机器人
-（一个 chat_id）在自己的线程里串行处理消息，互不并发也互不阻塞。
+一个进程跑 1~N 个机器人（.env 里的 BOTS 列表），共享数据库 engine。消息接收改用
+飞书长连接（WebSocket）：长连接是「每 app 一条、cluster 模式、不广播」，故按 app_id
+分组，每个 app_id 开一条连接，收到事件后按 chat_id 路由到对应 Bot。多个群共用一个
+app_id 时共享这一条连接。每个 Bot 有自己的 inbox+worker 线程，同一 chat 保序、
+不同 chat 并行，全局 claude 并发由 run_slot 上限约束。
 """
 
 import argparse
 import json
 import os
 import threading
+from collections import OrderedDict
 
 import db
+import feishu_api
 from bot import Bot
 
 BASE_DIR = os.path.dirname(__file__)
@@ -62,7 +66,7 @@ def load_env_file(env_name):
 
 
 def load_config(env_name):
-    """解析 .env.<name> 为 {db, poll_interval, task_timeout, bots:[...]}。"""
+    """解析 .env.<name> 为 {db, task_timeout, bots:[...]}。"""
     env = load_env_file(env_name)
     return {
         "db": {
@@ -72,7 +76,6 @@ def load_config(env_name):
             "user": env["DB_USER"],
             "password": env["DB_PASSWORD"],
         },
-        "poll_interval": int(env["POLL_INTERVAL"]),
         "task_timeout": int(env["TASK_TIMEOUT"]),
         "heartbeat_interval": int(env.get("HEARTBEAT_INTERVAL", 60)),
         "max_concurrent": int(env.get("MAX_CONCURRENT", 3)),  # 全局同时运行的 claude 上限
@@ -111,15 +114,34 @@ def main():
 
     # 全局并发闸：所有 bot 共享一个信号量，限制同时运行的 claude 进程数（不同 chat_id 并行但有上限）
     run_slot = threading.BoundedSemaphore(cfg["max_concurrent"])
-    bots = [Bot(bc, session_factory, cfg["poll_interval"], cfg["task_timeout"], cfg["models"],
-                cfg["heartbeat_interval"], run_slot=run_slot)
-            for bc in cfg["bots"]]
+
+    # 按 app_id 分组：每个 app 一个 SDK 客户端（发送/下载）+ 一条长连接；chat_id -> Bot 供路由
+    api_clients = OrderedDict()     # app_id -> lark.Client
+    app_secrets = {}               # app_id -> app_secret
+    app_chatmaps = {}              # app_id -> {chat_id: Bot}
+    bots = []
+    for bc in cfg["bots"]:
+        aid = bc["app_id"]
+        if aid not in api_clients:
+            api_clients[aid] = feishu_api.build_client(aid, bc["app_secret"])
+            app_secrets[aid] = bc["app_secret"]
+            app_chatmaps[aid] = {}
+        b = Bot(bc, session_factory, cfg["task_timeout"], cfg["models"],
+                cfg["heartbeat_interval"], run_slot=run_slot, client=api_clients[aid])
+        app_chatmaps[aid][bc["chat_id"]] = b
+        bots.append(b)
     print(f"[feishu-claude-bot] env={args.env}, bots={[b.name for b in bots]}, "
-          f"max_concurrent={cfg['max_concurrent']}")
+          f"apps={len(api_clients)}, max_concurrent={cfg['max_concurrent']}")
 
     pidf = pid_file(args.env)
     write_pid(pidf)
-    threads = [threading.Thread(target=b.run, name=b.name, daemon=True) for b in bots]
+    # 先起每个 Bot 的 inbox+worker 线程，再为每个 app 开一条长连接（start() 阻塞、自动重连）
+    for b in bots:
+        b.start()
+    ws_clients = [feishu_api.build_ws_client(aid, app_secrets[aid], app_chatmaps[aid])
+                  for aid in api_clients]
+    threads = [threading.Thread(target=ws.start, name=f"ws-{i}", daemon=True)
+               for i, ws in enumerate(ws_clients)]
     try:
         for t in threads:
             t.start()

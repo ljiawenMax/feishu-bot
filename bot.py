@@ -1,10 +1,12 @@
 """Bot：单个飞书机器人（一个 chat_id）的消息处理与会话编排。
 
-每个 Bot 实例对应一个 chat_id，状态持久化在 MySQL。同一 chat_id 的消息在
-Bot.run() 的单循环里串行处理，天然无并发。多机器人通过多进程（每个一份 .env.<name>）
-运行，互不阻塞。
+每个 Bot 实例对应一个 chat_id，状态持久化在 MySQL。消息由长连接事件推来，经
+on_event（跑在 ws 事件循环里、必须快速返回）按 message_id 去重后丢进 inbox 队列；
+inbox 线程串行处理（命令回复/上传下载/把长任务入队），claude 长任务再交给 worker 线程。
+同一 chat_id 天然保序；不同 chat_id 各有自己的线程可并行，全局 claude 并发由 run_slot 约束。
 """
 
+import collections
 import os
 import queue
 import subprocess
@@ -39,15 +41,16 @@ HELP_TEXT = "\n".join([
 class Bot:
     """飞书消息驱动 Claude Code 的轮询服务，状态持久化在 MySQL。"""
 
-    def __init__(self, bot_cfg, session_factory, poll_interval, task_timeout, models=None,
-                 heartbeat_interval=60, run_slot=None):
+    def __init__(self, bot_cfg, session_factory, task_timeout, models=None,
+                 heartbeat_interval=60, run_slot=None, client=None):
         self.name = bot_cfg["name"]
         self.app_id = bot_cfg["app_id"]
         self.app_secret = bot_cfg["app_secret"]
         self.chat_id = bot_cfg["chat_id"]
         # 一 chat 一 work_dir；省略时回退家目录，配置值支持 ~
         self.work_dir = os.path.expanduser(bot_cfg.get("work_dir") or "~")
-        self.poll_interval = poll_interval
+        # 发送/下载用的 SDK 客户端（同 app_id 的多个 Bot 共用一个；token 由其内部管理）
+        self.client = client
         self.task_timeout = task_timeout
         self.models = models or ["opus", "sonnet", "haiku"]  # /model 可选清单
         self.heartbeat_interval = heartbeat_interval  # 长任务心跳间隔秒数，0=禁用
@@ -66,11 +69,16 @@ class Bot:
         self.pending = None   # "session" | "model"，当前等待用户回复序号的类型
         self.last_task = None  # {"text", "msg_id", "session_id"}，用于 /retry 重跑
 
-        # 异步执行：任务丢后台 worker 串行跑，主循环不阻塞；lock 护共享会话状态的短临界区
+        # inbox：长连接事件先入此队列（on_event 快速返回），inbox 线程串行处理命令/上传/入队
+        self.inbox = queue.Queue()
+        # 幂等去重：长连接事件可能重复投递，记最近处理过的 message_id（有界 LRU）
+        self._seen_ids = collections.OrderedDict()
+        self._seen_max = 500
+        # 异步执行：claude 长任务丢后台 worker 串行跑，inbox 线程不阻塞；lock 护会话状态短临界区
         self.task_queue = queue.Queue()
         self.lock = threading.RLock()
 
-        # 命令分发表：命令 -> 处理方法(token, msg, arg)
+        # 命令分发表：命令 -> 处理方法(msg, arg)
         self.commands = {
             "/sessions": self.cmd_sessions,
             "/help": self.cmd_help,
@@ -186,20 +194,20 @@ class Bot:
 
     # ------------------------------------------------------------- commands
 
-    def cmd_sessions(self, token, msg, arg):
+    def cmd_sessions(self, msg, arg):
         data = self.sessions
         if len(data["list"]) <= 1:
-            feishu_api.reply_message(token, msg["id"], "当前只有 1 个对话，发送 /new 创建新对话")
+            feishu_api.reply_message(self.client, msg["id"], "当前只有 1 个对话，发送 /new 创建新对话")
         else:
             self.pending = "session"
-            feishu_api.reply_message(token, msg["id"], feishu_api.build_sessions_prompt(data["list"], data["current"]))
+            feishu_api.reply_message(self.client, msg["id"], feishu_api.build_sessions_prompt(data["list"], data["current"]))
 
-    def cmd_help(self, token, msg, arg):
-        feishu_api.reply_message(token, msg["id"], HELP_TEXT)
+    def cmd_help(self, msg, arg):
+        feishu_api.reply_message(self.client, msg["id"], HELP_TEXT)
 
-    def cmd_name(self, token, msg, arg):
+    def cmd_name(self, msg, arg):
         if not arg:
-            feishu_api.reply_message(token, msg["id"], "用法：/name <名称>")
+            feishu_api.reply_message(self.client, msg["id"], "用法：/name <名称>")
             return
         data = self.sessions
         if data["list"]:
@@ -207,11 +215,11 @@ class Bot:
             entry["label"] = arg
             if entry.get("_row_id"):
                 self.db(db.update_session, entry["_row_id"], label=arg)
-            feishu_api.reply_message(token, msg["id"], f"当前对话已命名为「{arg}」")
+            feishu_api.reply_message(self.client, msg["id"], f"当前对话已命名为「{arg}」")
         else:
-            feishu_api.reply_message(token, msg["id"], "当前没有活跃的对话")
+            feishu_api.reply_message(self.client, msg["id"], "当前没有活跃的对话")
 
-    def cmd_new(self, token, msg, arg):
+    def cmd_new(self, msg, arg):
         with self.lock:  # 与 worker 的 update_session 互斥，防会话列表被并发改乱
             data = self.sessions
             entry = self.make_session()
@@ -221,10 +229,10 @@ class Bot:
             self.set_current(entry)
             total = len(data["list"])
         self.pending = None
-        feishu_api.reply_message(token, msg["id"], f"已创建新对话（共 {total} 个），发送任务即可开始")
+        feishu_api.reply_message(self.client, msg["id"], f"已创建新对话（共 {total} 个），发送任务即可开始")
         print(f"[{self.name}][new-session] total={total}")
 
-    def cmd_permit(self, token, msg, arg):
+    def cmd_permit(self, msg, arg):
         self.permit_mode = not self.permit_mode
         on = self.permit_mode
         # 与 unsafe 互斥：开 permit 则关掉 unsafe
@@ -234,12 +242,12 @@ class Bot:
         self.save_bot_state()
         status = "已开启（可在工作区读写/修改文件，不执行命令）" if on else "已关闭"
         note = "（已自动关闭最高权限 unsafe）" if cleared else ""
-        feishu_api.reply_message(token, msg["id"], f"权限模式 {status}{note}")
+        feishu_api.reply_message(self.client, msg["id"], f"权限模式 {status}{note}")
         print(f"[{self.name}][permit]={on}")
         if on and self.last_task:
-            feishu_api.reply_message(token, msg["id"], "是否用新权限重跑上一条任务？发送 /retry 确认")
+            feishu_api.reply_message(self.client, msg["id"], "是否用新权限重跑上一条任务？发送 /retry 确认")
 
-    def cmd_unsafe(self, token, msg, arg):
+    def cmd_unsafe(self, msg, arg):
         self.unsafe_mode = not self.unsafe_mode
         on = self.unsafe_mode
         # 与 permit 互斥：开 unsafe 则关掉 permit
@@ -250,12 +258,12 @@ class Bot:
         status = ("已开启（跳过全部权限校验，可执行任意命令含 bash，请谨慎）"
                   if on else "已关闭")
         note = "（已自动关闭文件读写 permit）" if cleared else ""
-        feishu_api.reply_message(token, msg["id"], f"最高权限 {status}{note}")
+        feishu_api.reply_message(self.client, msg["id"], f"最高权限 {status}{note}")
         print(f"[{self.name}][unsafe]={on}")
         if on and self.last_task:
-            feishu_api.reply_message(token, msg["id"], "是否用新权限重跑上一条任务？发送 /retry 确认")
+            feishu_api.reply_message(self.client, msg["id"], "是否用新权限重跑上一条任务？发送 /retry 确认")
 
-    def cmd_model(self, token, msg, arg):
+    def cmd_model(self, msg, arg):
         """列出可选模型，回复序号选择（作用于当前对话）。"""
         # 确保有一个 session 承载模型选择（无则按首用初始化）
         if not self.sessions["list"]:
@@ -271,21 +279,21 @@ class Bot:
         for i, name in enumerate(options, 1):
             lines.append(f"{i}. {name}{' ◀ 当前' if i - 1 == cur_pos else ''}")
         self.pending = "model"
-        feishu_api.reply_message(token, msg["id"], "\n".join(lines))
+        feishu_api.reply_message(self.client, msg["id"], "\n".join(lines))
 
-    def cmd_context(self, token, msg, arg):
+    def cmd_context(self, msg, arg):
         """查看当前对话的 context 窗口占用（读磁盘 session 文件的最近一轮用量）。"""
         entry = self.current_entry()
         if not entry or not entry.get("id"):
-            feishu_api.reply_message(token, msg["id"],
+            feishu_api.reply_message(self.client, msg["id"],
                                      "当前对话还没开始，暂无 context 信息（先发一条任务）")
             return
         info = claude_runner.session_context(entry["id"], self.work_dir)
         if not info:
-            feishu_api.reply_message(token, msg["id"],
+            feishu_api.reply_message(self.client, msg["id"],
                                      "读不到当前对话的 context 记录（session 文件不存在或尚无用量）")
             return
-        feishu_api.reply_message(token, msg["id"], self._format_context(entry, info))
+        feishu_api.reply_message(self.client, msg["id"], self._format_context(entry, info))
         print(f"[{self.name}][context] used={info['total_input']} model={info.get('model')}")
 
     @staticmethod
@@ -317,7 +325,7 @@ class Bot:
             f"本地历史：{turns} 轮（session 失效时用于重建 context）",
         ])
 
-    def cmd_usage(self, token, msg, arg):
+    def cmd_usage(self, msg, arg):
         """查看 Claude 订阅用量（官方 oauth/usage 端点，按需+缓存）。"""
         try:
             text = usage.report()
@@ -329,20 +337,20 @@ class Bot:
             text = "用量端点暂时限流，请稍后再试"
         except Exception as e:
             text = f"[error] 查询用量失败: {e}"
-        feishu_api.reply_message(token, msg["id"], text)
+        feishu_api.reply_message(self.client, msg["id"], text)
         print(f"[{self.name}][usage] queried")
 
-    def cmd_del(self, token, msg, arg):
+    def cmd_del(self, msg, arg):
         data = self.sessions
         if not arg.isdigit():
-            feishu_api.reply_message(token, msg["id"], "用法：/del <序号>（序号见 /sessions）")
+            feishu_api.reply_message(self.client, msg["id"], "用法：/del <序号>（序号见 /sessions）")
             return
         if not data["list"]:
-            feishu_api.reply_message(token, msg["id"], "当前没有可删除的对话")
+            feishu_api.reply_message(self.client, msg["id"], "当前没有可删除的对话")
             return
         didx = int(arg) - 1
         if not (0 <= didx < len(data["list"])):
-            feishu_api.reply_message(token, msg["id"], f"无效序号，请输入 1～{len(data['list'])}")
+            feishu_api.reply_message(self.client, msg["id"], f"无效序号，请输入 1～{len(data['list'])}")
             return
         with self.lock:  # 与 worker 的 update_session 互斥，防列表 pop/重排与写入相撞
             removed = data["list"].pop(didx)
@@ -370,7 +378,7 @@ class Bot:
                 data["history"] = self.load_history(cur_entry["id"])
             remaining = len(data["list"])
         self.pending = None
-        feishu_api.reply_message(token, msg["id"], f"已删除对话「{removed['label']}」（剩 {remaining} 个）")
+        feishu_api.reply_message(self.client, msg["id"], f"已删除对话「{removed['label']}」（剩 {remaining} 个）")
         print(f"[{self.name}][del] removed idx={didx} row={removed.get('_row_id')}")
 
     @staticmethod
@@ -391,7 +399,7 @@ class Bot:
 
     def _start_heartbeat(self, msg_id):
         """长任务期间周期回「仍在处理」，返回 stop_event；调用方在 finally 里 .set()。
-        每次发送都现取新鲜 token（token 仅 2h 有效，10h 任务复用旧的必失效）。"""
+        token 由 SDK 客户端内部自动刷新，长任务无需担心 token 过期。"""
         stop = threading.Event()
         if self.heartbeat_interval <= 0:
             return stop
@@ -402,8 +410,7 @@ class Bot:
             while not stop.wait(interval):          # 被 set 时立即返回 True 退出
                 elapsed = int(time.time() - started)
                 try:
-                    token = feishu_api.get_token(self.app_id, self.app_secret)
-                    feishu_api.reply_message(token, msg_id, f"⏳ 仍在处理中，已用 {self._human_elapsed(elapsed)}…", tag="heartbeat")
+                    feishu_api.reply_message(self.client, msg_id, f"⏳ 仍在处理中，已用 {self._human_elapsed(elapsed)}…", tag="heartbeat")
                 except Exception as e:
                     print(f"[{self.name}][heartbeat-error] {e}")
                 interval = min(interval * 2, 600)   # 逐步加倍、上限 10 分钟，防刷屏
@@ -420,28 +427,28 @@ class Bot:
             return f"{seconds // 60}m"
         return f"{seconds // 3600}h{(seconds % 3600) // 60:02d}m"
 
-    def cmd_retry(self, token, msg, arg):
+    def cmd_retry(self, msg, arg):
         with self.lock:
             t = self.last_task
         if not t:
-            feishu_api.reply_message(token, msg["id"], "没有可重跑的任务")
+            feishu_api.reply_message(self.client, msg["id"], "没有可重跑的任务")
             return
         self._enqueue({"kind": "retry", "text": t["text"], "msg_id": t["msg_id"],
                        "session_id": t["session_id"]},
-                      token, msg["id"], verb="重跑")
+                      msg["id"], verb="重跑")
 
     # --------------------------------------------------------------- 任务执行（异步）
 
-    def run_task(self, token, msg, text):
+    def run_task(self, msg, text):
         """主线程只做入队 + 立即回执，真正执行在后台 worker，故长任务不冻结 bot。"""
         self.pending = None
         with self.lock:
             self.last_task = {"text": text, "msg_id": msg["id"],
                               "session_id": self.current_session_id()}
         self._enqueue({"kind": "task", "text": text, "msg_id": msg["id"]},
-                      token, msg["id"], verb="执行")
+                      msg["id"], verb="执行")
 
-    def _enqueue(self, job, token, msg_id, verb):
+    def _enqueue(self, job, msg_id, verb):
         """把任务丢后台队列，立即回执（不阻塞主循环）。"""
         ahead = self.task_queue.qsize()
         self.task_queue.put(job)
@@ -451,7 +458,7 @@ class Bot:
         banner = self._permit_banner()
         if banner:
             lines.append(banner)
-        feishu_api.reply_message(token, msg_id, "\n".join(lines))
+        feishu_api.reply_message(self.client, msg_id, "\n".join(lines))
         print(f"[{self.name}][enqueue] {verb} qsize={ahead + 1} | {job['text'][:60]}")
 
     def _worker(self):
@@ -534,8 +541,7 @@ class Bot:
         """主动推送结果，失败重试几次（后台任务跑很久，不能因一次网络抖动就丢结果）。"""
         for i in range(attempts):
             try:
-                token = feishu_api.get_token(self.app_id, self.app_secret)
-                res = feishu_api.reply_message(token, msg_id, text, tag="push")
+                res = feishu_api.reply_message(self.client, msg_id, text, tag="push")
                 self._audit_sends(msg_id, "push", res)
                 if res:
                     return True
@@ -555,7 +561,7 @@ class Bot:
 
     # ---------------------------------------------------------- 消息处理 / 主循环
 
-    def handle_select(self, token, msg, idx):
+    def handle_select(self, msg, idx):
         """pending 状态下用数字消息选择对话 / 模型。"""
         if self.pending == "session":
             sessions = self.sessions["list"]
@@ -566,10 +572,10 @@ class Bot:
                     self.set_current(entry)
                     self.sessions["history"] = self.load_history(entry["id"])
                 self.pending = None
-                feishu_api.reply_message(token, msg["id"], f"已切换到对话 {idx + 1}：{entry['label']}")
+                feishu_api.reply_message(self.client, msg["id"], f"已切换到对话 {idx + 1}：{entry['label']}")
                 print(f"[{self.name}][session] switched to idx={idx}")
             else:
-                feishu_api.reply_message(token, msg["id"], f"无效序号，请输入 1～{len(sessions)}")
+                feishu_api.reply_message(self.client, msg["id"], f"无效序号，请输入 1～{len(sessions)}")
         elif self.pending == "model":
             options = ["默认（不指定）"] + list(self.models)  # idx 0=默认
             if 0 <= idx < len(options):
@@ -580,26 +586,26 @@ class Bot:
                     entry["model"] = model
                     if entry.get("_row_id"):
                         self.db(db.set_session_model, entry["_row_id"], model)
-                feishu_api.reply_message(token, msg["id"], f"当前对话模型已设为：{options[idx]}")
+                feishu_api.reply_message(self.client, msg["id"], f"当前对话模型已设为：{options[idx]}")
                 print(f"[{self.name}][model] -> {model}")
             else:
-                feishu_api.reply_message(token, msg["id"], f"无效序号，请输入 1～{len(options)}")
+                feishu_api.reply_message(self.client, msg["id"], f"无效序号，请输入 1～{len(options)}")
 
-    def handle_upload(self, token, msg):
+    def handle_upload(self, msg):
         """下载并安全存储上传的图片/文件/压缩包，写台账，回复保存路径。"""
         try:
-            info = uploads.save_upload(token, msg, self.chat_id)
+            info = uploads.save_upload(self.client, msg, self.chat_id)
         except uploads.TooLarge:
             mb = uploads.MAX_UPLOAD_BYTES // (1024 * 1024)
-            feishu_api.reply_message(token, msg["id"], f"文件超过大小上限（>{mb}MB），未保存")
+            feishu_api.reply_message(self.client, msg["id"], f"文件超过大小上限（>{mb}MB），未保存")
             return
         except Exception as e:
-            feishu_api.reply_message(token, msg["id"], f"[error] 保存上传文件失败: {e}")
+            feishu_api.reply_message(self.client, msg["id"], f"[error] 保存上传文件失败: {e}")
             print(f"[{self.name}][upload-error] {e}")
             return
         self.db(db.record_upload, msg["id"], self.chat_id, msg.get("resource_type"),
                 info["file_name"], info["path"], info["size"], info["content_type"])
-        feishu_api.reply_message(token, msg["id"], "\n".join([
+        feishu_api.reply_message(self.client, msg["id"], "\n".join([
             "已保存上传文件：",
             info["path"],
             f"大小 {info['size_human']}",
@@ -607,7 +613,7 @@ class Bot:
         ]))
         print(f"[{self.name}][upload] {info['path']} ({info['size_human']})")
 
-    def handle_post_images(self, token, msg):
+    def handle_post_images(self, msg):
         """下载 post 富文本里内嵌的图片，写台账，返回 (文字, [本地路径,...])。"""
         text = msg.get("text", "")
         paths = []
@@ -615,7 +621,7 @@ class Bot:
             synth = {"id": msg["id"], "file_key": image_key,
                      "resource_type": "image", "file_name": f"img{idx}"}
             try:
-                info = uploads.save_upload(token, synth, self.chat_id)
+                info = uploads.save_upload(self.client, synth, self.chat_id)
             except Exception as e:
                 print(f"[{self.name}][post-img-error] {e}")
                 continue
@@ -624,29 +630,29 @@ class Bot:
             paths.append(info["path"])
         return text, paths
 
-    def handle_unsupported(self, token, msg):
+    def handle_unsupported(self, msg):
         """处理不了的消息（不支持的类型）：留痕到 DB + 回提示。"""
         mt = msg.get("msg_type", "?")
         self.db(db.record_unhandled, msg["id"], self.chat_id, mt, msg.get("raw", ""))
-        feishu_api.reply_message(token, msg["id"], "不支持处理当前消息类型")
+        feishu_api.reply_message(self.client, msg["id"], "不支持处理当前消息类型")
         print(f"[{self.name}][unhandled] msg_type={mt} id={msg['id']}")
 
-    def handle_message(self, token, msg):
+    def handle_message(self, msg):
         # 文件类消息（图片/文件/压缩包）先分流（这些消息没有 text 字段）
         if msg.get("kind") == "file":
-            self.handle_upload(token, msg)
+            self.handle_upload(msg)
             return
         # 处理不了的类型：留痕 + 提示
         if msg.get("kind") == "unsupported":
-            self.handle_unsupported(token, msg)
+            self.handle_unsupported(msg)
             return
         # 富文本 post：下载内嵌图片；有图则作为带附件的任务，纯文本则按文本继续
         if msg.get("kind") == "post":
-            ptext, paths = self.handle_post_images(token, msg)
+            ptext, paths = self.handle_post_images(msg)
             if paths:
                 full = (ptext or "请查看随附的图片").rstrip()
                 full += "\n\n[随消息附带的图片，可直接读取]\n" + "\n".join(paths)
-                self.run_task(token, msg, full)
+                self.run_task(msg, full)
                 return
             msg = {**msg, "text": ptext}  # 纯文本 post，降级为普通文本处理
         text = (msg.get("text") or "").strip()
@@ -654,45 +660,47 @@ class Bot:
             return
         # 等待序号时，数字消息用于选择
         if self.pending and text.isdigit():
-            self.handle_select(token, msg, int(text) - 1)
+            self.handle_select(msg, int(text) - 1)
             return
         # 命令分发（首词为命令，其余为参数）
         head, _, rest = text.partition(" ")
         handler = self.commands.get(head.lower())
         if handler:
-            handler(token, msg, rest.strip())
+            handler(msg, rest.strip())
             return
         # 普通任务
-        self.run_task(token, msg, text)
+        self.run_task(msg, text)
 
-    def run(self):
-        print(f"[{self.name}] started, chat_id={self.chat_id}, "
-              f"work_dir={self.work_dir}, backoff 5s~{self.poll_interval}s")
+    # ------------------------------------------------------------ 长连接入口 / 启动
 
-        # 后台 worker：任务串行执行，主循环只入队，长任务不冻结轮询/命令
+    def start(self):
+        """启动后台线程：inbox 分发（命令回复/上传下载/入队）+ worker（跑 claude 长任务）。
+        事件由长连接推来，绝不在 ws 事件循环里做网络 IO。"""
+        threading.Thread(target=self._inbox_worker, name=f"{self.name}-inbox", daemon=True).start()
         threading.Thread(target=self._worker, name=f"{self.name}-worker", daemon=True).start()
+        print(f"[{self.name}] ready, chat_id={self.chat_id}, work_dir={self.work_dir}")
 
-        last_ts = str(int(time.time()))
-        last_poll_time = time.time()
-        interval = 5
+    def on_event(self, msg):
+        """长连接事件入口：跑在 ws 事件循环线程里，必须快速返回。
+        按 message_id 幂等去重（飞书事件可能重投）后丢进 inbox，实际处理在 inbox 线程。"""
+        mid = msg.get("id")
+        if mid is not None:
+            if mid in self._seen_ids:
+                print(f"[{self.name}][dup] ignore redelivered msg {mid}")
+                return
+            self._seen_ids[mid] = True
+            if len(self._seen_ids) > self._seen_max:
+                self._seen_ids.popitem(last=False)
+        self.inbox.put(msg)
 
+    def _inbox_worker(self):
+        """串行处理本 chat 的消息（命令回复、上传下载、把长任务入 task_queue）：
+        同一 chat 保序，不阻塞 ws 事件循环。等价于旧轮询线程里 handle_message 的角色。"""
         while True:
+            msg = self.inbox.get()
             try:
-                now = time.time()
-                # 距上次轮询超过 60s，说明电脑曾休眠，跳过积压消息
-                if now - last_poll_time > 60:
-                    last_ts = str(int(now))
-                    print(f"[{self.name}][info] woke from sleep, resetting message timestamp")
-                last_poll_time = now
-
-                token = feishu_api.get_token(self.app_id, self.app_secret)
-                messages = feishu_api.fetch_new_messages(token, self.chat_id, last_ts)
-                interval = 5 if messages else min(interval * 4, self.poll_interval)
-
-                for msg in messages:
-                    last_ts = str(int(msg["create_time"]) // 1000 + 1)
-                    self.handle_message(token, msg)
+                self.handle_message(msg)
             except Exception as e:
-                print(f"[{self.name}][error] {e}")
-
-            time.sleep(5 if self.pending else interval)
+                print(f"[{self.name}][inbox-error] {e}")
+            finally:
+                self.inbox.task_done()

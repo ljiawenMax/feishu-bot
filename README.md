@@ -1,29 +1,29 @@
 # feishu-claude-bot
 
-本地运行的轮询服务，监听飞书群消息，将消息内容作为任务交给 Claude Code 执行，把执行结果回复到飞书。无需开放本地端口，采用主动轮询方式拉取消息。
+本地运行的服务，监听飞书群消息，将消息内容作为任务交给 Claude Code 执行，把执行结果回复到飞书。无需开放本地端口、也无需公网 IP：用飞书官方 SDK `lark-oapi` 的**长连接（WebSocket）**接收事件（出站连接由本机发起），群里 **@机器人** 触发。
 
 ## 架构
 
 ```
-飞书群聊 → 轮询拉取消息 → 解析指令/任务 → 调用 Claude Code CLI → 回复结果到飞书
+飞书群聊 @机器人 → 长连接推送事件 → 按 chat_id 路由 → 解析指令/任务 → 调用 Claude Code CLI → 回复结果到飞书
 ```
 
-`Bot` 在一个循环中：
+收到 `im.message.receive_v1` 事件后：
 
-1. 调用飞书 API 拉取最新群消息（带自适应退避，闲置时最长 `POLL_INTERVAL` 秒）
-2. 识别是命令（`/` 开头）还是普通任务文本
-3. 以 `claude -p <task> --output-format stream-json` 执行任务
+1. `on_event` 按 `message_id` 幂等去重（防飞书重投）后丢进 inbox（回调在 ws 事件循环里，必须快速返回）
+2. inbox 线程识别是命令（`/` 开头）还是普通任务文本
+3. 以 `claude -p <task> --output-format stream-json` 执行任务（长任务在 worker 线程，不阻塞接收）
 4. 将结果分段（每段 ≤ 3900 字符）回复到飞书
 
 ### 代码结构（按职责分层）
 
 | 文件 | 职责 |
 |------|------|
-| `feishu_claude.py` | 入口：解析配置、建 DB engine、按 `BOTS` 列表为每个机器人起线程、管理 PID |
+| `feishu_claude.py` | 入口：解析配置、建 DB engine、按 `app_id` 分组建长连接并路由、管理 PID |
 | `bot.py` | `Bot` 类：单个机器人的消息分发、命令处理、会话编排（业务主体） |
 | `models.py` | SQLAlchemy ORM 模型：`BotState` / `Conversation`(表 sessions) / `Message` / `Upload` |
 | `db.py` | 数据库层：engine/session 管理 + 基于 ORM 的数据访问 |
-| `feishu_api.py` | 飞书 API：获取 token、拉取/回复消息、下载资源、文本分段与构造 |
+| `feishu_api.py` | 飞书交互层（lark-oapi SDK）：长连接与事件分发、事件归一、回复/下载、文本分段 |
 | `uploads.py` | 上传文件的安全下载与存储（隔离目录、最小权限、文件名消毒） |
 | `claude_runner.py` | 调用 `claude` CLI、解析 stream-json、删除磁盘 session 文件 |
 
@@ -33,12 +33,15 @@
 ### 多机器人（单进程多线程）
 
 一个进程内可运行多个机器人——`.env.local` 的 `BOTS` 列表里每一项就是一个机器人（自己的
-app 凭证、chat_id、工作目录）。每个机器人在**自己的线程**里跑独立的轮询循环：
+app 凭证、chat_id、工作目录）。长连接是「**每 app 一条、cluster 模式、不广播**」，故按
+`app_id` 分组：每个 app_id 一条长连接，收到事件按 `chat_id` 路由到对应 Bot；多个群共用一个
+app_id 时共享这条连接。每个 Bot 有 inbox 线程（串行处理消息）+ worker 线程（跑长任务）：
 
-- 同一 `chat_id` 的消息在该机器人线程里**串行处理**，无并发
-- 不同机器人并行、互不阻塞（一个机器人跑长任务不影响其它机器人）
+- 同一 `chat_id` 的消息**串行处理**、保序，无并发
+- 不同 `chat_id` 并行、互不阻塞（一个跑长任务不影响其它）
 - 共享一个数据库 engine；每次 DB 操作开短生命周期 Session，天然线程安全
-- token 缓存按 `app_id` 分键；数据库三张表按 `chat_id` 隔离
+- token 由 SDK 客户端内部管理（按 `app_id` 一个客户端）；数据库表按 `chat_id` 隔离
+- 长连接断线期间飞书**不补发**漏掉的事件（SDK 自动重连）；进程未运行时发的消息不会补处理
 
 ## 配置文件
 
@@ -51,7 +54,6 @@ DB_PORT=3306
 DB_NAME=feishu_bot
 DB_USER=feishu_bot
 DB_PASSWORD=xxxxxxxx
-POLL_INTERVAL=5
 TASK_TIMEOUT=600
 BOTS=[{"name":"prod","app_id":"cli_xxx","app_secret":"xxx","chat_id":"oc_xxx","work_dirs":{"别名":"/abs/path"}}]
 ```
@@ -59,7 +61,6 @@ BOTS=[{"name":"prod","app_id":"cli_xxx","app_secret":"xxx","chat_id":"oc_xxx","w
 | 字段 | 说明 |
 |------|------|
 | `DB_*` | MySQL 连接信息，用于 session 持久化与对话审计 |
-| `POLL_INTERVAL` | 空闲时最大轮询间隔（秒），有消息时退回 5s |
 | `TASK_TIMEOUT` | 单次 Claude Code 执行超时（秒） |
 | `BOTS` | JSON 数组，每项一个机器人；多机器人就追加数组项 |
 | `BOTS[].name` | 机器人名（用于日志前缀，区分多机器人） |
@@ -70,9 +71,12 @@ BOTS=[{"name":"prod","app_id":"cli_xxx","app_secret":"xxx","chat_id":"oc_xxx","w
 ### 飞书应用配置
 
 1. 前往 [飞书开放平台](https://open.feishu.cn) 创建企业自建应用
-2. 权限管理中开启：`im:message`、`im:message.group_at_msg`
-3. 发布应用并将 Bot 添加到目标群聊
-4. `CHAT_ID`：飞书 PC 端打开群聊 → 右上角「…」→「复制链接」→ 链接中 `open_chat_id=oc_xxx` 的值
+2. 权限管理中开启：`im:message`、`im:message.group_at_msg`、`im:resource`（下载图片/文件）；私聊再加 `im:message.p2p_msg`
+3. **事件与回调 → 事件配置：订阅方式选「长连接」**，订阅事件 `im.message.receive_v1`
+4. 发布应用版本并将 Bot 添加到目标群聊
+5. `CHAT_ID`：飞书 PC 端打开群聊 → 右上角「…」→「复制链接」→ 链接中 `open_chat_id=oc_xxx` 的值
+
+> 群里需 **@机器人** 才会收到事件（正文里的 @ 占位会被自动剥掉）。想「每条消息都执行」需改申请敏感权限 `im:message.group_msg`（需审批）。
 
 ## 启动与重启
 
@@ -182,10 +186,13 @@ ORDER BY id DESC LIMIT 20;
 
 设计要点：Claude Code 能把文件操作限定在工作区（cwd + `--add-dir`），但无法把 shell 命令限定在目录（命令以系统用户身份运行）。因此本项目**不再使用** `--dangerously-skip-permissions`（会放开整个文件系统与命令执行），`/permit` 最高只到 `acceptEdits`——文件操作锁在当前目录、永不执行任意命令。该聊天上传目录始终经 `--add-dir` 纳入工作区，便于读取上传文件分析。
 
-## 自适应轮询与休眠恢复
+## 长连接（WebSocket）接收
 
-- 有新消息时轮询间隔重置为 5s；无消息时每次乘以 4 直到 `POLL_INTERVAL` 上限
-- 检测到距上次轮询超过 60s（电脑休眠），自动跳过积压消息，避免重复执行历史任务
+- 用飞书官方 SDK `lark-oapi` 的 `lark.ws.Client` 建长连接、订阅 `im.message.receive_v1` 事件；连接由本机出站发起，无需公网 IP，无需开端口
+- 长连接「每 app 一条、cluster 模式、不广播」——同一 `app_id` 只能有一条有效连接，多开只有随机一条能收到事件；本项目按 `app_id` 分组保证一条
+- 事件可能重复投递，`on_event` 按 `message_id` 幂等去重
+- 断线由 SDK 自动重连；断线期间飞书**不补发**漏掉的事件，进程未运行时发的消息不会补处理
+- 启动成功会打印 `connected to wss://...`
 
 ## 文件结构
 
@@ -194,7 +201,7 @@ feishu_claude.py   # 入口：解析配置 + 建 engine + 起线程 + PID 管理
 bot.py             # Bot 类：单机器人消息分发、命令处理、会话编排
 models.py          # SQLAlchemy ORM 模型（BotState/Conversation/Message/Upload）
 db.py              # 数据库层：engine/session + ORM 数据访问
-feishu_api.py      # 飞书 API：token / 拉取 / 回复 / 下载资源 / 文本构造
+feishu_api.py      # 飞书交互层（lark-oapi SDK）：长连接/事件归一/回复/下载/文本分段
 uploads.py         # 上传文件安全下载与存储（隔离目录、最小权限）
 claude_runner.py   # 调用 claude CLI + 删除磁盘 session 文件
 restart.sh         # 按配置名停止旧进程并重启
