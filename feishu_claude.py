@@ -130,7 +130,7 @@ def main():
                 cfg["heartbeat_interval"], run_slot=run_slot, client=api_clients[aid])
         app_chatmaps[aid][bc["chat_id"]] = b
         bots.append(b)
-    print(f"[feishu-claude-bot] env={args.env}, bots={[b.name for b in bots]}, "
+    print(f"[feishu-bot] env={args.env}, bots={[b.name for b in bots]}, "
           f"apps={len(api_clients)}, max_concurrent={cfg['max_concurrent']}")
 
     pidf = pid_file(args.env)
@@ -148,7 +148,7 @@ def main():
         for t in threads:
             t.join()
     except KeyboardInterrupt:
-        print("\n[feishu-claude-bot] stopped")
+        print("\n[feishu-bot] stopped")
     finally:
         remove_pid(pidf)
 

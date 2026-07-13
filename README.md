@@ -1,4 +1,4 @@
-# feishu-claude-bot
+# feishu-bot
 
 本地运行的服务，监听飞书群消息，将消息内容作为任务交给 Claude Code 执行，把执行结果回复到飞书。无需开放本地端口、也无需公网 IP：用飞书官方 SDK `lark-oapi` 的**长连接（WebSocket）**接收事件（出站连接由本机发起），群里 **@机器人** 触发。
 
