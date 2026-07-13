@@ -68,14 +68,29 @@ def run_claude(task, work_dir, timeout, session_id=None, permit=False, extra_dir
         etype = event.get("type")
         if etype == "result":
             if event.get("is_error"):
-                errors = event.get("errors", [])
+                error_message = format_claude_error(event)
+
                 # session 失效：用历史记录重建 context，开新 session 重跑
-                if session_id and any("No conversation found" in e for e in errors):
+                if session_id and "No conversation found" in error_message:
                     print(f"[warn] session {session_id[:8]}… expired, rebuilding context")
-                    recovered_task = build_task_with_history(task, history or [])
-                    return run_claude(recovered_task, work_dir, timeout, session_id=None,
-                                      permit=permit, extra_dirs=extra_dirs, model=model, unsafe=unsafe)
-                return f"[error] {'; '.join(errors) or 'unknown error'}", None, used_model
+
+                    recovered_task = build_task_with_history(
+                        task,
+                        history or []
+                    )
+
+                    return run_claude(
+                        recovered_task,
+                        work_dir,
+                        timeout,
+                        session_id=None,
+                        permit=permit,
+                        extra_dirs=extra_dirs,
+                        model=model,
+                        unsafe=unsafe
+                    )
+
+                return f"[error] {error_message}", None, used_model
             new_session_id = event.get("session_id")
             result = event.get("result") or "".join(text_parts).strip()
             # result 为空说明 session 状态异常（如权限拒绝后的残留），清掉重跑
@@ -102,6 +117,32 @@ def run_claude(task, work_dir, timeout, session_id=None, permit=False, extra_dir
         result += f"\n\n[超时（>{timeout}s），以上为已生成内容]"
     return result, new_session_id, used_model
 
+def format_claude_error(event):
+    status = event.get("api_error_status")
+
+    message = (
+        "; ".join(event.get("errors", []))
+        or event.get("result")
+        or event.get("message")
+        or "unknown error"
+    )
+
+    if "usage limit" in message.lower():
+        return f"额度已用尽（订阅使用限额），请等待额度重置或升级套餐: {message}"
+
+    mapping = {
+        401: "认证失败",
+        403: "权限不足",
+        429: "请求受限（限流或额度不足）",
+        500: "Claude 服务异常",
+    }
+
+    prefix = mapping.get(status)
+
+    if prefix:
+        return f"{prefix}: {message}"
+
+    return message
 
 def session_context(claude_session_id, work_dir):
     """读取磁盘 session 文件，返回最近一轮的 context 占用信息。
