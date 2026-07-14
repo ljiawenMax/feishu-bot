@@ -203,6 +203,61 @@ def session_context(claude_session_id, work_dir):
     }
 
 
+def list_all_sessions():
+    """扫描 ~/.claude/projects 下全部 project 目录的 session 文件——本机所有 Claude Code
+    会话，不限于本 bot 的 work_dir/chat_id。按最近修改时间倒序返回：
+    [{"project", "session_id", "title", "mtime"}, ...]（project/title 缺失时可能为 None）。"""
+    base = os.path.expanduser("~/.claude/projects")
+    results = []
+    if not os.path.isdir(base):
+        return results
+    for project_dir in os.scandir(base):
+        if not project_dir.is_dir():
+            continue
+        for entry in os.scandir(project_dir.path):
+            if not entry.is_file() or not entry.name.endswith(".jsonl"):
+                continue
+            try:
+                mtime = entry.stat().st_mtime
+            except OSError:
+                continue
+            cwd, title = _peek_session_meta(entry.path)
+            results.append({
+                "project": cwd or project_dir.name,
+                "session_id": entry.name[:-len(".jsonl")],
+                "title": title,
+                "mtime": mtime,
+            })
+    results.sort(key=lambda r: r["mtime"], reverse=True)
+    return results
+
+
+def _peek_session_meta(path, max_lines=200):
+    """只读文件前若干行取 cwd（首条带 cwd 的事件）与 ai-title（Claude 生成的会话摘要），
+    两者都拿到即提前退出，避免整份读大文件。"""
+    cwd = None
+    title = None
+    try:
+        with open(path) as f:
+            for i, line in enumerate(f):
+                if i >= max_lines or (cwd and title):
+                    break
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not cwd and event.get("cwd"):
+                    cwd = event["cwd"]
+                if not title and event.get("type") == "ai-title":
+                    title = event.get("aiTitle")
+    except OSError:
+        pass
+    return cwd, title
+
+
 def delete_claude_session(claude_session_id, work_dir):
     """删除 Claude Code 在磁盘上保存的 session 文件"""
     project_key = work_dir.replace("/", "-")

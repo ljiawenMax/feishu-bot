@@ -17,6 +17,7 @@
 - `db.py` — 数据库层：engine/session 管理 + 基于 ORM 的数据访问（不再手写 SQL）
 - `feishu_api.py` — 飞书交互层（基于 lark-oapi SDK）：长连接客户端与事件分发、事件归一、回复/下载、文本分段
 - `uploads.py` — 上传图片/文件/压缩包的安全下载与存储（隔离目录 700、文件 600、文件名消毒、不自动解压）
+- `gitsync.py` — 增量补丁：把每个 chat 工作目录「上次同步以来」的改动生成增量 `git diff`（供远程 `git apply`）
 - `claude_runner.py` — 调用 `claude` CLI、解析 stream-json、删除磁盘 session 文件
 - `.env` — 配置模板（入 git）；`.env.local` — 实际配置（不入 git）
 
@@ -47,9 +48,16 @@ DB 访问走 SQLAlchemy ORM；每次操作开短生命周期 Session（线程安
   "app_id": "飞书应用 App ID",
   "app_secret": "飞书应用 App Secret",
   "chat_id": "监听的群聊 ID（格式 oc_xxxxxx，唯一）",
-  "work_dir": "Claude Code 执行任务的工作目录（绝对路径，可省略→家目录 ~）"
+  "work_dir": "Claude Code 执行任务的工作目录（绝对路径，可省略→家目录 ~）",
+  "sync_patch": "可选布尔（默认 false）：每轮任务成功后自动把增量 .patch 发到群，供远程 git apply"
 }
 ```
+
+**增量补丁同步（gitsync）**：`work_dir` 是 git 仓库时可用。每个 chat 维护隐藏基线 ref
+`refs/feishu-sync/<chat_id>`（游离快照，不碰 HEAD/分支/历史/暂存区）；每轮改动生成「基线→当前工作树」
+的增量 `git diff`（尊重 .gitignore），带序号发到群，发完基线前移，故下轮只含新增改动、远程按序
+`git apply` 逐轮叠加。`sync_patch=true` 开启自动发送；`/sync` 命令随时手动发送（不受开关限制）。
+本机 commit 与否都不影响（快照抓工作树内容而非 HEAD）。前提：远程与本机同版本、只被动接收补丁。
 
 `task_timeout` / `heartbeat_interval` / `models` / `max_concurrent` 为共享项，写在 `.env.local` 顶层。
 （`POLL_INTERVAL` 已废弃：改用长连接推送，不再轮询；保留仅为兼容旧配置。）

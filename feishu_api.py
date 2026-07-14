@@ -11,6 +11,8 @@ import json
 
 import lark_oapi as lark
 from lark_oapi.api.im.v1 import (
+    CreateFileRequest,
+    CreateFileRequestBody,
     GetMessageResourceRequest,
     ReplyMessageRequest,
     ReplyMessageRequestBody,
@@ -252,6 +254,49 @@ def reply_message(client, message_id, text, tag="reply"):
             print(f"[feishu][{tag}][error] reply_to={message_id} {i+1}/{total} {e}")
         sends.append(snd)
     return SendResult(sends)
+
+
+def upload_file(client, file_path, file_name, file_type="stream"):
+    """上传本地文件到飞书，返回 file_key（用于发文件消息）。失败抛异常。
+    file_type 用通用的 'stream'（补丁是文本 .patch 文件，走通用二进制流即可）。"""
+    with open(file_path, "rb") as f:
+        body = (CreateFileRequestBody.builder()
+                .file_type(file_type)
+                .file_name(file_name)
+                .file(f)
+                .build())
+        req = CreateFileRequest.builder().request_body(body).build()
+        resp = client.im.v1.file.create(req)
+    if not resp.success():
+        raise RuntimeError(f"upload file failed: code={resp.code} "
+                           f"msg={resp.msg} log_id={resp.get_log_id()}")
+    return resp.data.file_key
+
+
+def reply_file(client, message_id, file_key, tag="file"):
+    """以「文件消息」回复某条消息（file_key 由 upload_file 得到）。
+    返回 SendResult（与 reply_message 一致，便于统一审计）。"""
+    try:
+        req = (ReplyMessageRequest.builder()
+               .message_id(message_id)
+               .request_body(ReplyMessageRequestBody.builder()
+                             .msg_type("file")
+                             .content(json.dumps({"file_key": file_key}))
+                             .build())
+               .build())
+        resp = client.im.v1.message.reply(req)
+        sent_id = resp.data.message_id if resp.data is not None else None
+        snd = {"ok": resp.success(), "code": resp.code, "msg": resp.msg,
+               "sent_id": sent_id, "chars": None}
+        if resp.success():
+            print(f"[feishu][{tag}][ok] reply_to={message_id} file sent_id={sent_id}")
+        else:
+            print(f"[feishu][{tag}][fail] reply_to={message_id} "
+                  f"code={resp.code} msg={resp.msg} log_id={resp.get_log_id()}")
+    except Exception as e:
+        snd = {"ok": False, "code": None, "msg": str(e), "sent_id": None, "chars": None}
+        print(f"[feishu][{tag}][error] reply_to={message_id} {e}")
+    return SendResult([snd])
 
 
 def build_sessions_prompt(sessions, current_idx):

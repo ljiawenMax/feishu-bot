@@ -10,12 +10,14 @@ import collections
 import os
 import queue
 import subprocess
+import tempfile
 import threading
 import time
 
 import claude_runner
 import db
 import feishu_api
+import gitsync
 import uploads
 import usage
 
@@ -25,6 +27,7 @@ CONTEXT_WINDOW = 200000
 HELP_TEXT = "\n".join([
     "可用命令：",
     "/sessions  — 列出对话，回复序号切换",
+    "/allsessions — 列出本机全部 Claude Code 会话（跨项目/跨群，只读不可切换）",
     "/new       — 新建对话（清空历史）",
     "/name <名称> — 重命名当前对话",
     "/del <序号> — 删除指定对话（序号见 /sessions）",
@@ -34,6 +37,7 @@ HELP_TEXT = "\n".join([
     "/context   — 查看当前对话的 context 窗口占用",
     "/usage     — 查看 Claude 订阅用量（5 小时窗 / 7 天）",
     "/retry     — 用当前权限重跑上一条任务",
+    "/sync      — 把「上次同步以来」的增量改动作为 .patch 文件发出（远程 git apply）",
     "/help      — 显示此帮助",
 ])
 
@@ -56,6 +60,11 @@ class Bot:
         self.heartbeat_interval = heartbeat_interval  # 长任务心跳间隔秒数，0=禁用
         # 全局并发闸（所有 bot 共享一个）：限制同时运行的 claude 进程数；未传时不限流
         self.run_slot = run_slot or threading.BoundedSemaphore(1000)
+
+        # 增量补丁同步：每轮任务后把「上次同步以来」的改动作为 .patch 发到群，供远程 git apply。
+        # 需 work_dir 是 git 仓库；sync_patch=True 开启自动发送（/sync 手动发送不受此开关限制）。
+        self._is_git = gitsync.is_git_repo(self.work_dir)
+        self.sync_patch = bool(bot_cfg.get("sync_patch", False)) and self._is_git
 
         self.Session = session_factory
 
@@ -81,6 +90,7 @@ class Bot:
         # 命令分发表：命令 -> 处理方法(msg, arg)
         self.commands = {
             "/sessions": self.cmd_sessions,
+            "/allsessions": self.cmd_allsessions,
             "/help": self.cmd_help,
             "/name": self.cmd_name,
             "/new": self.cmd_new,
@@ -91,6 +101,7 @@ class Bot:
             "/usage": self.cmd_usage,
             "/del": self.cmd_del,
             "/retry": self.cmd_retry,
+            "/sync": self.cmd_sync,
         }
 
     # ------------------------------------------------------------------ DB
@@ -201,6 +212,25 @@ class Bot:
         else:
             self.pending = "session"
             feishu_api.reply_message(self.client, msg["id"], feishu_api.build_sessions_prompt(data["list"], data["current"]))
+
+    def cmd_allsessions(self, msg, arg):
+        """列出本机全部 Claude Code 会话：直接扫磁盘 ~/.claude/projects，跨项目/跨群/跨 bot，
+        只读展示（不支持切换，切换仍用 /sessions 操作当前 chat 自己的会话）。"""
+        sessions = claude_runner.list_all_sessions()
+        if not sessions:
+            feishu_api.reply_message(self.client, msg["id"], "本机暂无 Claude Code 会话记录")
+            return
+        limit = 30
+        now = time.time()
+        lines = [f"本机共 {len(sessions)} 个 Claude Code 会话（按最近使用倒序，最多显示 {limit} 条）："]
+        for i, s in enumerate(sessions[:limit], 1):
+            age = self._human_elapsed(max(0, int(now - s["mtime"]))) + "前"
+            title = s["title"] or "(无标题)"
+            lines.append(f"{i}. [{age}] {title}")
+            lines.append(f"   项目：{s['project']}")
+            lines.append(f"   session：{s['session_id']}")
+        feishu_api.reply_message(self.client, msg["id"], "\n".join(lines))
+        print(f"[{self.name}][allsessions] total={len(sessions)}")
 
     def cmd_help(self, msg, arg):
         feishu_api.reply_message(self.client, msg["id"], HELP_TEXT)
@@ -437,6 +467,14 @@ class Bot:
                        "session_id": t["session_id"]},
                       msg["id"], verb="重跑")
 
+    def cmd_sync(self, msg, arg):
+        """手动把「上次同步以来」的增量改动作为 .patch 文件发出（无视 sync_patch 开关）。"""
+        if not self._is_git:
+            feishu_api.reply_message(self.client, msg["id"],
+                                     f"工作目录不是 git 仓库，无法生成补丁：{self.work_dir}")
+            return
+        self._send_incremental_patch(msg["id"], announce_empty=True)
+
     # --------------------------------------------------------------- 任务执行（异步）
 
     def run_task(self, msg, text):
@@ -537,6 +575,10 @@ class Bot:
         self._push_reply(msg_id, result + suffix + (("\n\n" + banner) if banner else ""))
         print(f"[{self.name}][done] pushed to {msg_id} model={used_model}")
 
+        # 任务成功后自动把这一轮的增量改动作为 .patch 发到群（供远程 git apply）
+        if self.sync_patch and not is_err:
+            self._send_incremental_patch(msg_id, announce_empty=False)
+
     def _push_reply(self, msg_id, text, attempts=3):
         """主动推送结果，失败重试几次（后台任务跑很久，不能因一次网络抖动就丢结果）。"""
         for i in range(attempts):
@@ -558,6 +600,50 @@ class Bot:
             self.db(db.record_audit, self.chat_id, "feishu", tag, message_id=msg_id,
                     ok=s["ok"], code=s["code"], chars=s.get("chars"),
                     detail=(f"sent_id={s.get('sent_id')}" if s["ok"] else s.get("msg")))
+
+    def _send_incremental_patch(self, msg_id, announce_empty=False):
+        """生成「上次同步以来」的增量 diff，作为 .patch 文件发到群（远程按序 git apply）。
+        announce_empty=True（手动 /sync）时，无改动/无仓库也回一句提示；自动调用则静默跳过。"""
+        if not self._is_git:
+            return
+        try:
+            info = gitsync.incremental_patch(self.work_dir, self.chat_id)
+        except Exception as e:
+            print(f"[{self.name}][sync-error] {e}")
+            feishu_api.reply_message(self.client, msg_id, f"[error] 生成增量补丁失败: {e}", tag="patch")
+            return
+        if not info:
+            if announce_empty:
+                feishu_api.reply_message(self.client, msg_id, "自上次同步以来没有代码改动，无补丁可发")
+            return
+
+        seq = info["seq"]
+        fname = f"{seq:04d}-feishu-sync.patch"
+        note = "\n".join([
+            f"📦 第 {seq} 轮增量补丁：{fname}",
+            f"基线 {info['base']} → {info['snap']}",
+            "本地按序号顺序逐个应用（务必按序，勿跳号）：",
+            f"  git apply --check {fname} && git apply {fname}",
+        ])
+        tmpdir = tempfile.mkdtemp(prefix="feishu-sync-")
+        path = os.path.join(tmpdir, fname)
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(info["patch"])
+            file_key = feishu_api.upload_file(self.client, path, fname)
+            res = feishu_api.reply_file(self.client, msg_id, file_key, tag="patch")
+            self._audit_sends(msg_id, "patch", res)
+            feishu_api.reply_message(self.client, msg_id, note, tag="patch")
+            print(f"[{self.name}][sync] sent seq={seq} bytes={len(info['patch'])} to {msg_id}")
+        except Exception as e:
+            print(f"[{self.name}][sync-error] send failed: {e}")
+            feishu_api.reply_message(self.client, msg_id, f"[error] 发送增量补丁失败: {e}", tag="patch")
+        finally:
+            try:
+                os.remove(path)
+                os.rmdir(tmpdir)
+            except OSError:
+                pass
 
     # ---------------------------------------------------------- 消息处理 / 主循环
 
