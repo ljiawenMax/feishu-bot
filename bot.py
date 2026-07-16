@@ -24,6 +24,9 @@ import usage
 # Claude 标准上下文窗口大小（token）；用于 /context 计算占用百分比
 CONTEXT_WINDOW = 200000
 
+# /debate 正反方各自的发言轮数
+DEBATE_ROUNDS = 5
+
 HELP_TEXT = "\n".join([
     "可用命令：",
     "/sessions  — 列出对话，回复序号切换",
@@ -40,6 +43,7 @@ HELP_TEXT = "\n".join([
     "/sync      — 把「上次同步以来」的增量改动作为 .bundle 文件发出（远程 git fetch + merge --ff-only）",
     "/resync    — 全量重新同步（忽略此前增量基线，远程 git fetch + reset --hard 强制拉平；/sync 报 "
     "non-fast-forward 时用这个恢复）",
+    "/debate <辩题> — 正反方各5轮辩论（每轮实时推送）",
     "/help      — 显示此帮助",
 ])
 
@@ -105,6 +109,7 @@ class Bot:
             "/retry": self.cmd_retry,
             "/sync": self.cmd_sync,
             "/resync": self.cmd_resync,
+            "/debate": self.cmd_debate,
         }
 
     # ------------------------------------------------------------------ DB
@@ -488,6 +493,14 @@ class Bot:
             return
         self._send_bundle(msg["id"], announce_empty=True, full=True)
 
+    def cmd_debate(self, msg, arg):
+        """辩题入队：两个独立 Claude session 分饰正反方，交替发言，详见 _execute_debate_job。"""
+        if not arg:
+            feishu_api.reply_message(self.client, msg["id"], "用法：/debate <辩题>")
+            return
+        self._enqueue({"kind": "debate", "topic": arg, "text": arg, "msg_id": msg["id"]},
+                      msg["id"], verb="辩论")
+
     # --------------------------------------------------------------- 任务执行（异步）
 
     def run_task(self, msg, text):
@@ -525,6 +538,9 @@ class Bot:
                 self.task_queue.task_done()
 
     def _execute_job(self, job):
+        if job["kind"] == "debate":
+            self._execute_debate_job(job)
+            return
         text, msg_id = job["text"], job["msg_id"]
         is_retry = job["kind"] == "retry"
 
@@ -592,12 +608,102 @@ class Bot:
         if self.sync_patch and not is_err:
             self._send_bundle(msg_id, announce_empty=False, full=False)
 
-    def _push_reply(self, msg_id, text, attempts=3):
+    def _execute_debate_job(self, job):
+        """辩论编排：两个独立 Claude session（正/反方）交替发言 DEBATE_ROUNDS 轮，
+        每轮把对方刚发的言喂给下一位发言者（靠 last_statement/last_speaker 滚动传递），
+        每轮结果实时推送到飞书。发言内容通过临时 Conversation 行完整落库（messages
+        表 LONGTEXT，不截断）；辩论结束后清理该 Conversation 行与磁盘 session 文件——
+        messages.session_id 是 ON DELETE SET NULL，删行不删内容，效果与 /del 一致。"""
+        topic, msg_id = job["topic"], job["msg_id"]
+        rounds = DEBATE_ROUNDS
+        permit_mode, unsafe_mode = self.permit_mode, self.unsafe_mode
+        up = uploads.chat_dir(self.chat_id)
+        extra_dirs = [up] if os.path.isdir(up) else []
+
+        row_ids = {
+            "pro": self.db(db.insert_session, self.chat_id, f"[辩论]🔵正方: {topic[:20]}", 9999),
+            "con": self.db(db.insert_session, self.chat_id, f"[辩论]🔴反方: {topic[:20]}", 9999),
+        }
+        session_ids = {"pro": None, "con": None}
+        transcripts = {"pro": [], "con": []}  # 各自的 history，供 session 失效时重建
+        last_statement, last_speaker = None, None
+        turns = [(side, r) for r in range(1, rounds + 1) for side in ("pro", "con")]
+
+        print(f"[{self.name}][debate] start topic={topic[:60]}")
+        stop = self._start_heartbeat(msg_id)
+        aborted = False
+        try:
+            for side, round_n in turns:
+                prompt = self._build_debate_prompt(topic, side, round_n, rounds,
+                                                   last_statement, last_speaker)
+                t0 = time.time()
+                with self.run_slot:
+                    result, new_sid, used_model = claude_runner.run_claude(
+                        prompt, self.work_dir, self.task_timeout, session_ids[side],
+                        permit=permit_mode, unsafe=unsafe_mode, extra_dirs=extra_dirs,
+                        history=transcripts[side],
+                    )
+                elapsed = time.time() - t0
+                is_err = result.startswith("[error]")
+                print(f"[{self.name}][debate] {side} r{round_n} elapsed={self._human_elapsed(int(elapsed))} "
+                      f"error={is_err} chars={len(result)}")
+                self.db(db.record_audit, self.chat_id, "llm", f"debate-{side}-r{round_n}",
+                        message_id=msg_id, ok=not is_err, model=used_model,
+                        elapsed_ms=int(elapsed * 1000), chars=len(result))
+                if new_sid:
+                    if not session_ids[side]:  # 首轮才需要把 claude_session_id 写回该行
+                        self.db(db.update_session, row_ids[side], claude_sid=new_sid)
+                    session_ids[side] = new_sid
+                # 完整内容落库（不截断），一问一答两条，写法与普通任务的 audit() 一致
+                if row_ids[side]:
+                    self.db(db.append_message, row_ids[side], self.chat_id, session_ids[side],
+                            "user", prompt)
+                    self.db(db.append_message, row_ids[side], self.chat_id, session_ids[side],
+                            "assistant", result, is_err, "超时" in result, model=used_model)
+                label = "🔵正方" if side == "pro" else "🔴反方"
+                self._push_reply(msg_id, f"{label} 第{round_n}/{rounds}轮：\n\n{result}",
+                                 tag=f"debate-{side}-r{round_n}")
+                if is_err:
+                    aborted = True
+                    break
+                transcripts[side].append({"role": "user", "content": prompt})
+                transcripts[side].append({"role": "assistant", "content": result})
+                last_statement, last_speaker = result, side
+        finally:
+            stop.set()
+            for side, sid in session_ids.items():
+                if sid:
+                    try:
+                        claude_runner.delete_claude_session(sid, self.work_dir)
+                    except Exception as e:
+                        print(f"[{self.name}][debate-cleanup-error] {e}")
+                if row_ids[side]:
+                    self.db(db.delete_session, row_ids[side])  # 只删会话行，messages 内容
+                                                                 # 因 ON DELETE SET NULL 永久保留
+
+        self._push_reply(msg_id, "🏁 辩论已中止（出错）" if aborted else "🏁 辩论结束（正反方各5轮）")
+        print(f"[{self.name}][debate] {'aborted' if aborted else 'done'} topic={topic[:60]}")
+
+    def _build_debate_prompt(self, topic, side, round_n, rounds, last_statement, last_speaker):
+        """拼当前发言者这一轮的 prompt：首轮开篇立论，之后必须先反驳对方刚才的发言。"""
+        role = "正方（支持方）" if side == "pro" else "反方（反对方）"
+        header = f"你是本场辩论的{role}。辩题：《{topic}》。这是你的第 {round_n}/{rounds} 轮发言。"
+        if last_statement is None:
+            body = "请给出开篇立论，阐述你方核心观点和理由（直接给发言正文，不要加多余的前后缀，建议300字以内）。"
+        else:
+            opp_label = "反方" if last_speaker == "pro" else "正方"
+            body = (f"以下是{opp_label}刚才的发言：\n「{last_statement}」\n"
+                    f"请针对性反驳对方观点，并继续深化你方论证"
+                    f"（直接给发言正文，不要加多余的前后缀，建议300字以内）。")
+        closing = "这是最后一轮，请适当收束、总结你方立场。" if round_n == rounds else ""
+        return "\n".join(filter(None, [header, body, closing]))
+
+    def _push_reply(self, msg_id, text, attempts=3, tag="push"):
         """主动推送结果，失败重试几次（后台任务跑很久，不能因一次网络抖动就丢结果）。"""
         for i in range(attempts):
             try:
-                res = feishu_api.reply_message(self.client, msg_id, text, tag="push")
-                self._audit_sends(msg_id, "push", res)
+                res = feishu_api.reply_message(self.client, msg_id, text, tag=tag)
+                self._audit_sends(msg_id, tag, res)
                 if res:
                     return True
             except Exception as e:
