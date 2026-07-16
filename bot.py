@@ -37,7 +37,9 @@ HELP_TEXT = "\n".join([
     "/context   — 查看当前对话的 context 窗口占用",
     "/usage     — 查看 Claude 订阅用量（5 小时窗 / 7 天）",
     "/retry     — 用当前权限重跑上一条任务",
-    "/sync      — 把「上次同步以来」的增量改动作为 .patch 文件发出（远程 git apply）",
+    "/sync      — 把「上次同步以来」的增量改动作为 .bundle 文件发出（远程 git fetch + merge --ff-only）",
+    "/resync    — 全量重新同步（忽略此前增量基线，远程 git fetch + reset --hard 强制拉平；/sync 报 "
+    "non-fast-forward 时用这个恢复）",
     "/help      — 显示此帮助",
 ])
 
@@ -61,8 +63,8 @@ class Bot:
         # 全局并发闸（所有 bot 共享一个）：限制同时运行的 claude 进程数；未传时不限流
         self.run_slot = run_slot or threading.BoundedSemaphore(1000)
 
-        # 增量补丁同步：每轮任务后把「上次同步以来」的改动作为 .patch 发到群，供远程 git apply。
-        # 需 work_dir 是 git 仓库；sync_patch=True 开启自动发送（/sync 手动发送不受此开关限制）。
+        # 增量 bundle 同步：每轮任务后把「上次同步以来」的改动打包成 .bundle 发到群，供远程 git fetch。
+        # 需 work_dir 是 git 仓库；sync_patch=True 开启自动发送（/sync /resync 手动发送不受此开关限制）。
         self._is_git = gitsync.is_git_repo(self.work_dir)
         self.sync_patch = bool(bot_cfg.get("sync_patch", False)) and self._is_git
 
@@ -102,6 +104,7 @@ class Bot:
             "/del": self.cmd_del,
             "/retry": self.cmd_retry,
             "/sync": self.cmd_sync,
+            "/resync": self.cmd_resync,
         }
 
     # ------------------------------------------------------------------ DB
@@ -468,12 +471,22 @@ class Bot:
                       msg["id"], verb="重跑")
 
     def cmd_sync(self, msg, arg):
-        """手动把「上次同步以来」的增量改动作为 .patch 文件发出（无视 sync_patch 开关）。"""
+        """手动把「上次同步以来」的增量改动打包成 .bundle 发出（无视 sync_patch 开关）。"""
         if not self._is_git:
             feishu_api.reply_message(self.client, msg["id"],
-                                     f"工作目录不是 git 仓库，无法生成补丁：{self.work_dir}")
+                                     f"工作目录不是 git 仓库，无法生成同步文件：{self.work_dir}")
             return
-        self._send_incremental_patch(msg["id"], announce_empty=True)
+        self._send_bundle(msg["id"], announce_empty=True, full=False)
+
+    def cmd_resync(self, msg, arg):
+        """全量重新同步：不依赖增量基线，以本机当前工作树为准打包完整历史，
+        远程 fetch 后 reset --hard 强制拉平。用于 /sync 报 non-fast-forward
+        （基线与远程实际状态不一致）时的恢复手段。"""
+        if not self._is_git:
+            feishu_api.reply_message(self.client, msg["id"],
+                                     f"工作目录不是 git 仓库，无法生成同步文件：{self.work_dir}")
+            return
+        self._send_bundle(msg["id"], announce_empty=True, full=True)
 
     # --------------------------------------------------------------- 任务执行（异步）
 
@@ -575,9 +588,9 @@ class Bot:
         self._push_reply(msg_id, result + suffix + (("\n\n" + banner) if banner else ""))
         print(f"[{self.name}][done] pushed to {msg_id} model={used_model}")
 
-        # 任务成功后自动把这一轮的增量改动作为 .patch 发到群（供远程 git apply）
+        # 任务成功后自动把这一轮的增量改动打包成 .bundle 发到群（供远程 git fetch）
         if self.sync_patch and not is_err:
-            self._send_incremental_patch(msg_id, announce_empty=False)
+            self._send_bundle(msg_id, announce_empty=False, full=False)
 
     def _push_reply(self, msg_id, text, attempts=3):
         """主动推送结果，失败重试几次（后台任务跑很久，不能因一次网络抖动就丢结果）。"""
@@ -601,43 +614,61 @@ class Bot:
                     ok=s["ok"], code=s["code"], chars=s.get("chars"),
                     detail=(f"sent_id={s.get('sent_id')}" if s["ok"] else s.get("msg")))
 
-    def _send_incremental_patch(self, msg_id, announce_empty=False):
-        """生成「上次同步以来」的增量 diff，作为 .patch 文件发到群（远程按序 git apply）。
+    def _send_bundle(self, msg_id, announce_empty=False, full=False):
+        """生成同步 bundle 发到群（远程 git fetch 应用）。
+        full=False：「上次同步以来」的增量，远程 fetch 后 merge --ff-only 快进；
+        full=True（/resync）：不依赖增量基线，远程 fetch 后 reset --hard 强制拉平。
         announce_empty=True（手动 /sync）时，无改动/无仓库也回一句提示；自动调用则静默跳过。"""
         if not self._is_git:
             return
+        tmpdir = tempfile.mkdtemp(prefix="feishu-sync-")
+        tmp_path = os.path.join(tmpdir, "sync.bundle")
         try:
-            info = gitsync.incremental_patch(self.work_dir, self.chat_id)
+            info = gitsync.full_bundle(self.work_dir, self.chat_id, tmp_path) if full \
+                else gitsync.incremental_bundle(self.work_dir, self.chat_id, tmp_path)
         except Exception as e:
             print(f"[{self.name}][sync-error] {e}")
-            feishu_api.reply_message(self.client, msg_id, f"[error] 生成增量补丁失败: {e}", tag="patch")
+            feishu_api.reply_message(self.client, msg_id, f"[error] 生成同步 bundle 失败: {e}", tag="patch")
             return
         if not info:
             if announce_empty:
-                feishu_api.reply_message(self.client, msg_id, "自上次同步以来没有代码改动，无补丁可发")
+                feishu_api.reply_message(self.client, msg_id, "自上次同步以来没有代码改动，无需同步")
             return
 
         seq = info["seq"]
-        fname = f"{seq:04d}-feishu-sync.patch"
-        note = "\n".join([
-            f"📦 第 {seq} 轮增量补丁：{fname}",
-            f"基线 {info['base']} → {info['snap']}",
-            "本地按序号顺序逐个应用（务必按序，勿跳号）：",
-            f"  git apply --check {fname} && git apply {fname}",
-        ])
-        tmpdir = tempfile.mkdtemp(prefix="feishu-sync-")
+        fname = f"{seq:04d}-feishu-sync.bundle"
         path = os.path.join(tmpdir, fname)
+        os.rename(tmp_path, path)
+        if full:
+            note = "\n".join([
+                f"📦 第 {seq} 轮【全量】同步 bundle：{fname}（忽略远程此前状态，强制以本机当前为准）",
+                f"快照 {info['snap']}",
+                "远程执行（会把当前分支强制重置为本机快照；如远程有未提交改动请先自行处理）：",
+                f"  git bundle verify {fname}",
+                f"  git fetch ./{fname} {info['tip_ref']}:sync-full",
+                "  git reset --hard sync-full",
+                "  git branch -d sync-full",
+            ])
+        else:
+            note = "\n".join([
+                f"📦 第 {seq} 轮增量同步 bundle：{fname}",
+                f"基线 {info['base']} → {info['snap']}",
+                "远程执行（按序号顺序逐个应用，务必按序、勿跳号）：",
+                f"  git bundle verify {fname}",
+                f"  git fetch ./{fname} {info['tip_ref']}:sync-incoming",
+                "  git merge --ff-only sync-incoming",
+                "  git branch -d sync-incoming",
+                "若上面报 \"not possible to fast-forward\"，说明基线和远程实际状态不一致，改发 /resync 全量拉平。",
+            ])
         try:
-            with open(path, "w", encoding="utf-8") as f:
-                f.write(info["patch"])
             file_key = feishu_api.upload_file(self.client, path, fname)
             res = feishu_api.reply_file(self.client, msg_id, file_key, tag="patch")
             self._audit_sends(msg_id, "patch", res)
             feishu_api.reply_message(self.client, msg_id, note, tag="patch")
-            print(f"[{self.name}][sync] sent seq={seq} bytes={len(info['patch'])} to {msg_id}")
+            print(f"[{self.name}][sync] sent seq={seq} full={full} bytes={os.path.getsize(path)} to {msg_id}")
         except Exception as e:
             print(f"[{self.name}][sync-error] send failed: {e}")
-            feishu_api.reply_message(self.client, msg_id, f"[error] 发送增量补丁失败: {e}", tag="patch")
+            feishu_api.reply_message(self.client, msg_id, f"[error] 发送同步 bundle 失败: {e}", tag="patch")
         finally:
             try:
                 os.remove(path)
