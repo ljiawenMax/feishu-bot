@@ -70,17 +70,33 @@ def _tip_ref(chat_id):
     return TIP_REF_PREFIX + re.sub(r"[^A-Za-z0-9_]", "_", chat_id)
 
 
+def _base_commit(work_dir, chat_id):
+    """取增量基线 commit：优先 sync 基线 ref，其次当前 HEAD；
+    仓库刚 git init、尚无任何提交（HEAD 未诞生）时返回 ""，交由调用方走全量。"""
+    base = _git(work_dir, "rev-parse", "--verify", "--quiet", _ref(chat_id), check=False).strip()
+    if base:
+        return base
+    # --verify --quiet：HEAD 不存在时返回空串而非报 "ambiguous argument 'HEAD'"
+    return _git(work_dir, "rev-parse", "--verify", "--quiet", "HEAD", check=False).strip()
+
+
 def _snapshot_commit(work_dir, base):
-    """把当前工作树快照成一个游离提交（父为 base），返回其 sha。
+    """把当前工作树快照成一个游离提交，返回其 sha。base 为父提交；base 为空
+    （仓库刚 git init、尚无任何提交）时生成无父的 root 提交，全量纳入工作树。
     用临时 GIT_INDEX_FILE，绝不触碰用户真实 index / 分支。"""
     fd, idx = tempfile.mkstemp(prefix="feishu-sync-idx-")
     os.close(fd)
     env = {"GIT_INDEX_FILE": idx, **_IDENTITY}
     try:
-        _git(work_dir, "read-tree", base, env=env)   # 临时 index 以 base 为起点
+        if base:
+            _git(work_dir, "read-tree", base, env=env)   # 临时 index 以 base 为起点
+        else:
+            # base 为空（空仓库）：初始化一个合法的空 index（mkstemp 的 0 字节文件 git 不认）
+            _git(work_dir, "read-tree", "--empty", env=env)
         _git(work_dir, "add", "-A", env=env)          # 纳入增删改（尊重 .gitignore）
         tree = _git(work_dir, "write-tree", env=env).strip()
-        commit = _git(work_dir, "commit-tree", tree, "-p", base,
+        parent = ["-p", base] if base else []          # 无 base 则生成 root 提交
+        commit = _git(work_dir, "commit-tree", tree, *parent,
                       "-m", "feishu-sync snapshot", env=env).strip()
         return commit
     finally:
@@ -118,22 +134,27 @@ def incremental_bundle(work_dir, chat_id, out_path):
     成功生成后基线 ref 前移到本次快照（即已计入「已发送」），故下轮只含新增改动。
     """
     ref = _ref(chat_id)
-    base = _git(work_dir, "rev-parse", "--verify", "--quiet", ref, check=False).strip()
-    if not base:
-        # 首轮：基线取当前 HEAD（远程与本机同版本的那个 commit）
-        base = _git(work_dir, "rev-parse", "HEAD").strip()
+    base = _base_commit(work_dir, chat_id)   # 空仓库(无提交)时为 ""
 
     snap = _snapshot_commit(work_dir, base)
-    if not _git(work_dir, "diff", "--stat", base, snap).strip():
+    # 有基线：diff 基线→快照判断有无改动；无基线(空仓库)：看快照里是否有文件
+    if base:
+        changed = _git(work_dir, "diff", "--stat", base, snap).strip()
+    else:
+        changed = _git(work_dir, "ls-tree", "-r", "--name-only", snap).strip()
+    if not changed:
         return None
 
     tip_ref = _tip_ref(chat_id)
     _git(work_dir, "update-ref", tip_ref, snap)
-    _git(work_dir, "bundle", "create", out_path, f"{base}..{tip_ref}")
+    # 有基线打 base..tip 的增量；无基线则打包全部可达历史（首轮=全量）
+    rev = f"{base}..{tip_ref}" if base else tip_ref
+    _git(work_dir, "bundle", "create", out_path, rev)
 
     _git(work_dir, "update-ref", ref, snap)   # 基线前移，本次改动计入「已发送」
     seq = _next_seq(work_dir, chat_id)
-    return {"seq": seq, "base": base[:12], "snap": snap[:12], "tip_ref": tip_ref}
+    return {"seq": seq, "base": (base[:12] if base else "(空仓库)"),
+            "snap": snap[:12], "tip_ref": tip_ref}
 
 
 def full_bundle(work_dir, chat_id, out_path):
@@ -144,9 +165,7 @@ def full_bundle(work_dir, chat_id, out_path):
     成功后同样把基线 ref 前移到本次快照，后续增量同步从这里重新计起。
     """
     ref = _ref(chat_id)
-    base = _git(work_dir, "rev-parse", "--verify", "--quiet", ref, check=False).strip()
-    if not base:
-        base = _git(work_dir, "rev-parse", "HEAD").strip()
+    base = _base_commit(work_dir, chat_id)   # 空仓库(无提交)时为 ""，snapshot 生成 root 提交
     snap = _snapshot_commit(work_dir, base)
 
     tip_ref = _tip_ref(chat_id)

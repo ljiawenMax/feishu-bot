@@ -69,8 +69,9 @@ class Bot:
 
         # 增量 bundle 同步：每轮任务后把「上次同步以来」的改动打包成 .bundle 发到群，供远程 git fetch。
         # 需 work_dir 是 git 仓库；sync_patch=True 开启自动发送（/sync /resync 手动发送不受此开关限制）。
-        self._is_git = gitsync.is_git_repo(self.work_dir)
-        self.sync_patch = bool(bot_cfg.get("sync_patch", False)) and self._is_git
+        # 是否 git 仓库改为命令执行时实时判断（见 _git_ready），不在启动时缓存——
+        # 允许「先起服务、后 git init」，不必为此重启进程。
+        self.sync_patch = bool(bot_cfg.get("sync_patch", False))
 
         self.Session = session_factory
 
@@ -475,9 +476,13 @@ class Bot:
                        "session_id": t["session_id"]},
                       msg["id"], verb="重跑")
 
+    def _git_ready(self):
+        """实时判断 work_dir 是否已是 git 仓库（不缓存：允许启动服务后再 git init）。"""
+        return gitsync.is_git_repo(self.work_dir)
+
     def cmd_sync(self, msg, arg):
         """手动把「上次同步以来」的增量改动打包成 .bundle 发出（无视 sync_patch 开关）。"""
-        if not self._is_git:
+        if not self._git_ready():
             feishu_api.reply_message(self.client, msg["id"],
                                      f"工作目录不是 git 仓库，无法生成同步文件：{self.work_dir}")
             return
@@ -487,7 +492,7 @@ class Bot:
         """全量重新同步：不依赖增量基线，以本机当前工作树为准打包完整历史，
         远程 fetch 后 reset --hard 强制拉平。用于 /sync 报 non-fast-forward
         （基线与远程实际状态不一致）时的恢复手段。"""
-        if not self._is_git:
+        if not self._git_ready():
             feishu_api.reply_message(self.client, msg["id"],
                                      f"工作目录不是 git 仓库，无法生成同步文件：{self.work_dir}")
             return
@@ -725,7 +730,7 @@ class Bot:
         full=False：「上次同步以来」的增量，远程 fetch 后 merge --ff-only 快进；
         full=True（/resync）：不依赖增量基线，远程 fetch 后 reset --hard 强制拉平。
         announce_empty=True（手动 /sync）时，无改动/无仓库也回一句提示；自动调用则静默跳过。"""
-        if not self._is_git:
+        if not self._git_ready():
             return
         tmpdir = tempfile.mkdtemp(prefix="feishu-sync-")
         tmp_path = os.path.join(tmpdir, "sync.bundle")
