@@ -91,9 +91,15 @@ python -m venv .venv && .venv/bin/pip install -r requirements.txt
 # 前台运行
 .venv/bin/python feishu_claude.py
 
-# 后台运行（推荐用 restart.sh，按 --env 区分 PID/日志）
-./restart.sh local
+# 启动 / 重启（推荐）：服务由 systemd 托管，unit 名 feishu-bot.service
+systemctl restart feishu-bot.service
+# 重启后务必确认启动成功且无异常，失败则回滚：
+systemctl status feishu-bot.service            # Active: active (running)
+journalctl -u feishu-bot.service -n 50 --no-pager
 ```
+
+> 若尚未把服务加入 systemd（无 `feishu-bot.service`），可退回用脚本重启：
+> `./restart.sh local`（按 `--env` 区分 PID/日志）。
 
 启动成功会打印 `connected to wss://...`（每个 app_id 一条）。
 
