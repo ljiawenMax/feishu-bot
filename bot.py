@@ -25,6 +25,23 @@ import usage
 # Claude 标准上下文窗口大小（token）；用于 /context 计算占用百分比
 CONTEXT_WINDOW = 200000
 
+# context 占用护栏阈值（百分比）：随每条回复 inline 提示，越高越醒目
+CONTEXT_WARN = 60   # 软提醒：建议 /new 或 /compact
+CONTEXT_HIGH = 80   # 强提醒
+CONTEXT_HARD = 92   # 硬闸：未开自动压缩时，触顶即暂停执行、要求手动处理
+
+# 自动压缩：把本地历史摘要成一段上下文用的模型（cheap）与提示词
+COMPACT_MODEL = "haiku"
+COMPACT_PROMPT = (
+    "下面是一段对话记录。请把它压缩成一份简洁但完整的上下文摘要，供另一个助手无缝接续对话：\n"
+    "- 保留关键事实、结论、已确定的决策、用户的偏好与约束、尚未完成的任务与待办；\n"
+    "- 保留必要的文件名/路径/命令/数据等具体信息；\n"
+    "- 去掉寒暄与冗余，用要点式中文，不要复述原文、不要评论。\n"
+    "只输出摘要正文。"
+)
+# _context_guard 返回状态
+GUARD_PROCEED, GUARD_BLOCKED, GUARD_COMPACTED = "proceed", "blocked", "compacted"
+
 # /debate 正反方各自的发言轮数
 DEBATE_ROUNDS = 5
 
@@ -39,6 +56,7 @@ HELP_TEXT = "\n".join([
     "/unsafe    — 开关最高权限（跳过全部权限校验，可执行 bash 命令，谨慎）",
     "/model     — 选择当前对话使用的模型",
     "/context   — 查看当前对话的 context 窗口占用",
+    "/compact   — 压缩当前对话上下文（摘要后开新对话、自动带上摘要，省额度）",
     "/usage     — 查看 Claude 订阅用量（5 小时窗 / 7 天）",
     "/retry     — 用当前权限重跑上一条任务",
     "/sync      — 把「上次同步以来」的增量改动作为 .bundle 文件发出（远程 git fetch + merge --ff-only）",
@@ -53,7 +71,8 @@ class Bot:
     """飞书消息驱动 Claude Code 的轮询服务，状态持久化在 MySQL。"""
 
     def __init__(self, bot_cfg, session_factory, task_timeout, models=None,
-                 heartbeat_interval=60, run_slot=None, client=None):
+                 heartbeat_interval=60, run_slot=None, client=None,
+                 auto_compact_threshold=75):
         self.name = bot_cfg["name"]
         self.app_id = bot_cfg["app_id"]
         self.app_secret = bot_cfg["app_secret"]
@@ -67,6 +86,10 @@ class Bot:
         self.heartbeat_interval = heartbeat_interval  # 长任务心跳间隔秒数，0=禁用
         # 全局并发闸（所有 bot 共享一个）：限制同时运行的 claude 进程数；未传时不限流
         self.run_slot = run_slot or threading.BoundedSemaphore(1000)
+
+        # 自动压缩阈值（context 占用百分比）：续聊前若达此值，先把本地历史摘要成一段
+        # 上下文、开新对话再执行，避免每轮都重复烧满额度。<=0 关闭（改由 CONTEXT_HARD 硬闸兜底）。
+        self.auto_compact_threshold = auto_compact_threshold
 
         # 增量 bundle 同步：每轮任务后把「上次同步以来」的改动打包成 .bundle 发到群，供远程 git fetch。
         # 需 work_dir 是 git 仓库；sync_patch=True 开启自动发送（/sync /resync 手动发送不受此开关限制）。
@@ -106,6 +129,7 @@ class Bot:
             "/unsafe": self.cmd_unsafe,
             "/model": self.cmd_model,
             "/context": self.cmd_context,
+            "/compact": self.cmd_compact,
             "/usage": self.cmd_usage,
             "/del": self.cmd_del,
             "/retry": self.cmd_retry,
@@ -200,9 +224,10 @@ class Bot:
         self.db(db.append_message, row_id, self.chat_id, sid, "assistant", result,
                 result.startswith("[error]"), "超时" in result, model=used_model)
 
-    def execute_claude(self, text, session_id, history=None, first_task=None):
+    def execute_claude(self, text, session_id, history=None, first_task=None, run_text=None):
         """调用 Claude Code，处理超时/异常，成功时同步 session_id 到 DB。
-        返回 (result, new_sid, used_model)。"""
+        run_text 指定实际发给 claude 的 prompt（默认同 text）：压缩后首轮会在 text 前
+        拼上摘要，但审计/历史/标签仍用用户原文 text。返回 (result, new_sid, used_model)。"""
         permit = self.permit_mode
         unsafe = self.unsafe_mode
         # 始终把该聊天上传目录纳入工作区（存在才加），让 Claude 能读上传文件
@@ -212,7 +237,7 @@ class Bot:
         model = entry.get("model") if entry else None
         try:
             result, new_sid, used_model = claude_runner.run_claude(
-                text, self.work_dir, self.task_timeout,
+                run_text or text, self.work_dir, self.task_timeout,
                 session_id, permit=permit, extra_dirs=extra_dirs, history=history,
                 model=model, unsafe=unsafe,
             )
@@ -347,6 +372,16 @@ class Bot:
         feishu_api.reply_message(self.client, msg["id"], self._format_context(entry, info))
         print(f"[{self.name}][context] used={info['total_input']} model={info.get('model')}")
 
+    def cmd_compact(self, msg, arg):
+        """手动压缩当前对话上下文：排入后台 worker，摘要后开新对话并把摘要设为其
+        seed（下一条任务自动带上），从而清空 context 重新计费。"""
+        if not self.sessions.get("history"):
+            feishu_api.reply_message(self.client, msg["id"],
+                                     "当前对话暂无可压缩的历史（先发几条任务再压缩）")
+            return
+        self.task_queue.put({"kind": "compact", "msg_id": msg["id"]})
+        feishu_api.reply_message(self.client, msg["id"], "🗜 已排入后台压缩当前对话上下文…")
+
     @staticmethod
     def _fmt_tokens(n):
         """token 数人性化：42299→42.3k、200000→200k、856→856。"""
@@ -433,17 +468,112 @@ class Bot:
         print(f"[{self.name}][del] removed idx={didx} row={removed.get('_row_id')}")
 
     @staticmethod
-    def _model_suffix(used_model):
-        """成功结果末尾追加「（模型：… · 5h …% · 周 …%）」；去掉 claude- 前缀。
+    def _model_suffix(used_model, ctx_pct=None):
+        """成功结果末尾追加「（模型：… · ctx …% · 5h …% · 周 …%）」；去掉 claude- 前缀。
         用量取自 usage 模块的缓存（只读、不阻塞），取不到时静默省略。"""
         parts = []
         if used_model:
             short = used_model[7:] if used_model.startswith("claude-") else used_model
             parts.append(f"模型：{short}")
+        if ctx_pct is not None:
+            parts.append(f"ctx {ctx_pct:.0f}%")
         u = usage.report_inline()
         if u:
             parts.append(u)
         return f"\n\n（{' · '.join(parts)}）" if parts else ""
+
+    def _context_pct(self, session_id):
+        """读盘取某 session 当前 context 占用百分比（只读、不阻塞）；取不到返回 None。"""
+        if not session_id:
+            return None
+        try:
+            info = claude_runner.session_context(session_id, self.work_dir)
+        except Exception as e:
+            print(f"[{self.name}][context-pct-error] {e}")
+            return None
+        if not info:
+            return None
+        return min(info["total_input"] / CONTEXT_WINDOW * 100, 100)
+
+    @staticmethod
+    def _context_warning(pct):
+        """按 context 占用给分级提醒文案（附在回复末尾）；未越阈值返回空串。"""
+        if pct is None:
+            return ""
+        if pct >= CONTEXT_HIGH:
+            return (f"⚠️ 当前对话 context 已达 {pct:.0f}%，强烈建议 /new 开新对话或 /compact 压缩，"
+                    "否则每轮都在重复消耗额度")
+        if pct >= CONTEXT_WARN:
+            return f"💡 当前对话 context 已达 {pct:.0f}%，可考虑 /new 或 /compact 以节省额度"
+        return ""
+
+    def _context_guard(self, msg_id, session_id):
+        """续聊前的 context 护栏：达自动压缩阈值则压缩重置；未开压缩且触顶则硬闸拦下。
+        返回 GUARD_PROCEED / GUARD_COMPACTED / GUARD_BLOCKED。"""
+        pct = self._context_pct(session_id)
+        if pct is None:
+            return GUARD_PROCEED
+        if self.auto_compact_threshold > 0 and pct >= self.auto_compact_threshold:
+            if self._do_compact(msg_id, reason=f"context {pct:.0f}%"):
+                return GUARD_COMPACTED
+            # 压缩失败：跌落到硬闸判断（不因失败而卡死续聊）
+        if pct >= CONTEXT_HARD:
+            self._push_reply(
+                msg_id,
+                f"🛑 当前对话 context 已达 {pct:.0f}%，为避免持续消耗额度已暂停执行。\n"
+                "请发 /compact 压缩上下文，或 /new 开新对话后重试。")
+            return GUARD_BLOCKED
+        return GUARD_PROCEED
+
+    def _summarize_history(self, history):
+        """用便宜模型把本地历史（用户/Claude 交替）摘要成一段接续用上下文；失败返回 None。
+        用 session_id=None 单跑一次、跑完删掉这条一次性 session 文件，不污染会话列表。"""
+        convo = []
+        for t in history:
+            who = "用户" if t["role"] == "user" else "Claude"
+            convo.append(f"{who}: {t.get('content') or ''}")
+        prompt = COMPACT_PROMPT + "\n\n" + "\n\n".join(convo)
+        try:
+            result, sid, _ = claude_runner.run_claude(
+                prompt, self.work_dir, min(self.task_timeout, 300),
+                session_id=None, permit=False, extra_dirs=[], history=None,
+                model=COMPACT_MODEL, unsafe=False)
+        except Exception as e:
+            print(f"[{self.name}][compact-error] {e}")
+            return None
+        if sid:
+            try:
+                claude_runner.delete_claude_session(sid, self.work_dir)
+            except Exception as e:
+                print(f"[{self.name}][compact-cleanup] {e}")
+        if not result or result.startswith("[error]") or result == "(no output)":
+            return None
+        return result
+
+    def _do_compact(self, msg_id, reason=None):
+        """把当前对话本地历史摘要成一段上下文，开一个新对话并把摘要设为其 seed
+        （下一条任务自动带上）。成功返回 True；无历史或摘要失败返回 False。"""
+        with self.lock:
+            history = list(self.sessions.get("history", []))
+        if not history:
+            return False
+        note = f"（{reason}）" if reason else ""
+        self._push_reply(msg_id, f"🗜 正在压缩当前对话上下文{note}…", tag="compact")
+        with self.run_slot:  # 摘要也是一次 claude 调用，纳入全局并发闸
+            summary = self._summarize_history(history)
+        if not summary:
+            self._push_reply(msg_id, "上下文自动压缩失败，可手动 /new 开新对话", tag="compact")
+            return False
+        with self.lock:  # 与 worker/命令的会话增删改互斥（同 cmd_new）
+            entry = self.make_session()
+            entry["seed"] = summary  # 仅内存：下条任务拼进 prompt 后即清除
+            self.sessions["list"].append(entry)
+            self.sessions["current"] = len(self.sessions["list"]) - 1
+            self.sessions["history"] = []
+            self.set_current(entry)
+        self._push_reply(msg_id, "✅ 已压缩并开新对话，后续在压缩摘要基础上继续。", tag="compact")
+        print(f"[{self.name}][compact] done reason={reason} summary_chars={len(summary)}")
+        return True
 
     def _permit_banner(self):
         """若开着 permit/unsafe，返回提醒文案（防止开启后忘关）。互斥后至多一条。"""
@@ -563,6 +693,10 @@ class Bot:
         if job["kind"] == "debate":
             self._execute_debate_job(job)
             return
+        if job["kind"] == "compact":
+            if not self._do_compact(job["msg_id"], reason="手动 /compact"):
+                self._push_reply(job["msg_id"], "当前对话暂无可压缩的历史（先发几条任务再压缩）")
+            return
         text, msg_id = job["text"], job["msg_id"]
         is_retry = job["kind"] == "retry"
 
@@ -571,6 +705,7 @@ class Bot:
             if is_retry:
                 session_id, history, first_task = job.get("session_id"), None, None
                 is_new = session_id is None
+                seed = None
             else:
                 is_new = self.current_session_id() is None
                 if not self.sessions["list"]:  # 首用，建 session 条目
@@ -580,8 +715,27 @@ class Bot:
                 session_id = self.current_session_id()
                 history = list(self.sessions.get("history", []))
                 first_task = text if is_new else None
+                cur = self.current_entry()
+                seed = cur.get("seed") if cur else None
             permit_mode = self.permit_mode
             unsafe_mode = self.unsafe_mode
+
+        # 档1/档2：续聊前按 context 占用护栏——达阈值自动压缩，未开压缩且触顶则硬闸拦下
+        if not is_retry and session_id and not is_new:
+            status = self._context_guard(msg_id, session_id)
+            if status == GUARD_BLOCKED:
+                return
+            if status == GUARD_COMPACTED:  # 已切到新对话，重取会话状态
+                with self.lock:
+                    session_id, history, first_task, is_new = None, [], text, True
+                    cur = self.current_entry()
+                    seed = cur.get("seed") if cur else None
+
+        # 压缩后首轮：把摘要拼进实际 prompt（审计/历史仍存用户原文 text）
+        run_text = text
+        if seed:
+            run_text = (f"[以下是上一段对话的压缩摘要，请据此延续上下文，无需复述]\n{seed}\n\n"
+                        f"[用户新消息]\n{text}")
 
         print(f"[{self.name}][{'retry' if is_retry else 'task'}] permit={permit_mode} "
               f"unsafe={unsafe_mode} session={'new' if is_new else str(session_id)[:8] + '…'} | {text[:60]}")
@@ -595,6 +749,7 @@ class Bot:
                 t0 = time.time()
                 result, new_sid, used_model = self.execute_claude(
                     text, session_id, history=history, first_task=first_task,
+                    run_text=run_text,
                 )
                 elapsed = time.time() - t0
         finally:
@@ -609,7 +764,7 @@ class Bot:
                 message_id=msg_id, ok=not is_err, model=used_model,
                 elapsed_ms=int(elapsed * 1000), chars=len(result), detail=result[:2000])
 
-        # 锁内：更新对话历史（保留最近 20 轮）+ 审计
+        # 锁内：更新对话历史（保留最近 20 轮）+ 审计；成功后清除已消费的压缩 seed
         with self.lock:
             if not is_retry and not result.startswith("[error]"):
                 data = self.sessions
@@ -618,12 +773,22 @@ class Bot:
                 data["history"].append({"role": "assistant", "content": result})
                 if len(data["history"]) > 40:  # 20 轮 × 2
                     data["history"] = data["history"][-40:]
+                if seed:  # 摘要已随首轮写入 claude session，勿再重复带上
+                    cur = self.current_entry()
+                    if cur:
+                        cur.pop("seed", None)
             self.audit(text, result, new_sid, used_model)
 
-        # 主动推送结果（带失败重试，避免网络抖动丢结果）
+        # 主动推送结果（带失败重试，避免网络抖动丢结果）+ context 占用提示/分级提醒
         banner = self._permit_banner()
-        suffix = "" if result.startswith("[error]") else self._model_suffix(used_model)
-        self._push_reply(msg_id, result + suffix + (("\n\n" + banner) if banner else ""))
+        if is_err:
+            suffix, warn = "", ""
+        else:
+            ctx_pct = self._context_pct(new_sid or session_id)
+            suffix = self._model_suffix(used_model, ctx_pct)
+            warn = self._context_warning(ctx_pct)
+        tail = "".join("\n\n" + x for x in (warn, banner) if x)
+        self._push_reply(msg_id, result + suffix + tail)
         print(f"[{self.name}][done] pushed to {msg_id} model={used_model}")
 
         # 任务成功后自动把这一轮的增量改动打包成 .bundle 发到群（供远程 git fetch）

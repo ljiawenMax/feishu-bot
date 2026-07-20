@@ -66,7 +66,15 @@ DB 访问走 SQLAlchemy ORM；每次操作开短生命周期 Session（线程安
 bundle 传的是真实 git 对象，`fetch`/`merge --ff-only` 要么整体成功要么明确失败，配合 `/resync` 能可靠
 自愈。
 
-`task_timeout` / `heartbeat_interval` / `models` / `max_concurrent` 为共享项，写在 `.env.local` 顶层。
+`task_timeout` / `heartbeat_interval` / `models` / `max_concurrent` / `auto_compact_threshold`
+为共享项，写在 `.env.local` 顶层。
+
+**context 护栏（省额度）**：每轮 `--resume` 都会把整段对话重喂给模型，忘了 `/new` 时 context
+越滚越大、每轮重复烧订阅额度。为此：①每条回复 inline 附带 `ctx N%`，越阈值（60/80%）追加分级提醒；
+②续聊前若 context 占用达 `AUTO_COMPACT_THRESHOLD`（默认 75%，0 关闭）自动压缩——把本地历史用
+便宜模型（haiku）摘要成一段上下文、开新对话（`/new`）并把摘要作为新会话首轮 prompt 的前缀带上，
+从而清空 context 重新计费又不丢脉络；③关掉自动压缩时，92% 硬闸兜底：触顶暂停执行、要求手动
+`/compact` 或 `/new`。`/compact` 命令随时手动触发同样的「摘要→开新对话→下轮带摘要」流程。
 （`POLL_INTERVAL` 已废弃：改用长连接推送，不再轮询；保留仅为兼容旧配置。）
 
 ## 飞书开放平台前置配置

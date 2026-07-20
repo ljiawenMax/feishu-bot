@@ -79,6 +79,8 @@ def load_config(env_name):
         "task_timeout": int(env["TASK_TIMEOUT"]),
         "heartbeat_interval": int(env.get("HEARTBEAT_INTERVAL", 60)),
         "max_concurrent": int(env.get("MAX_CONCURRENT", 3)),  # 全局同时运行的 claude 上限
+        # 续聊 context 占用达此百分比即自动压缩（摘要后开新对话）；0 关闭，改由硬闸兜底
+        "auto_compact_threshold": int(env.get("AUTO_COMPACT_THRESHOLD", 75)),
         "models": json.loads(env.get("MODELS") or '["opus","sonnet","haiku"]'),
         "bots": json.loads(env["BOTS"]),
     }
@@ -127,7 +129,8 @@ def main():
             app_secrets[aid] = bc["app_secret"]
             app_chatmaps[aid] = {}
         b = Bot(bc, session_factory, cfg["task_timeout"], cfg["models"],
-                cfg["heartbeat_interval"], run_slot=run_slot, client=api_clients[aid])
+                cfg["heartbeat_interval"], run_slot=run_slot, client=api_clients[aid],
+                auto_compact_threshold=cfg["auto_compact_threshold"])
         app_chatmaps[aid][bc["chat_id"]] = b
         bots.append(b)
     print(f"[feishu-bot] env={args.env}, bots={[b.name for b in bots]}, "
