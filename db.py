@@ -86,7 +86,7 @@ def load_history(s, chat_id, claude_sid, limit=40):
     if not claude_sid:
         return []
     rows = s.execute(
-        select(Message.role, Message.content)
+        select(Message.role, Message.content, Message.created_at)
         .where(
             Message.chat_id == chat_id,
             Message.claude_session_id == claude_sid,
@@ -95,7 +95,7 @@ def load_history(s, chat_id, claude_sid, limit=40):
         .order_by(Message.id.desc())
         .limit(limit)
     ).all()
-    return [{"role": r[0], "content": r[1]} for r in reversed(rows)]
+    return [{"role": r[0], "content": r[1], "created_at": r[2]} for r in reversed(rows)]
 
 
 def save_bot_state(s, chat_id, permit, unsafe):

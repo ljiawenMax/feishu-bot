@@ -162,6 +162,17 @@ class Bot:
     def load_history(self, claude_sid):
         return self.db(db.load_history, self.chat_id, claude_sid) or []
 
+    def _send_recent_history(self, msg_id, rounds=3):
+        """切换对话后，把最近 rounds 轮（user+assistant 各算一条）逐条单独发回，
+        每条带时间戳和发送者，方便不用翻聊天记录就能看到上下文。"""
+        recent = self.sessions["history"][-rounds * 2:]
+        for turn in recent:
+            who = "你" if turn["role"] == "user" else "Claude"
+            created_at = turn.get("created_at")
+            ts = created_at.strftime("%m-%d %H:%M") if created_at else ""
+            header = f"[{ts}] {who}：" if ts else f"{who}："
+            feishu_api.reply_message(self.client, msg_id, f"{header}\n{turn.get('content') or ''}", tag="history")
+
     def update_session(self, session_id, first_task=None):
         """首次执行时写入 session_id 和标签，并同步到 DB。
         在 worker 线程于长调用之后运行，加锁与主循环的会话增删改互斥。"""
@@ -806,6 +817,7 @@ class Bot:
                     self.sessions["history"] = self.load_history(entry["id"])
                 self.pending = None
                 feishu_api.reply_message(self.client, msg["id"], f"已切换到对话 {idx + 1}：{entry['label']}")
+                self._send_recent_history(msg["id"])
                 print(f"[{self.name}][session] switched to idx={idx}")
             else:
                 feishu_api.reply_message(self.client, msg["id"], f"无效序号，请输入 1～{len(sessions)}")
