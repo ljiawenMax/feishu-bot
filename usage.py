@@ -10,6 +10,7 @@ import json
 import os
 import re
 import subprocess
+import threading
 import time
 from datetime import datetime, timezone
 
@@ -20,6 +21,7 @@ ENDPOINT = "https://api.anthropic.com/api/oauth/usage"
 
 _cache = {"data": None, "ts": 0.0, "sub": None}
 _ver = None
+_refreshing = threading.Lock()
 
 
 class NoCredentials(Exception):
@@ -109,6 +111,47 @@ def format_usage(data, sub=None, from_cache=False):
     if from_cache:
         lines.append("（数据来自缓存）")
     return "\n".join(lines)
+
+
+def _bg_refresh():
+    """后台异步刷新缓存，不阻塞调用方；同一时刻至多一个刷新线程。
+    任何失败（无凭证/过期/限流/网络）都静默吞掉——inline 展示不该干扰主流程。"""
+    if not _refreshing.acquire(blocking=False):
+        return
+
+    def run():
+        try:
+            token, sub = read_token()
+            data = fetch_usage(token)
+            _cache.update(data=data, ts=time.time(), sub=sub)
+        except Exception:
+            pass
+        finally:
+            _refreshing.release()
+
+    threading.Thread(target=run, name="usage-refresh", daemon=True).start()
+
+
+def report_inline(max_age=300):
+    """给每条回复用的紧凑用量串，如 "5h 42% · 周 68%"；≥80% 加 ⚠️。
+    仅读缓存、绝不阻塞：缓存缺失或超过 max_age 秒时后台异步刷新，本次仍返回
+    当前缓存值（无则 None）。任何异常都不抛，取不到就返回 None。"""
+    try:
+        data = _cache["data"]
+        if data is None or time.time() - _cache["ts"] >= max_age:
+            _bg_refresh()
+        if data is None:
+            return None
+        parts = []
+        for key, label in (("five_hour", "5h"), ("seven_day", "周")):
+            v = data.get(key) or {}
+            p = v.get("utilization")
+            if p is not None:
+                mark = "⚠️" if p >= 80 else ""
+                parts.append(f"{label} {mark}{p:.0f}%")
+        return " · ".join(parts) if parts else None
+    except Exception:
+        return None
 
 
 def report(min_interval=60):

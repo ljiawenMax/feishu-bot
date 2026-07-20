@@ -422,11 +422,16 @@ class Bot:
 
     @staticmethod
     def _model_suffix(used_model):
-        """成功结果末尾追加「（模型：…）」；去掉 claude- 前缀。"""
-        if not used_model:
-            return ""
-        short = used_model[7:] if used_model.startswith("claude-") else used_model
-        return f"\n\n（模型：{short}）"
+        """成功结果末尾追加「（模型：… · 5h …% · 周 …%）」；去掉 claude- 前缀。
+        用量取自 usage 模块的缓存（只读、不阻塞），取不到时静默省略。"""
+        parts = []
+        if used_model:
+            short = used_model[7:] if used_model.startswith("claude-") else used_model
+            parts.append(f"模型：{short}")
+        u = usage.report_inline()
+        if u:
+            parts.append(u)
+        return f"\n\n（{' · '.join(parts)}）" if parts else ""
 
     def _permit_banner(self):
         """若开着 permit/unsafe，返回提醒文案（防止开启后忘关）。互斥后至多一条。"""
