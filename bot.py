@@ -9,6 +9,7 @@ inbox 线程串行处理（命令回复/上传下载/把长任务入队），cla
 import collections
 import os
 import queue
+import re
 import subprocess
 import tempfile
 import threading
@@ -763,7 +764,9 @@ class Bot:
             return
 
         seq = info["seq"]
-        fname = f"{seq:04d}-feishu-sync.bundle"
+        # 文件名带上 work_dir 标识，便于在群里区分是同步哪个工作目录（各目录 seq 独立起算）
+        slug = re.sub(r"[^A-Za-z0-9_.-]", "_", os.path.basename(os.path.normpath(self.work_dir))) or "root"
+        fname = f"{slug}-{seq:04d}-feishu-sync.bundle"
         path = os.path.join(tmpdir, fname)
         os.rename(tmp_path, path)
         if full:
