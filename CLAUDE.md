@@ -111,6 +111,13 @@ journalctl -u feishu-bot.service -n 50 --no-pager
 
 启动成功会打印 `connected to wss://...`（每个 app_id 一条）。
 
+## 提交规范
+
+commit/push 前务必自查暂存改动，避免敏感信息泄露：`git diff --cached` 扫一遍，确认没有
+app_secret、密码、token、数据库凭证、真实 chat_id/app_id 等；`.env.local` 保持 gitignored
+（本地实际配置不入 git），`.env` 模板只放占位符。只 `git add` 明确要提交的文件，别用
+`git add -A` 顺手带上未审阅或含凭证的文件。
+
 ## 当前状态 / 待完成事项
 
 - [ ] 填写 `.env.local` 中的真实飞书凭证
