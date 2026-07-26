@@ -45,6 +45,12 @@ GUARD_PROCEED, GUARD_BLOCKED, GUARD_COMPACTED = "proceed", "blocked", "compacted
 # /debate 正反方各自的发言轮数
 DEBATE_ROUNDS = 5
 
+# 附件回传协议：Claude 在回复里写 [[SEND_FILE:/abs/path]]，bot 剥离标记并把文件发到群。
+# 路径白名单与体积上限见 Bot._extract_send_files——这是唯一的外传闸门，别放宽。
+SEND_FILE_RE = re.compile(r"\[\[SEND_FILE:([^\]\n]+)\]\]")
+SEND_FILE_MAX = 3
+SEND_FILE_MAX_BYTES = 20 * 1024 * 1024
+
 HELP_TEXT = "\n".join([
     "可用命令：",
     "/sessions  — 列出对话，回复序号切换",
@@ -79,6 +85,11 @@ class Bot:
         self.chat_id = bot_cfg["chat_id"]
         # 一 chat 一 work_dir；省略时回退家目录，配置值支持 ~
         self.work_dir = os.path.expanduser(bot_cfg.get("work_dir") or "~")
+        # 额外挂进工作区的只读目录（--add-dir）：让 Claude 能读 work_dir 之外的代码/资料，
+        # 但 cwd 仍是 work_dir，产物不会落进那些目录。启动时过滤掉不存在的路径。
+        self.extra_dirs = [d for d in
+                           (os.path.expanduser(x) for x in (bot_cfg.get("extra_dirs") or []))
+                           if os.path.isdir(d)]
         # 发送/下载用的 SDK 客户端（同 app_id 的多个 Bot 共用一个；token 由其内部管理）
         self.client = client
         self.task_timeout = task_timeout
@@ -232,7 +243,7 @@ class Bot:
         unsafe = self.unsafe_mode
         # 始终把该聊天上传目录纳入工作区（存在才加），让 Claude 能读上传文件
         up = uploads.chat_dir(self.chat_id)
-        extra_dirs = [up] if os.path.isdir(up) else []
+        extra_dirs = ([up] if os.path.isdir(up) else []) + self.extra_dirs
         entry = self.current_entry()
         model = entry.get("model") if entry else None
         try:
@@ -661,7 +672,8 @@ class Bot:
         with self.lock:
             self.last_task = {"text": text, "msg_id": msg["id"],
                               "session_id": self.current_session_id()}
-        self._enqueue({"kind": "task", "text": text, "msg_id": msg["id"]},
+        self._enqueue({"kind": "task", "text": text, "msg_id": msg["id"],
+                       "sender_id": msg.get("sender_id")},
                       msg["id"], verb="执行")
 
     def _enqueue(self, job, msg_id, verb):
@@ -736,6 +748,9 @@ class Bot:
         if seed:
             run_text = (f"[以下是上一段对话的压缩摘要，请据此延续上下文，无需复述]\n{seed}\n\n"
                         f"[用户新消息]\n{text}")
+        # 群里可能多人共用一个 bot，把发言人 open_id 交给 Claude，便于按人分账/存档
+        if job.get("sender_id"):
+            run_text = f"[飞书用户: {job['sender_id']}]\n{run_text}"
 
         print(f"[{self.name}][{'retry' if is_retry else 'task'}] permit={permit_mode} "
               f"unsafe={unsafe_mode} session={'new' if is_new else str(session_id)[:8] + '…'} | {text[:60]}")
@@ -805,7 +820,7 @@ class Bot:
         rounds = DEBATE_ROUNDS
         permit_mode, unsafe_mode = self.permit_mode, self.unsafe_mode
         up = uploads.chat_dir(self.chat_id)
-        extra_dirs = [up] if os.path.isdir(up) else []
+        extra_dirs = ([up] if os.path.isdir(up) else []) + self.extra_dirs
 
         row_ids = {
             "pro": self.db(db.insert_session, self.chat_id, f"[辩论]🔵正方: {topic[:20]}", 9999),
@@ -885,13 +900,73 @@ class Bot:
         closing = "这是最后一轮，请适当收束、总结你方立场。" if round_n == rounds else ""
         return "\n".join(filter(None, [header, body, closing]))
 
+    def _extract_send_files(self, text):
+        """解析 Claude 回复里的 [[SEND_FILE:/abs/path]] 标记，返回 (剥离标记的正文, 合法路径, 拒绝说明)。
+
+        白名单：必须是 work_dir 或本 chat 上传目录之下的普通文件（按 realpath 判断，
+        软链也逃不出去），单文件 ≤20MB，一条回复最多 3 个。Claude 可能被上传的文件
+        内容诱导去发送任意路径，这里是唯一的闸门。
+        """
+        paths = SEND_FILE_RE.findall(text)
+        if not paths:
+            return text, [], []
+        clean = SEND_FILE_RE.sub("", text).strip()
+        roots = [os.path.realpath(self.work_dir)]
+        up = uploads.chat_dir(self.chat_id)
+        if os.path.isdir(up):
+            roots.append(os.path.realpath(up))
+
+        ok, rejected = [], []
+        for raw in paths:
+            p = raw.strip()
+            if len(ok) >= SEND_FILE_MAX:
+                rejected.append(f"{os.path.basename(p)}：一条回复最多发 {SEND_FILE_MAX} 个文件")
+                continue
+            real = os.path.realpath(p)
+            if not os.path.isabs(p):
+                rejected.append(f"{p}：必须是绝对路径")
+            elif not any(real == r or real.startswith(r + os.sep) for r in roots):
+                rejected.append(f"{os.path.basename(p)}：不在本机器人的工作目录内，拒绝发送")
+            elif not os.path.isfile(real):
+                rejected.append(f"{os.path.basename(p)}：文件不存在")
+            elif os.path.getsize(real) > SEND_FILE_MAX_BYTES:
+                rejected.append(f"{os.path.basename(p)}：超过 "
+                                f"{SEND_FILE_MAX_BYTES // (1024 * 1024)}MB，拒绝发送")
+            else:
+                ok.append(real)
+        return clean, ok, rejected
+
+    def _send_files(self, msg_id, paths):
+        """把文件逐个上传并以文件消息回复。失败只记日志，不影响正文已送达。"""
+        for path in paths:
+            try:
+                file_key = feishu_api.upload_file(self.client, path, os.path.basename(path))
+                res = feishu_api.reply_file(self.client, msg_id, file_key, tag="attach")
+                self._audit_sends(msg_id, "attach", res)
+                print(f"[{self.name}][attach] sent {path}")
+            except Exception as e:
+                print(f"[{self.name}][attach-error] {path}: {e}")
+                self._push_reply(msg_id, f"⚠️ 附件发送失败：{os.path.basename(path)}（{e}）",
+                                 attempts=1, tag="attach")
+
     def _push_reply(self, msg_id, text, attempts=3, tag="push"):
-        """主动推送结果，失败重试几次（后台任务跑很久，不能因一次网络抖动就丢结果）。"""
+        """主动推送结果，失败重试几次（后台任务跑很久，不能因一次网络抖动就丢结果）。
+
+        正文里的 [[SEND_FILE:...]] 标记会被剥离，对应文件在正文送达后作为文件消息补发。
+        """
+        text, files, rejected = self._extract_send_files(text)
+        if rejected:
+            text = (text + "\n\n⚠️ 以下附件未发送：\n" +
+                    "\n".join("· " + r for r in rejected)).strip()
+        if not text:
+            text = "（见附件）"
         for i in range(attempts):
             try:
                 res = feishu_api.reply_message(self.client, msg_id, text, tag=tag)
                 self._audit_sends(msg_id, tag, res)
                 if res:
+                    if files:
+                        self._send_files(msg_id, files)
                     return True
             except Exception as e:
                 print(f"[{self.name}][push-error] attempt {i + 1}/{attempts}: {e}")

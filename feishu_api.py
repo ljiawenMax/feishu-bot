@@ -72,7 +72,9 @@ def event_to_msg(data):
     if ev.sender is None or ev.sender.sender_type != "user":
         return None
 
-    base = {"id": msg.message_id, "create_time": msg.create_time, "chat_id": msg.chat_id}
+    base = {"id": msg.message_id, "create_time": msg.create_time, "chat_id": msg.chat_id,
+            # 发送者 open_id：群里多人共用一个 bot 时，供下游按人区分（拿不到则为 None）
+            "sender_id": getattr(getattr(ev.sender, "sender_id", None), "open_id", None)}
     mtype = msg.message_type
     try:
         content = json.loads(msg.content)

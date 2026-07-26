@@ -21,7 +21,10 @@ ENDPOINT = "https://api.anthropic.com/api/oauth/usage"
 
 _cache = {"data": None, "ts": 0.0, "sub": None}
 _ver = None
-_refreshing = threading.Lock()
+# 单飞锁：全局任一时刻至多一个真实请求在飞，多 chat 并发只放一个打接口、其余复用结果
+_lock = threading.Lock()
+# 429 退避截止（epoch 秒）：命中限流后在此之前所有调用都只读缓存、绝不发请求
+_blocked_until = 0.0
 
 
 class NoCredentials(Exception):
@@ -33,7 +36,9 @@ class TokenExpired(Exception):
 
 
 class RateLimited(Exception):
-    pass
+    def __init__(self, msg="用量端点限流（429）", retry_after=None):
+        super().__init__(msg)
+        self.retry_after = retry_after
 
 
 def _claude_version():
@@ -61,7 +66,7 @@ def read_token():
         raise NoCredentials("凭证文件结构异常或不含 OAuth token")
 
 
-def fetch_usage(token):
+def fetch_usage(token, timeout=15):
     headers = {
         "Authorization": f"Bearer {token}",
         "anthropic-beta": "oauth-2025-04-20",
@@ -69,11 +74,16 @@ def fetch_usage(token):
         # User-Agent 必须像 claude-code，否则被狠狠限流持续 429
         "User-Agent": f"claude-cli/{_claude_version()} (external)",
     }
-    r = requests.get(ENDPOINT, headers=headers, timeout=15)
+    r = requests.get(ENDPOINT, headers=headers, timeout=timeout)
     if r.status_code == 401:
         raise TokenExpired("OAuth token 已过期，请在终端跑一次 claude 刷新登录")
     if r.status_code == 429:
-        raise RateLimited("用量端点限流（429）")
+        ra = r.headers.get("retry-after")
+        try:
+            ra = float(ra) if ra is not None else None
+        except (TypeError, ValueError):
+            ra = None
+        raise RateLimited(retry_after=ra)
     r.raise_for_status()
     return r.json()
 
@@ -113,33 +123,54 @@ def format_usage(data, sub=None, from_cache=False):
     return "\n".join(lines)
 
 
-def _bg_refresh():
-    """后台异步刷新缓存，不阻塞调用方；同一时刻至多一个刷新线程。
-    任何失败（无凭证/过期/限流/网络）都静默吞掉——inline 展示不该干扰主流程。"""
-    if not _refreshing.acquire(blocking=False):
-        return
+def _fresh(now, max_age):
+    return _cache["data"] is not None and now - _cache["ts"] < max_age
 
-    def run():
+
+def _single_flight(max_age, wait_timeout, timeout):
+    """单飞取用量，返回 (data, sub, stale)。
+    - 缓存够新（< max_age 秒）：直接用，不发请求。
+    - 处于 429 退避期：只读缓存并标 stale，绝不发请求。
+    - 否则抢单飞锁：抢到→双重检查后发唯一一次真实请求；抢不到（别人正在刷）→
+      最多等 wait_timeout 秒，其间别人刷好就复用新值，否则回退缓存并标 stale。
+    因此全局任一时刻至多一个真实请求在飞，多 chat 并发只会有一个打到接口。
+    命中 429 时按 Retry-After（缺省 240s）设置全局退避。任何失败都不抛。"""
+    global _blocked_until
+    now = time.time()
+    if _fresh(now, max_age):
+        return _cache["data"], _cache["sub"], False
+    if now < _blocked_until:
+        return _cache["data"], _cache["sub"], _cache["data"] is not None
+
+    if not _lock.acquire(timeout=wait_timeout):
+        return _cache["data"], _cache["sub"], _cache["data"] is not None
+    try:
+        now = time.time()
+        if _fresh(now, max_age):                 # 等锁期间别人可能已刷好
+            return _cache["data"], _cache["sub"], False
+        if now < _blocked_until:
+            return _cache["data"], _cache["sub"], _cache["data"] is not None
         try:
             token, sub = read_token()
-            data = fetch_usage(token)
+            data = fetch_usage(token, timeout=timeout)
             _cache.update(data=data, ts=time.time(), sub=sub)
+            return data, sub, False
+        except RateLimited as e:
+            _blocked_until = time.time() + (e.retry_after or 240)
         except Exception:
             pass
-        finally:
-            _refreshing.release()
+        return _cache["data"], _cache["sub"], _cache["data"] is not None
+    finally:
+        _lock.release()
 
-    threading.Thread(target=run, name="usage-refresh", daemon=True).start()
 
-
-def report_inline(max_age=300):
+def report_inline(max_age=30, wait_timeout=8, timeout=8):
     """给每条回复用的紧凑用量串，如 "5h 42% · 周 68%"；≥80% 加 ⚠️。
-    仅读缓存、绝不阻塞：缓存缺失或超过 max_age 秒时后台异步刷新，本次仍返回
-    当前缓存值（无则 None）。任何异常都不抛，取不到就返回 None。"""
+    同步取值（可能阻塞几秒等一次真实请求），但走单飞：多 chat 并发只放一个打
+    接口、其余复用其结果或读缓存，避免并发触发 429。数据陈旧（限流/超时回退
+    缓存）时串尾加 "·旧"。任何异常都不抛，取不到就返回 None。"""
     try:
-        data = _cache["data"]
-        if data is None or time.time() - _cache["ts"] >= max_age:
-            _bg_refresh()
+        data, _sub, stale = _single_flight(max_age, wait_timeout, timeout)
         if data is None:
             return None
         parts = []
@@ -149,22 +180,37 @@ def report_inline(max_age=300):
             if p is not None:
                 mark = "⚠️" if p >= 80 else ""
                 parts.append(f"{label} {mark}{p:.0f}%")
-        return " · ".join(parts) if parts else None
+        if not parts:
+            return None
+        s = " · ".join(parts)
+        return f"{s} ·旧" if stale else s
     except Exception:
         return None
 
 
 def report(min_interval=60):
-    """返回格式化的用量文本。min_interval 秒内复用缓存，避免触发端点限流。"""
+    """/usage 命令用：返回完整用量文本。min_interval 秒内复用缓存。与 inline 共用
+    单飞锁与 429 退避，避免和逐条回复的刷新并发打接口。NoCredentials/TokenExpired
+    照常抛给命令调用方展示。"""
+    global _blocked_until
     now = time.time()
-    if _cache["data"] is not None and now - _cache["ts"] < min_interval:
+    if _fresh(now, min_interval):
         return format_usage(_cache["data"], _cache["sub"], from_cache=True)
-    token, sub = read_token()
-    try:
-        data = fetch_usage(token)
-    except RateLimited:
+    token, sub = read_token()          # 无凭证/结构异常直接抛给调用方
+    if now < _blocked_until:           # 退避期内不发请求，回退缓存
         if _cache["data"] is not None:
-            return format_usage(_cache["data"], _cache["sub"], from_cache=True) + "\n（端点限流，显示上次结果）"
-        raise
-    _cache.update(data=data, ts=now, sub=sub)
-    return format_usage(data, sub)
+            return format_usage(_cache["data"], _cache["sub"], from_cache=True) + "\n（端点限流退避中，显示上次结果）"
+        raise RateLimited("用量端点限流（429），请稍后再试")
+    with _lock:
+        now = time.time()
+        if _fresh(now, min_interval):  # 等锁期间别人可能已刷好
+            return format_usage(_cache["data"], _cache["sub"], from_cache=True)
+        try:
+            data = fetch_usage(token, timeout=15)
+        except RateLimited as e:
+            _blocked_until = time.time() + (e.retry_after or 240)
+            if _cache["data"] is not None:
+                return format_usage(_cache["data"], _cache["sub"], from_cache=True) + "\n（端点限流，显示上次结果）"
+            raise
+        _cache.update(data=data, ts=time.time(), sub=sub)
+        return format_usage(data, sub)

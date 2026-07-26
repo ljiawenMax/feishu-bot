@@ -49,9 +49,26 @@ DB 访问走 SQLAlchemy ORM；每次操作开短生命周期 Session（线程安
   "app_secret": "飞书应用 App Secret",
   "chat_id": "监听的群聊 ID（格式 oc_xxxxxx，唯一）",
   "work_dir": "Claude Code 执行任务的工作目录（绝对路径，可省略→家目录 ~）",
-  "sync_patch": "可选布尔（默认 false）：每轮任务成功后自动把增量 .bundle 发到群，供远程 git fetch"
+  "sync_patch": "可选布尔（默认 false）：每轮任务成功后自动把增量 .bundle 发到群，供远程 git fetch",
+  "extra_dirs": "可选字符串数组：额外挂进工作区的只读目录（--add-dir），启动时过滤掉不存在的路径"
 }
 ```
+
+**extra_dirs（额外挂载目录）**：cwd 始终是 `work_dir`，`extra_dirs` 只是让 Claude 能*读*到
+别处的代码/资料。典型用法是「群里的对话产物不要污染源码目录」——把 work_dir 设成一个
+专用空目录，把项目源码用 `extra_dirs` 挂进来（`resume` 机器人就是这么配的）。
+该 chat 的上传目录始终自动挂载，不必写进 `extra_dirs`。
+
+**发送者身份**：`event_to_msg` 会把发言人 open_id 放进 `msg["sender_id"]`，`_execute_job`
+再以 `[飞书用户: ou_xxx]` 作为首行拼进给 Claude 的 prompt。群里多人共用一个机器人时，
+Claude 可据此按人分账（`resume` 项目就用它做 `--owner`）。拿不到时该行不出现。
+
+**附件回传协议 `[[SEND_FILE:/abs/path]]`**：Claude 在回复正文里写这个标记，`_push_reply`
+会剥离标记、正常发送正文，随后把对应文件作为文件消息补发到群（复用 `feishu_api.upload_file`
++ `reply_file`）。**白名单是唯一的外传闸门**（`Bot._extract_send_files`）：必须是绝对路径、
+realpath 落在 `work_dir` 或本 chat 上传目录之下（软链与 `..` 都逃不出去）、是普通文件、
+单文件 ≤20MB、一条回复最多 3 个；被拒的会在正文末尾列出原因。放宽它等于允许被上传文件
+里的内容诱导 Claude 外传任意路径，别动。
 
 **增量 bundle 同步（gitsync）**：`work_dir` 是 git 仓库时可用。每个 chat 维护隐藏基线 ref
 `refs/feishu-sync/<chat_id>`（游离快照，不碰 HEAD/分支/历史/暂存区）；每轮改动把「基线→当前工作树」
