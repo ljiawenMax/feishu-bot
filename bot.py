@@ -7,6 +7,7 @@ inbox 线程串行处理（命令回复/上传下载/把长任务入队），cla
 """
 
 import collections
+import difflib
 import os
 import queue
 import re
@@ -1345,6 +1346,15 @@ class Bot:
         handler = self.commands.get(head.lower())
         if handler:
             handler(msg, rest.strip())
+            return
+        # 形如「单个斜杠词」（/foo 或 /foo args）却不是已知命令：直接提示，不走 LLM。
+        # 只匹配「斜杠 + 纯 ASCII 词」，故文件路径参数（/home/x.py、/etc/nginx.conf，含更多 / 或 .）
+        # 不会被误判为命令，仍照常作为任务交给 Claude。
+        if re.fullmatch(r"/[A-Za-z][A-Za-z0-9_-]*", head):
+            sugg = difflib.get_close_matches(head.lower(), self.commands.keys(), n=1, cutoff=0.5)
+            hint = f"，你是指 {sugg[0]} 吗？" if sugg else ""
+            feishu_api.reply_message(self.client, msg["id"],
+                                     f"未识别的命令 {head}{hint}\n发送 /help 查看全部命令")
             return
         # 普通任务
         self.run_task(msg, text)
