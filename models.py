@@ -1,9 +1,10 @@
 """SQLAlchemy ORM 模型（MySQL）。
 
-三张表：
+主要的表：
 - bot_state：每个 chat_id 的 UI 状态
 - sessions：一行一个对话（类名 Conversation，避开 SQLAlchemy 自身的 Session）
 - messages：对话审计，append-only
+- wiki_chunks：知识库切块的全文检索副本（ngram 索引在 db.migrate() 里建）
 
 MySQL 适配要点：
 - 被索引/做主键的字符串列用 VARCHAR（MySQL 不能直接对 TEXT 建索引/主键）
@@ -122,6 +123,29 @@ class Unhandled(Base):
     msg_type: Mapped[str | None] = mapped_column(String(32))
     content: Mapped[str | None] = mapped_column(LONGTEXT)  # 原始 body.content
     created_at: Mapped["DateTime"] = mapped_column(DateTime, server_default=func.now())
+
+
+class WikiChunk(Base):
+    """知识库切块的全文检索副本（权威数据在本地 chunks.jsonl，这里只为 MATCH...AGAINST）。
+
+    向量索引解决同义/口语化问法，这张表解决专有名词精确匹配（错误码、组件名）——
+    两路缺一不可，见 wiki_index 模块注释。text 上的 ngram 全文索引由 db.migrate() 建
+    （create_all 不支持带 parser 的索引），按 space_id 整段替换。"""
+
+    __tablename__ = "wiki_chunks"
+    __table_args__ = (
+        Index("uq_wiki_chunk", "space_id", "chunk_id", unique=True),
+        TABLE_KW,
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    space_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    chunk_id: Mapped[str] = mapped_column(String(128), nullable=False)  # <node_token>#<序号>
+    doc_title: Mapped[str | None] = mapped_column(String(255))
+    url: Mapped[str | None] = mapped_column(String(1024))
+    breadcrumb: Mapped[str | None] = mapped_column(String(1024))
+    text: Mapped[str | None] = mapped_column(LONGTEXT)
+    updated_at: Mapped["DateTime"] = mapped_column(DateTime, server_default=func.now())
 
 
 class Upload(Base):

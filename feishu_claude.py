@@ -82,6 +82,16 @@ def load_config(env_name):
         # 续聊 context 占用达此百分比即自动压缩（摘要后开新对话）；0 关闭，改由硬闸兜底
         "auto_compact_threshold": int(env.get("AUTO_COMPACT_THRESHOLD", 75)),
         "models": json.loads(env.get("MODELS") or '["opus","sonnet","haiku"]'),
+        # 知识库 RAG 共享项：只有 BOTS 里配了 wiki 字段的机器人才会用到
+        "wiki": {
+            # 索引缓存目录：必须在 work_dir 之外——gitsync 每轮 `git add -A`，
+            # 镜像落进 work_dir 会被整个提交进用户的 git 历史
+            "cache_dir": env.get("WIKI_CACHE_DIR") or "~/.feishu-bot/wiki",
+            "sync_interval": int(env.get("WIKI_SYNC_INTERVAL", 1800)),
+            "embed_url": env.get("WIKI_EMBED_URL") or "http://localhost:11434",
+            "embed_model": env.get("WIKI_EMBED_MODEL") or "quentinz/bge-small-zh-v1.5",
+            "keep_alive": env.get("WIKI_EMBED_KEEP_ALIVE") or "30m",
+        },
         "bots": json.loads(env["BOTS"]),
     }
 
@@ -130,7 +140,8 @@ def main():
             app_chatmaps[aid] = {}
         b = Bot(bc, session_factory, cfg["task_timeout"], cfg["models"],
                 cfg["heartbeat_interval"], run_slot=run_slot, client=api_clients[aid],
-                auto_compact_threshold=cfg["auto_compact_threshold"])
+                auto_compact_threshold=cfg["auto_compact_threshold"],
+                wiki_cfg=cfg["wiki"])
         app_chatmaps[aid][bc["chat_id"]] = b
         bots.append(b)
     print(f"[feishu-bot] env={args.env}, bots={[b.name for b in bots]}, "

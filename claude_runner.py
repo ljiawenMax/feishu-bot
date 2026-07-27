@@ -26,10 +26,23 @@ SYNC_SYSTEM_PROMPT = (
 )
 
 
+WIKI_SYSTEM_PROMPT = (
+    "本次 prompt 中若带有「知识库参考资料」，那是从飞书知识库检索出的相关条目。"
+    "回答时优先依据这些资料，不要凭印象改写其中的命令、参数或步骤；"
+    "答完在末尾用「来源：<文档标题> <链接>」列出实际引用到的资料（没用到的不要列）。"
+    "若参考资料与问题无关或不足以回答，明确说明「知识库中未找到相关内容」，再用你自己的知识作答，"
+    "并提示可以把这个问题补进知识库。"
+)
+
+
 def run_claude(task, work_dir, timeout, session_id=None, permit=False, extra_dirs=None,
-               history=None, model=None, unsafe=False):
+               history=None, model=None, unsafe=False, extra_system=None):
+    """extra_system：追加一段系统提示（CLI 支持多次 --append-system-prompt）。
+    知识库回答策略走这里，不动通用的 SYNC_SYSTEM_PROMPT。"""
     cmd = ["claude", "-p", task, "--output-format", "stream-json", "--verbose",
            "--append-system-prompt", SYNC_SYSTEM_PROMPT]
+    if extra_system:
+        cmd += ["--append-system-prompt", extra_system]
     # unsafe 优先级最高：跳过全部权限校验（可执行任意命令，含 bash）
     # permit = acceptEdits：可在工作区（cwd + extra_dirs）内读写/改文件，但不执行任意命令
     if unsafe:
@@ -87,7 +100,8 @@ def run_claude(task, work_dir, timeout, session_id=None, permit=False, extra_dir
                         permit=permit,
                         extra_dirs=extra_dirs,
                         model=model,
-                        unsafe=unsafe
+                        unsafe=unsafe,
+                        extra_system=extra_system
                     )
 
                 return f"[error] {error_message}", None, used_model
@@ -99,7 +113,8 @@ def run_claude(task, work_dir, timeout, session_id=None, permit=False, extra_dir
                     print(f"[warn] session {session_id[:8]}… returned empty, retrying fresh")
                     recovered_task = build_task_with_history(task, history or [])
                     return run_claude(recovered_task, work_dir, timeout, session_id=None,
-                                      permit=permit, extra_dirs=extra_dirs, model=model, unsafe=unsafe)
+                                      permit=permit, extra_dirs=extra_dirs, model=model,
+                                      unsafe=unsafe, extra_system=extra_system)
                 return "(no output)", new_session_id, used_model
             if timed_out:
                 result += f"\n\n[超时（>{timeout}s），响应可能不完整]"

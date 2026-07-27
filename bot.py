@@ -21,6 +21,8 @@ import feishu_api
 import gitsync
 import uploads
 import usage
+import wiki_index
+import wiki_sync
 
 # Claude 标准上下文窗口大小（token）；用于 /context 计算占用百分比
 CONTEXT_WINDOW = 200000
@@ -65,12 +67,18 @@ HELP_TEXT = "\n".join([
     "/compact   — 压缩当前对话上下文（摘要后开新对话、自动带上摘要，省额度）",
     "/usage     — 查看 Claude 订阅用量（5 小时窗 / 7 天）",
     "/retry     — 用当前权限重跑上一条任务",
-    "/sync      — 把「上次同步以来」的增量改动作为 .bundle 文件发出（远程 git fetch + merge --ff-only）",
+    "/sync [说明] — 把改动在本地提交（可自定义 commit message）并把增量 .bundle 发出"
+    "（远程 git fetch + merge --ff-only）",
     "/resync    — 全量重新同步（忽略此前增量基线，远程 git fetch + reset --hard 强制拉平；/sync 报 "
     "non-fast-forward 时用这个恢复）",
     "/debate <辩题> — 正反方各5轮辩论（每轮实时推送）",
+    "/wiki [sync|search <词>|spaces] — 飞书知识库：查看状态 / 立即同步 / 调试检索 / 列空间",
     "/help      — 显示此帮助",
 ])
+
+# 知识库检索注入：每轮取 top_k 个条目、总字数上限（越大越费 context，见 CLAUDE.md）
+WIKI_TOP_K = 5
+WIKI_MAX_CHARS = 3000
 
 
 class Bot:
@@ -78,7 +86,7 @@ class Bot:
 
     def __init__(self, bot_cfg, session_factory, task_timeout, models=None,
                  heartbeat_interval=60, run_slot=None, client=None,
-                 auto_compact_threshold=75):
+                 auto_compact_threshold=75, wiki_cfg=None):
         self.name = bot_cfg["name"]
         self.app_id = bot_cfg["app_id"]
         self.app_secret = bot_cfg["app_secret"]
@@ -107,6 +115,20 @@ class Bot:
         # 是否 git 仓库改为命令执行时实时判断（见 _git_ready），不在启动时缓存——
         # 允许「先起服务、后 git init」，不必为此重启进程。
         self.sync_patch = bool(bot_cfg.get("sync_patch", False))
+
+        # 飞书知识库 RAG：配了 wiki.space_id 才启用。索引按 space_id 分区（不按 chat_id），
+        # 多个群配同一知识库时共享一份索引，不重复建也不重复占内存。
+        wcfg = bot_cfg.get("wiki") or {}
+        self.wiki_space_id = str(wcfg.get("space_id") or "").strip() or None
+        self.wiki_root_node = wcfg.get("root_node") or None
+        self.wiki_top_k = int(wcfg.get("top_k") or WIKI_TOP_K)
+        self.wiki_cfg = wiki_cfg or {}
+        self.wiki_dir = (wiki_index.space_dir(self.wiki_cfg.get("cache_dir", "~/.feishu-bot/wiki"),
+                                              self.wiki_space_id)
+                         if self.wiki_space_id else None)
+        self.wiki_index = None          # 加载好的索引；整体替换，读侧无锁
+        self.wiki_status = "未同步"      # /wiki 展示用
+        self.wiki_lock = threading.Lock()  # 只护「同步+重建」这段，检索不加锁
 
         self.Session = session_factory
 
@@ -147,6 +169,7 @@ class Bot:
             "/sync": self.cmd_sync,
             "/resync": self.cmd_resync,
             "/debate": self.cmd_debate,
+            "/wiki": self.cmd_wiki,
         }
 
     # ------------------------------------------------------------------ DB
@@ -235,10 +258,12 @@ class Bot:
         self.db(db.append_message, row_id, self.chat_id, sid, "assistant", result,
                 result.startswith("[error]"), "超时" in result, model=used_model)
 
-    def execute_claude(self, text, session_id, history=None, first_task=None, run_text=None):
+    def execute_claude(self, text, session_id, history=None, first_task=None, run_text=None,
+                       extra_system=None):
         """调用 Claude Code，处理超时/异常，成功时同步 session_id 到 DB。
         run_text 指定实际发给 claude 的 prompt（默认同 text）：压缩后首轮会在 text 前
-        拼上摘要，但审计/历史/标签仍用用户原文 text。返回 (result, new_sid, used_model)。"""
+        拼上摘要，但审计/历史/标签仍用用户原文 text。extra_system 追加一段系统提示
+        （注入了知识库资料时带上回答策略）。返回 (result, new_sid, used_model)。"""
         permit = self.permit_mode
         unsafe = self.unsafe_mode
         # 始终把该聊天上传目录纳入工作区（存在才加），让 Claude 能读上传文件
@@ -250,7 +275,7 @@ class Bot:
             result, new_sid, used_model = claude_runner.run_claude(
                 run_text or text, self.work_dir, self.task_timeout,
                 session_id, permit=permit, extra_dirs=extra_dirs, history=history,
-                model=model, unsafe=unsafe,
+                model=model, unsafe=unsafe, extra_system=extra_system,
             )
             if new_sid:
                 self.update_session(new_sid, first_task=first_task)
@@ -639,22 +664,25 @@ class Bot:
         return gitsync.is_git_repo(self.work_dir)
 
     def cmd_sync(self, msg, arg):
-        """手动把「上次同步以来」的增量改动打包成 .bundle 发出（无视 sync_patch 开关）。"""
+        """手动把「上次同步以来」的改动本地提交 + 打包成 .bundle 发出（无视 sync_patch 开关）。
+        `/sync <说明>` 可自定义本次提交的 commit message。"""
         if not self._git_ready():
             feishu_api.reply_message(self.client, msg["id"],
                                      f"工作目录不是 git 仓库，无法生成同步文件：{self.work_dir}")
             return
-        self._send_bundle(msg["id"], announce_empty=True, full=False)
+        self._send_bundle(msg["id"], announce_empty=True, full=False,
+                          task_text=arg, sender_id=msg.get("sender_id"))
 
     def cmd_resync(self, msg, arg):
-        """全量重新同步：不依赖增量基线，以本机当前工作树为准打包完整历史，
+        """全量重新同步：不依赖增量基线，以本机当前 HEAD 为准打包完整历史，
         远程 fetch 后 reset --hard 强制拉平。用于 /sync 报 non-fast-forward
         （基线与远程实际状态不一致）时的恢复手段。"""
         if not self._git_ready():
             feishu_api.reply_message(self.client, msg["id"],
                                      f"工作目录不是 git 仓库，无法生成同步文件：{self.work_dir}")
             return
-        self._send_bundle(msg["id"], announce_empty=True, full=True)
+        self._send_bundle(msg["id"], announce_empty=True, full=True,
+                          task_text=arg, sender_id=msg.get("sender_id"))
 
     def cmd_debate(self, msg, arg):
         """辩题入队：两个独立 Claude session 分饰正反方，交替发言，详见 _execute_debate_job。"""
@@ -663,6 +691,137 @@ class Bot:
             return
         self._enqueue({"kind": "debate", "topic": arg, "text": arg, "msg_id": msg["id"]},
                       msg["id"], verb="辩论")
+
+    # --------------------------------------------------------------- 知识库（RAG）
+
+    def _wiki_refresh(self, log=None):
+        """增量同步知识库 + 重建索引 + 换上新索引。返回 (ok, 描述文本)。
+
+        整个过程在 wiki_lock 内串行（同一 bot 不并发重建）；检索侧读的是 self.wiki_index
+        引用，这里构建完才整体替换，故检索不需要等锁、也不会读到半截索引。"""
+        log = log or (lambda s: print(f"[{self.name}][wiki] {s}"))
+        with self.wiki_lock:
+            try:
+                stats = wiki_sync.sync_space(self.client, self.wiki_space_id,
+                                             self.wiki_dir, self.wiki_root_node, log=log)
+                wiki_index.build(self.wiki_dir, self.wiki_cfg,
+                                 session_factory=self.Session, log=log)
+                self.wiki_index = wiki_index.load(self.wiki_dir)
+            except Exception as e:
+                self.wiki_status = f"同步失败（{time.strftime('%m-%d %H:%M')}）：{e}"
+                print(f"[{self.name}][wiki-error] {e}")
+                return False, str(e)
+        n = len(self.wiki_index) if self.wiki_index else 0
+        desc = (f"新增 {stats['added']} / 更新 {stats['updated']} / 删除 {stats['removed']} / "
+                f"未变 {stats['unchanged']}" + (f" / 失败 {stats['failed']}" if stats["failed"] else ""))
+        self.wiki_status = f"{time.strftime('%m-%d %H:%M')} 同步完成，{desc}，共 {n} 个条目"
+        print(f"[{self.name}][wiki] {desc}, chunks={n}")
+        return True, desc
+
+    def _wiki_worker(self):
+        """后台定时增量同步。不占 run_slot——那是 claude 进程的并发闸，
+        这里只是网络 IO + ollama 编码，不该挤占任务名额。"""
+        interval = max(int(self.wiki_cfg.get("sync_interval", 1800)), 60)
+        while True:
+            self._wiki_refresh()
+            time.sleep(interval)
+
+    def _wiki_reference(self, question):
+        """检索知识库，返回可直接拼进 prompt 的「参考资料」块（无命中返回空串）。
+        任何失败都只记日志、返回空串——知识库挂了不该让整轮任务失败。"""
+        idx = self.wiki_index
+        if idx is None or not len(idx):
+            return ""
+        try:
+            hits = wiki_index.search(idx, question, self.wiki_cfg,
+                                     top_k=self.wiki_top_k, session_factory=self.Session)
+        except Exception as e:
+            print(f"[{self.name}][wiki-search-error] {e}")
+            return ""
+        if not hits:
+            print(f"[{self.name}][wiki] 无命中: {question[:40]}")
+            return ""
+        print(f"[{self.name}][wiki] 命中 {len(hits)} 条: "
+              + " | ".join(h["breadcrumb"][-40:] for h in hits[:3]))
+        return wiki_index.format_reference(hits, max_chars=WIKI_MAX_CHARS)
+
+    def cmd_wiki(self, msg, arg):
+        """/wiki 状态 | /wiki sync 立即同步 | /wiki search <词> 调试召回 | /wiki spaces 列空间"""
+        mid = msg["id"]
+        arg = (arg or "").strip()
+        sub, _, rest = arg.partition(" ")
+        rest = rest.strip()
+
+        if sub == "spaces":
+            try:
+                spaces = wiki_sync.list_spaces(self.client)
+            except Exception as e:
+                feishu_api.reply_message(self.client, mid, f"列出知识空间失败：{e}")
+                return
+            if not spaces:
+                feishu_api.reply_message(self.client, mid,
+                    "没有可见的知识空间。\n多半是机器人应用还没被加为知识库成员："
+                    "知识库 → 设置 → 成员管理 → 添加应用（飞书对此不报权限错，只返回空列表）")
+                return
+            lines = [f"可见知识空间（{len(spaces)} 个）："]
+            lines += [f"{i}. {s['name']}\n   space_id={s['space_id']}"
+                      for i, s in enumerate(spaces, 1)]
+            feishu_api.reply_message(self.client, mid, "\n".join(lines))
+            return
+
+        if not self.wiki_space_id:
+            feishu_api.reply_message(self.client, mid,
+                "本群未配置知识库。\n发 /wiki spaces 列出可见知识空间，"
+                "把 space_id 填进 .env.local 对应机器人的 wiki 字段后重启服务。")
+            return
+
+        if sub == "sync":
+            feishu_api.reply_message(self.client, mid, "📚 正在同步知识库…")
+            ok, desc = self._wiki_refresh()
+            feishu_api.reply_message(self.client, mid,
+                                     f"✅ 同步完成：{desc}" if ok else f"❌ 同步失败：{desc}")
+            return
+
+        if sub == "search":
+            if not rest:
+                feishu_api.reply_message(self.client, mid, "用法：/wiki search <关键词>")
+                return
+            idx = self.wiki_index
+            if idx is None or not len(idx):
+                feishu_api.reply_message(self.client, mid, "知识库尚无索引，先发 /wiki sync")
+                return
+            try:
+                hits = wiki_index.search(idx, rest, self.wiki_cfg,
+                                         top_k=self.wiki_top_k, session_factory=self.Session)
+            except Exception as e:
+                feishu_api.reply_message(self.client, mid, f"检索失败：{e}")
+                return
+            if not hits:
+                feishu_api.reply_message(self.client, mid, f"没有命中「{rest}」")
+                return
+            lines = [f"「{rest}」命中 {len(hits)} 条："]
+            for i, h in enumerate(hits, 1):
+                v = f"{h['vec_score']:.3f}" if h["vec_score"] is not None else "-"
+                f_ = f"{h['ft_score']:.2f}" if h["ft_score"] is not None else "-"
+                snippet = h["text"][:100].replace("\n", " ")
+                lines.append(f"\n{i}. [向量 {v} / 全文 {f_}] {h['breadcrumb']}\n   {snippet}…")
+            feishu_api.reply_message(self.client, mid, "\n".join(lines))
+            return
+
+        idx = self.wiki_index
+        lines = [
+            "📚 知识库状态",
+            f"space_id：{self.wiki_space_id}" + (f"（子树 {self.wiki_root_node}）"
+                                                if self.wiki_root_node else ""),
+            f"条目数：{len(idx) if idx else 0}",
+            f"模型：{self.wiki_cfg.get('embed_model')}",
+            f"每轮注入：Top {self.wiki_top_k}",
+            f"自动同步：每 {max(int(self.wiki_cfg.get('sync_interval', 1800)), 60) // 60} 分钟",
+            f"最近一次：{self.wiki_status}",
+            "",
+            "/wiki sync 立即同步 · /wiki search <词> 看召回 · /wiki spaces 列空间",
+        ]
+        feishu_api.reply_message(self.client, mid, "\n".join(lines))
 
     # --------------------------------------------------------------- 任务执行（异步）
 
@@ -748,6 +907,11 @@ class Bot:
         if seed:
             run_text = (f"[以下是上一段对话的压缩摘要，请据此延续上下文，无需复述]\n{seed}\n\n"
                         f"[用户新消息]\n{text}")
+        # 知识库 RAG：检索出的条目拼在用户消息之前。只改 run_text，text 原样进 history
+        # 与审计——否则历史会被资料撑爆，压缩摘要也会跟着跑偏。
+        reference = self._wiki_reference(text) if self.wiki_space_id else ""
+        if reference:
+            run_text = f"{reference}\n\n[用户新消息]\n{run_text}"
         # 群里可能多人共用一个 bot，把发言人 open_id 交给 Claude，便于按人分账/存档
         if job.get("sender_id"):
             run_text = f"[飞书用户: {job['sender_id']}]\n{run_text}"
@@ -765,6 +929,7 @@ class Bot:
                 result, new_sid, used_model = self.execute_claude(
                     text, session_id, history=history, first_task=first_task,
                     run_text=run_text,
+                    extra_system=claude_runner.WIKI_SYSTEM_PROMPT if reference else None,
                 )
                 elapsed = time.time() - t0
         finally:
@@ -806,9 +971,11 @@ class Bot:
         self._push_reply(msg_id, result + suffix + tail)
         print(f"[{self.name}][done] pushed to {msg_id} model={used_model}")
 
-        # 任务成功后自动把这一轮的增量改动打包成 .bundle 发到群（供远程 git fetch）
+        # 任务成功后自动把这一轮改动本地提交 + 打包成 .bundle 发到群（供远程 git fetch），
+        # 本轮任务正文即 commit message，故本机/远程 git log 都能看出每轮改了什么
         if self.sync_patch and not is_err:
-            self._send_bundle(msg_id, announce_empty=False, full=False)
+            self._send_bundle(msg_id, announce_empty=False, full=False,
+                              task_text=text, sender_id=job.get("sender_id"))
 
     def _execute_debate_job(self, job):
         """辩论编排：两个独立 Claude session（正/反方）交替发言 DEBATE_ROUNDS 轮，
@@ -982,18 +1149,34 @@ class Bot:
                     ok=s["ok"], code=s["code"], chars=s.get("chars"),
                     detail=(f"sent_id={s.get('sent_id')}" if s["ok"] else s.get("msg")))
 
-    def _send_bundle(self, msg_id, announce_empty=False, full=False):
-        """生成同步 bundle 发到群（远程 git fetch 应用）。
+    def _commit_message(self, task_text, sender_id):
+        """本轮同步提交的 commit message：首行取任务正文首句（≤72 字），正文标出
+        来源与飞书发言人，便于事后在 git log 里追溯这轮改动是谁、因什么任务产生的。"""
+        first = (task_text or "").strip().splitlines()
+        subject = first[0].strip() if first else ""
+        if len(subject) > 72:
+            subject = subject[:69] + "..."
+        if not subject:
+            subject = gitsync.DEFAULT_MESSAGE
+        body = [f"via: feishu-sync ({self.name})"]
+        if sender_id:
+            body.append(f"feishu-user: {sender_id}")
+        return subject + "\n\n" + "\n".join(body) + "\n"
+
+    def _send_bundle(self, msg_id, announce_empty=False, full=False,
+                     task_text=None, sender_id=None):
+        """把工作树改动在本地提交，并生成同步 bundle 发到群（远程 git fetch 应用）。
         full=False：「上次同步以来」的增量，远程 fetch 后 merge --ff-only 快进；
         full=True（/resync）：不依赖增量基线，远程 fetch 后 reset --hard 强制拉平。
         announce_empty=True（手动 /sync）时，无改动/无仓库也回一句提示；自动调用则静默跳过。"""
         if not self._git_ready():
             return
+        message = self._commit_message(task_text, sender_id)
         tmpdir = tempfile.mkdtemp(prefix="feishu-sync-")
         tmp_path = os.path.join(tmpdir, "sync.bundle")
         try:
-            info = gitsync.full_bundle(self.work_dir, self.chat_id, tmp_path) if full \
-                else gitsync.incremental_bundle(self.work_dir, self.chat_id, tmp_path)
+            info = gitsync.full_bundle(self.work_dir, self.chat_id, tmp_path, message) if full \
+                else gitsync.incremental_bundle(self.work_dir, self.chat_id, tmp_path, message)
         except Exception as e:
             print(f"[{self.name}][sync-error] {e}")
             feishu_api.reply_message(self.client, msg_id, f"[error] 生成同步 bundle 失败: {e}", tag="patch")
@@ -1002,6 +1185,8 @@ class Bot:
             if announce_empty:
                 feishu_api.reply_message(self.client, msg_id, "自上次同步以来没有代码改动，无需同步")
             return
+        # 本轮打包了哪些提交（含本次自动提交与你手动做的 commit），直接列在群里
+        log_lines = [f"  {sha} {subj}" for sha, subj in info.get("commits", [])]
 
         seq = info["seq"]
         # 文件名带上 work_dir 标识，便于在群里区分是同步哪个工作目录（各目录 seq 独立起算）
@@ -1012,17 +1197,22 @@ class Bot:
         if full:
             note = "\n".join([
                 f"📦 第 {seq} 轮【全量】同步 bundle：{fname}（忽略远程此前状态，强制以本机当前为准）",
-                f"快照 {info['snap']}",
-                "远程执行（会把当前分支强制重置为本机快照；如远程有未提交改动请先自行处理）：",
+                f"HEAD {info['tip']}" + ("（本轮已在本地提交）" if info["new_commit"] else "（工作树无改动，直接打包现有历史）"),
+                *(["最近提交："] + log_lines if log_lines else []),
+                "远程执行（会把当前分支强制重置为本机 HEAD；如远程有未提交改动请先自行处理）：",
                 f"  git bundle verify {fname}",
                 f"  git fetch ./{fname} {info['tip_ref']}:sync-full",
                 "  git reset --hard sync-full",
                 "  git branch -d sync-full",
             ])
         else:
+            head_line = f"基线 {info['base']} → {info['tip']}（{info['n_commits']} 个提交）"
+            if not info["new_commit"]:
+                head_line += "，本轮工作树无改动、同步的是你自己的提交"
             note = "\n".join([
                 f"📦 第 {seq} 轮增量同步 bundle：{fname}",
-                f"基线 {info['base']} → {info['snap']}",
+                head_line,
+                *(["本轮提交："] + log_lines if log_lines else []),
                 "远程执行（按序号顺序逐个应用，务必按序、勿跳号）：",
                 f"  git bundle verify {fname}",
                 f"  git fetch ./{fname} {info['tip_ref']}:sync-incoming",
@@ -1166,7 +1356,12 @@ class Bot:
         事件由长连接推来，绝不在 ws 事件循环里做网络 IO。"""
         threading.Thread(target=self._inbox_worker, name=f"{self.name}-inbox", daemon=True).start()
         threading.Thread(target=self._worker, name=f"{self.name}-worker", daemon=True).start()
-        print(f"[{self.name}] ready, chat_id={self.chat_id}, work_dir={self.work_dir}")
+        if self.wiki_space_id:
+            # 知识库同步线程：启动即先同步一次，之后按 sync_interval 循环
+            threading.Thread(target=self._wiki_worker, name=f"{self.name}-wiki",
+                             daemon=True).start()
+        print(f"[{self.name}] ready, chat_id={self.chat_id}, work_dir={self.work_dir}"
+              + (f", wiki={self.wiki_space_id}" if self.wiki_space_id else ""))
 
     def on_event(self, msg):
         """长连接事件入口：跑在 ws 事件循环线程里，必须快速返回。

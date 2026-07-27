@@ -10,7 +10,16 @@ from urllib.parse import quote_plus
 from sqlalchemy import create_engine, delete, select, update
 from sqlalchemy.orm import sessionmaker
 
-from models import AuditLog, Base, BotState, Conversation, Message, Unhandled, Upload
+from models import (
+    AuditLog,
+    Base,
+    BotState,
+    Conversation,
+    Message,
+    Unhandled,
+    Upload,
+    WikiChunk,
+)
 
 
 def init_engine(db_cfg):
@@ -42,6 +51,18 @@ def migrate(engine):
             if not exists:
                 c.execute(text(f"ALTER TABLE {tbl} ADD COLUMN {col} {typ}"))
                 print(f"[migrate] {tbl}.{col} 已添加")
+
+        # wiki_chunks 的中文全文索引：create_all 建不了带 parser 的索引，只能在这里补。
+        # ngram 分词器（ngram_token_size=2）是 MySQL 内置的中文分词方案。
+        has_ft = c.execute(text(
+            "SELECT 1 FROM information_schema.statistics "
+            "WHERE table_schema=DATABASE() AND table_name='wiki_chunks' "
+            "AND index_name='ft_wiki_text'"
+        )).first()
+        if not has_ft:
+            c.execute(text("ALTER TABLE wiki_chunks "
+                           "ADD FULLTEXT INDEX ft_wiki_text (text) WITH PARSER ngram"))
+            print("[migrate] wiki_chunks.ft_wiki_text 全文索引已创建")
 
 
 def make_session_factory(engine):
@@ -167,6 +188,33 @@ def record_audit(s, chat_id, kind, tag, message_id=None, ok=True, code=None,
         chat_id=chat_id, kind=kind, tag=tag, message_id=message_id, ok=ok,
         code=code, model=model, elapsed_ms=elapsed_ms, chars=chars, detail=detail,
     ))
+
+
+def replace_wiki_chunks(s, space_id, rows):
+    """整段替换某知识空间的全文检索副本（先删后插）。
+
+    不做逐行 diff：chunk_id 会随小节增删整体漂移，逐行对齐的复杂度远大于重插；
+    这张表只是索引副本，权威数据在本地 chunks.jsonl。"""
+    s.execute(delete(WikiChunk).where(WikiChunk.space_id == space_id))
+    s.flush()
+    for r in rows:
+        s.add(WikiChunk(space_id=space_id, chunk_id=r["chunk_id"],
+                        doc_title=r.get("doc_title"), url=r.get("url"),
+                        breadcrumb=r.get("breadcrumb"), text=r.get("text")))
+
+
+def search_wiki_chunks(s, space_id, query, limit=20):
+    """ngram 全文召回，返回 [(chunk_id, score)]（按分数降序，已剔除 0 分）。
+
+    用 NATURAL LANGUAGE MODE：BOOLEAN MODE 下用户问句里的 +-~<>* 等字符会被当成
+    操作符，中文自然语言提问很容易踩到。"""
+    from sqlalchemy import text as sql_text
+    rows = s.execute(sql_text(
+        "SELECT chunk_id, MATCH(text) AGAINST(:q IN NATURAL LANGUAGE MODE) AS score "
+        "FROM wiki_chunks WHERE space_id = :sid "
+        "HAVING score > 0 ORDER BY score DESC LIMIT :lim"
+    ), {"q": query, "sid": space_id, "lim": int(limit)}).all()
+    return [(r[0], float(r[1])) for r in rows]
 
 
 def record_unhandled(s, message_id, chat_id, msg_type, content):

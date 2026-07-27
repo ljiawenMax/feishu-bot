@@ -1,4 +1,4 @@
-"""增量同步：把某个 chat 的工作目录改动，按「上次同步以来」生成增量 git bundle。
+"""增量同步：把某个 chat 的工作目录改动**在本地提交**，并按「上次同步以来」生成增量 git bundle。
 
 设计目标：远程项目与本机同版本、只被动接收同步文件，远程 `git fetch` 该 bundle 后
 `merge --ff-only`（或 /resync 全量 bundle 后 `reset --hard`）即可拉平。
@@ -12,28 +12,35 @@ apply"，很难判断到底错在哪一轮。改用 bundle 后，同步单位是
 发 `/resync` 换一个不依赖增量基线、以本机当前状态为准强制拉平的全量 bundle 即可
 恢复，不需要人工排查是哪一轮 patch 断的。
 
-- 每个 chat_id 维护一个隐藏基线 ref `refs/feishu-sync/<chat_id>`，指向「上次已
-  发送状态」的快照提交（游离对象，不在任何分支上）。
-- 生成同步文件时：把当前工作树快照成一个临时提交（用独立的临时 index，**不碰用户的
-  HEAD / 分支 / 提交历史 / 暂存区**），与基线之间的差异非空则打包发送并把基线推进
-  到该快照；空则跳过。
-- 因此本机 commit 与否都不影响：快照抓的是工作树内容，而非 HEAD。
-- 快照走 `git add -A`（临时 index），自动尊重 .gitignore：被忽略的文件（.venv、
-  __pycache__、.env.local 等）不会进同步文件。
-- bundle 需要一个可被 `git fetch` 按名字引用的 ref 才能生成，因此额外维护一个
-  临时的「快照 tip」ref `refs/feishu-sync-tip/<chat_id>`，每轮生成时指向本轮快照，
-  随 bundle 一起发送 ref 名供远程 fetch 用（ref 名字固定不变，远程命令每轮无需改）。
+**同步 = 先在本地真提交，再打包真实历史**（旧版是造游离快照、不碰 HEAD，导致本机
+`git log` 里查不到任何同步记录、远程收到的也只是一条 message 全一样的匿名快照链，
+本机自己的 commit 反而被压平丢失）。现在：
+
+- 工作树有改动时，先在**当前分支**上做一次真实提交（`git add -A` + `git commit`，
+  message 为本轮飞书任务内容），因此本机与远程的 `git log` 完全一致、都能看到每轮
+  改了什么、是谁触发的。**代价：会写入用户的提交历史，并把暂存区一并提交。**
+- 提交走 `--no-verify` 且关掉 gpg 签名：同步不应被 pre-commit hook 或签名配置阻断。
+- 用户已配 `user.name/email` 时用用户身份提交，未配才回退 feishu-sync 身份。
+- `git add -A` 自动尊重 .gitignore：被忽略的文件（.venv、__pycache__、.env.local 等）
+  不会进提交、也就不会进同步文件。
+- 每个 chat_id 维护一个隐藏基线 ref `refs/feishu-sync/<chat_id>`，指向「上次已发送
+  的提交」；每轮打包 `基线..HEAD` 的真实提交，发完基线前移到 HEAD。
+- 基线若不是当前 HEAD 的祖先（本机 rebase / reset / 换分支改写过历史），增量已无意义，
+  直接报错要求改发 `/resync` 全量拉平，而不是发出一个远程必然 ff 失败的 bundle。
+- bundle 需要一个可被 `git fetch` 按名字引用的 ref，因此额外维护 `refs/feishu-sync-tip/
+  <chat_id>` 指向本轮 HEAD，随 bundle 一起发送 ref 名供远程 fetch（名字固定不变，
+  远程命令每轮无需改）。
 """
 
 import os
 import re
 import subprocess
-import tempfile
 
 REF_PREFIX = "refs/feishu-sync/"
 TIP_REF_PREFIX = "refs/feishu-sync-tip/"
-# 快照提交用的固定身份，避免依赖用户的 user.name/email 配置
-_IDENTITY = {
+DEFAULT_MESSAGE = "feishu-sync: 同步工作目录改动"
+# 用户未配置 user.name/email 时的回退身份（配了则用用户自己的，提交进的是用户历史）
+_FALLBACK_IDENTITY = {
     "GIT_AUTHOR_NAME": "feishu-sync",
     "GIT_AUTHOR_EMAIL": "feishu-sync@local",
     "GIT_COMMITTER_NAME": "feishu-sync",
@@ -70,40 +77,62 @@ def _tip_ref(chat_id):
     return TIP_REF_PREFIX + re.sub(r"[^A-Za-z0-9_]", "_", chat_id)
 
 
-def _base_commit(work_dir, chat_id):
-    """取增量基线 commit：优先 sync 基线 ref，其次当前 HEAD；
-    仓库刚 git init、尚无任何提交（HEAD 未诞生）时返回 ""，交由调用方走全量。"""
-    base = _git(work_dir, "rev-parse", "--verify", "--quiet", _ref(chat_id), check=False).strip()
-    if base:
-        return base
-    # --verify --quiet：HEAD 不存在时返回空串而非报 "ambiguous argument 'HEAD'"
+def _head(work_dir):
+    """当前 HEAD 的 sha；仓库刚 git init、尚无任何提交时返回 ""。
+    --verify --quiet：HEAD 不存在时给空串而非报 "ambiguous argument 'HEAD'"。"""
     return _git(work_dir, "rev-parse", "--verify", "--quiet", "HEAD", check=False).strip()
 
 
-def _snapshot_commit(work_dir, base):
-    """把当前工作树快照成一个游离提交，返回其 sha。base 为父提交；base 为空
-    （仓库刚 git init、尚无任何提交）时生成无父的 root 提交，全量纳入工作树。
-    用临时 GIT_INDEX_FILE，绝不触碰用户真实 index / 分支。"""
-    fd, idx = tempfile.mkstemp(prefix="feishu-sync-idx-")
-    os.close(fd)
-    env = {"GIT_INDEX_FILE": idx, **_IDENTITY}
-    try:
-        if base:
-            _git(work_dir, "read-tree", base, env=env)   # 临时 index 以 base 为起点
-        else:
-            # base 为空（空仓库）：初始化一个合法的空 index（mkstemp 的 0 字节文件 git 不认）
-            _git(work_dir, "read-tree", "--empty", env=env)
-        _git(work_dir, "add", "-A", env=env)          # 纳入增删改（尊重 .gitignore）
-        tree = _git(work_dir, "write-tree", env=env).strip()
-        parent = ["-p", base] if base else []          # 无 base 则生成 root 提交
-        commit = _git(work_dir, "commit-tree", tree, *parent,
-                      "-m", "feishu-sync snapshot", env=env).strip()
-        return commit
-    finally:
-        try:
-            os.remove(idx)
-        except OSError:
-            pass
+def _identity_env(work_dir):
+    """用户已配 user.email 就用用户身份提交（提交进的是用户自己的历史），未配才回退。"""
+    email = _git(work_dir, "config", "--get", "user.email", check=False).strip()
+    name = _git(work_dir, "config", "--get", "user.name", check=False).strip()
+    return {} if (email and name) else dict(_FALLBACK_IDENTITY)
+
+
+def has_local_changes(work_dir):
+    """工作树/暂存区相对 HEAD 是否有改动（含未跟踪文件，尊重 .gitignore）。"""
+    return bool(_git(work_dir, "status", "--porcelain").strip())
+
+
+def commit_worktree(work_dir, message):
+    """把当前工作树改动在**当前分支**上真实提交一次，返回新 commit sha；无改动返回 ""。
+
+    `git add -A` 会把用户暂存区一并纳入（方案取舍：同步即提交）。`--no-verify` +
+    关闭 gpg 签名，避免 pre-commit hook / 签名配置让同步失败或改动文件导致状态错位。
+    空仓库（尚无提交）时生成 root 提交。
+    """
+    if not has_local_changes(work_dir):
+        return ""
+    env = _identity_env(work_dir)
+    _git(work_dir, "add", "-A", env=env)      # 纳入增删改（尊重 .gitignore）
+    _git(work_dir, "-c", "commit.gpgsign=false", "commit", "--no-verify",
+         "-m", (message or DEFAULT_MESSAGE), env=env)
+    return _head(work_dir)
+
+
+def _log_subjects(work_dir, base, head, limit=10):
+    """列出 base..head（base 为空则取 head 全部历史）的提交摘要，供群消息展示。
+    返回 [(sha12, subject), ...]，最多 limit 条。"""
+    rev = f"{base}..{head}" if base else head
+    out = _git(work_dir, "log", f"-{limit}", "--format=%h %s", rev, check=False)
+    items = []
+    for line in out.strip().splitlines():
+        sha, _, subject = line.partition(" ")
+        items.append((sha, subject))
+    return items
+
+
+def _is_ancestor(work_dir, a, b):
+    """a 是否是 b 的祖先（`merge-base --is-ancestor` 靠退出码表达，不能看 stdout）。"""
+    return subprocess.run(["git", "merge-base", "--is-ancestor", a, b],
+                          cwd=work_dir, capture_output=True).returncode == 0
+
+
+def _count_commits(work_dir, base, head):
+    rev = f"{base}..{head}" if base else head
+    out = _git(work_dir, "rev-list", "--count", rev, check=False).strip()
+    return int(out) if out.isdigit() else 0
 
 
 def _next_seq(work_dir, chat_id):
@@ -127,51 +156,64 @@ def _next_seq(work_dir, chat_id):
     return n
 
 
-def incremental_bundle(work_dir, chat_id, out_path):
-    """生成「上次同步以来」的增量 bundle，写入 out_path。
+def incremental_bundle(work_dir, chat_id, out_path, message=None):
+    """先把工作树改动在本地提交（message 为提交说明），再生成「上次同步以来」的增量
+    bundle 写入 out_path。
 
-    返回 {"seq": int, "base": str, "snap": str, "tip_ref": str}；无改动时返回 None。
-    成功生成后基线 ref 前移到本次快照（即已计入「已发送」），故下轮只含新增改动。
+    返回 {"seq", "base", "tip", "tip_ref", "new_commit", "n_commits", "commits"}；
+    无任何待同步提交时返回 None。成功后基线 ref 前移到 HEAD，故下轮只含新增提交。
+    基线不是 HEAD 祖先（历史被改写）时抛 RuntimeError，提示改用 /resync。
     """
     ref = _ref(chat_id)
-    base = _base_commit(work_dir, chat_id)   # 空仓库(无提交)时为 ""
+    base = _git(work_dir, "rev-parse", "--verify", "--quiet", ref, check=False).strip()
 
-    snap = _snapshot_commit(work_dir, base)
-    # 有基线：diff 基线→快照判断有无改动；无基线(空仓库)：看快照里是否有文件
-    if base:
-        changed = _git(work_dir, "diff", "--stat", base, snap).strip()
-    else:
-        changed = _git(work_dir, "ls-tree", "-r", "--name-only", snap).strip()
-    if not changed:
-        return None
+    new_commit = commit_worktree(work_dir, message)
+    head = _head(work_dir)
+    if not head:
+        return None                    # 空仓库且无任何可提交文件
+    if base == head:
+        return None                    # 没有新提交，无需同步
+    if base and not _is_ancestor(work_dir, base, head):
+        raise RuntimeError(
+            f"同步基线 {base[:12]} 不是当前 HEAD {head[:12]} 的祖先"
+            "（本机历史被 rebase/reset/切分支改写过），增量已无法快进。"
+            "本轮改动已提交到本地、不会丢，发 /resync 全量拉平即可同步出去。")
 
     tip_ref = _tip_ref(chat_id)
-    _git(work_dir, "update-ref", tip_ref, snap)
+    _git(work_dir, "update-ref", tip_ref, head)
     # 有基线打 base..tip 的增量；无基线则打包全部可达历史（首轮=全量）
     rev = f"{base}..{tip_ref}" if base else tip_ref
     _git(work_dir, "bundle", "create", out_path, rev)
 
-    _git(work_dir, "update-ref", ref, snap)   # 基线前移，本次改动计入「已发送」
+    commits = _log_subjects(work_dir, base, head)
+    n = _count_commits(work_dir, base, head)
+    _git(work_dir, "update-ref", ref, head)   # 基线前移，本次提交计入「已发送」
     seq = _next_seq(work_dir, chat_id)
-    return {"seq": seq, "base": (base[:12] if base else "(空仓库)"),
-            "snap": snap[:12], "tip_ref": tip_ref}
+    return {"seq": seq, "base": (base[:12] if base else "(全量首轮)"),
+            "tip": head[:12], "tip_ref": tip_ref,
+            "new_commit": bool(new_commit), "n_commits": n, "commits": commits}
 
 
-def full_bundle(work_dir, chat_id, out_path):
-    """生成不依赖增量基线的全量 bundle（含快照可达的完整历史），写入 out_path。
+def full_bundle(work_dir, chat_id, out_path, message=None):
+    """先在本地提交工作树改动，再生成不依赖增量基线的全量 bundle（HEAD 可达的完整
+    历史），写入 out_path。
 
-    用于 /resync：不管远程此前处于什么状态，远程 fetch 后 `reset --hard` 到这份
-    快照即可强制与本机当前工作树拉平，作为「怀疑基线偏了」时的恢复手段。
-    成功后同样把基线 ref 前移到本次快照，后续增量同步从这里重新计起。
+    用于 /resync：不管远程此前处于什么状态，远程 fetch 后 `reset --hard` 到本机 HEAD
+    即可强制拉平，作为「怀疑基线偏了 / 本机历史被改写」时的恢复手段。
+    成功后基线 ref 前移到 HEAD，后续增量同步从这里重新计起。
     """
     ref = _ref(chat_id)
-    base = _base_commit(work_dir, chat_id)   # 空仓库(无提交)时为 ""，snapshot 生成 root 提交
-    snap = _snapshot_commit(work_dir, base)
+    new_commit = commit_worktree(work_dir, message)
+    head = _head(work_dir)
+    if not head:
+        return None                    # 空仓库且无任何可提交文件
 
     tip_ref = _tip_ref(chat_id)
-    _git(work_dir, "update-ref", tip_ref, snap)
+    _git(work_dir, "update-ref", tip_ref, head)
     _git(work_dir, "bundle", "create", out_path, tip_ref)   # 不带 base..，打包全部可达历史
 
-    _git(work_dir, "update-ref", ref, snap)
+    commits = _log_subjects(work_dir, "", head, limit=5)
+    _git(work_dir, "update-ref", ref, head)
     seq = _next_seq(work_dir, chat_id)
-    return {"seq": seq, "snap": snap[:12], "tip_ref": tip_ref}
+    return {"seq": seq, "tip": head[:12], "tip_ref": tip_ref,
+            "new_commit": bool(new_commit), "commits": commits}
