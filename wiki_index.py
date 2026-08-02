@@ -96,8 +96,16 @@ def chunk_markdown(md, meta):
             sections.append((list(stack), text))
         buf.clear()
 
+    in_code = False
     for line in body.splitlines():
-        m = _HEADING_RE.match(line.strip())
+        stripped = line.strip()
+        # 代码块内不认标题：shell 注释 `# xxx` 在排障文档里遍地都是，
+        # 不跟踪围栏就会被误判成小节边界，在条目中间切一刀
+        if stripped.startswith("```") or stripped.startswith("~~~"):
+            in_code = not in_code
+            buf.append(line)
+            continue
+        m = None if in_code else _HEADING_RE.match(stripped)
         if m:
             flush()
             level, title = len(m.group(1)), m.group(2).strip()
