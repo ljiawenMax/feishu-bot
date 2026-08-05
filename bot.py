@@ -24,6 +24,7 @@ import uploads
 import usage
 import wiki_index
 import wiki_sync
+from ops import snapshot as ops_snapshot
 
 # Claude 标准上下文窗口大小（token）；用于 /context 计算占用百分比
 CONTEXT_WINDOW = 200000
@@ -74,6 +75,7 @@ HELP_TEXT = "\n".join([
     "non-fast-forward 时用这个恢复）",
     "/debate <辩题> — 正反方各5轮辩论（每轮实时推送）",
     "/wiki [sync|search <词>|spaces] — 飞书知识库：查看状态 / 立即同步 / 调试检索 / 列空间",
+    "/restart   — 重启 feishu-bot 服务（带外自救；起来后各群会收到启动通知）",
     "/help      — 显示此帮助",
 ])
 
@@ -171,6 +173,7 @@ class Bot:
             "/resync": self.cmd_resync,
             "/debate": self.cmd_debate,
             "/wiki": self.cmd_wiki,
+            "/restart": self.cmd_restart,
         }
 
     # ------------------------------------------------------------------ DB
@@ -463,6 +466,33 @@ class Bot:
         feishu_api.reply_message(self.client, msg["id"], text)
         print(f"[{self.name}][usage] queried")
 
+    def cmd_restart(self, msg, arg):
+        """重启整个 feishu-bot 服务（带外自救通道）。
+
+        **必须交给 systemd-run 起的一次性 unit 去执行**：命令是在 feishu-bot.service 的
+        cgroup 里跑的，直接 `systemctl restart` 会把整个 cgroup（含发命令的这个线程）一起
+        杀掉——表现为无声消失、连回执都发不出去。transient unit 在 cgroup 外，本进程被杀
+        是预期行为。sleep 2 是留给回执的发送窗口。
+        """
+        unit = f"feishu-bot-restart-{int(time.time())}"
+        cmd = ["sudo", "-n", "systemd-run", "--collect", "--no-block", f"--unit={unit}",
+               "/bin/sh", "-c", "sleep 2; systemctl restart feishu-bot.service"]
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        except Exception as e:
+            feishu_api.reply_message(self.client, msg["id"], f"[error] 重启失败: {e}")
+            return
+        if r.returncode != 0:
+            feishu_api.reply_message(self.client, msg["id"],
+                                     f"[error] 重启失败: {(r.stderr or r.stdout).strip()[:400]}")
+            return
+        feishu_api.reply_message(
+            self.client, msg["id"],
+            "🔄 已请求重启服务（2 秒后执行）。\n"
+            "起来后各群会收到「✅ 已启动」通知；一分钟内没收到就是没起来。\n"
+            "注意：重启期间的消息飞书不会补发。")
+        print(f"[{self.name}][restart] scheduled unit={unit}")
+
     def cmd_del(self, msg, arg):
         data = self.sessions
         if not arg.isdigit():
@@ -574,7 +604,7 @@ class Bot:
             result, sid, _ = claude_runner.run_claude(
                 prompt, self.work_dir, min(self.task_timeout, 300),
                 session_id=None, permit=False, extra_dirs=[], history=None,
-                model=COMPACT_MODEL, unsafe=False)
+                model=COMPACT_MODEL, unsafe=False, report_actions=False)
         except Exception as e:
             print(f"[{self.name}][compact-error] {e}")
             return None
@@ -923,6 +953,11 @@ class Bot:
         # 锁外：长耗时执行 + 心跳（此期间主循环命令不被阻塞）
         # 全局并发闸：不同 chat_id 可并行，但同时运行的 claude 进程数受 run_slot 上限约束；
         # 心跳在闸外启动，等待空位期间也会回「仍在处理中」。elapsed 只计实际执行、不含排队等待。
+        # 回滚基线（方案 b）：在 claude 动手**之前**拍一份主程序目录的快照，本轮 LLM 成功后
+        # 才把它转正为 known-good。必须是「动手前」——写坏配置的那一轮它自己往往是成功的
+        # （正是它写坏的），拿完成时刻的状态当基线会把污染态存成 known-good。详见 ops/snapshot.py。
+        snap_id = ops_snapshot.take_quiet()
+
         stop = self._start_heartbeat(msg_id)
         try:
             with self.run_slot:
@@ -944,6 +979,12 @@ class Bot:
         self.db(db.record_audit, self.chat_id, "llm", "retry" if is_retry else "task",
                 message_id=msg_id, ok=not is_err, model=used_model,
                 elapsed_ms=int(elapsed * 1000), chars=len(result), detail=result[:2000])
+
+        # 本轮 LLM 成功 = 这轮开跑时的状态被真实流量证明可用 → 转正为回滚基线。
+        # 用真实流量当健康信号，零成本、零延迟、不烧额度；判据必须是「有成功」而不是
+        # 「没失败」——没有调用时「没失败」恒真，会把污染态直接存成基线。
+        if not is_err:
+            ops_snapshot.promote_quiet(snap_id)
 
         # 锁内：更新对话历史（保留最近 20 轮）+ 审计；成功后清除已消费的压缩 seed
         with self.lock:
@@ -1219,7 +1260,10 @@ class Bot:
                 f"  git fetch ./{fname} {info['tip_ref']}:sync-incoming",
                 "  git merge --ff-only sync-incoming",
                 "  git branch -d sync-incoming",
-                "若上面报 \"not possible to fast-forward\"，说明基线和远程实际状态不一致，改发 /resync 全量拉平。",
+                "若上面报 \"not possible to fast-forward\"（远程有本机没有的提交、两边历史分叉）：",
+                "  · 想保留两边历史、生成一个 merge commit（代码基本一致时通常自动合，改到同处才会冲突，解决后 git commit 即可）：",
+                "      git merge --no-ff sync-incoming && git branch -d sync-incoming",
+                "  · 想直接以本机为准、丢弃远程本地分叉：改发 /resync 全量拉平（远程 reset --hard）。",
             ])
         try:
             file_key = feishu_api.upload_file(self.client, path, fname)

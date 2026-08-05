@@ -35,10 +35,71 @@ WIKI_SYSTEM_PROMPT = (
 )
 
 
+# ---------------------------------------------------------------- 本轮动作回报
+#
+# stream-json 的 assistant 消息里 content 是一组块：`text` 是它**说**的话，`tool_use` 是它
+# **做**的事。只收 text 的话，飞书里永远只看得到「它说了什么」，看不到「它做了什么」——
+# 2026-08-04 的事故正是这样：那一轮实际发生了一个 Write 写进 .claude/settings.local.json
+# 把 LLM 通道打瘫，而回复读起来只像一段配置建议，没人看得出文件已经落到磁盘上了。
+#
+# 只报「写」和「执行」，不报 Read/Grep/Glob：只读操作量大且无风险，全报会把正文淹掉。
+# Bash 必须报——群里 /unsafe 常开，能跑任意命令，这恰恰最该被看见。
+# 绝不回显 Write 的 content / Edit 的 new_string：可能很大，也可能含密钥。
+WRITE_TOOLS = ("Write", "Edit", "MultiEdit", "NotebookEdit", "Update")
+ACTIONS_MAX = 8          # 超出折叠，避免撑爆飞书分段
+BASH_MAX_CHARS = 90
+
+
+def _collect_action(block, actions):
+    name, inp = block.get("name"), block.get("input") or {}
+    if not isinstance(inp, dict):
+        return
+    if name in WRITE_TOOLS:
+        path = inp.get("file_path") or inp.get("notebook_path")
+        if path:
+            actions.append(("write", str(path)))
+    elif name == "Bash":
+        cmd = (inp.get("command") or "").strip()
+        if cmd:
+            actions.append(("bash", " ".join(cmd.split())))
+
+
+def format_actions(actions, work_dir):
+    """把本轮动作拼成一段附在回复末尾。去重（同一文件改 5 次只报一次）+ 截断。"""
+    seen, uniq = set(), []
+    for kind, detail in actions:
+        key = (kind, detail)
+        if key in seen:
+            continue
+        seen.add(key)
+        uniq.append((kind, detail))
+    if not uniq:
+        return ""
+    lines = ["", "━━━━━━━━━━", "📝 本轮动作"]
+    for kind, detail in uniq[:ACTIONS_MAX]:
+        if kind == "write":
+            try:
+                shown = os.path.relpath(detail, work_dir)   # 绝对路径太长会刷屏
+            except ValueError:
+                shown = detail
+            if shown.startswith(".."):                      # 落在 work_dir 之外，保留绝对路径才看得出越界
+                shown = detail
+            lines.append(f"  ✏️ 写入 {shown}")
+        else:
+            cmd = detail if len(detail) <= BASH_MAX_CHARS else detail[:BASH_MAX_CHARS] + "…"
+            lines.append(f"  ▶️ {cmd}")
+    if len(uniq) > ACTIONS_MAX:
+        lines.append(f"  …等 {len(uniq)} 项")
+    return "\n".join(lines)
+
+
 def run_claude(task, work_dir, timeout, session_id=None, permit=False, extra_dirs=None,
-               history=None, model=None, unsafe=False, extra_system=None):
+               history=None, model=None, unsafe=False, extra_system=None,
+               report_actions=True):
     """extra_system：追加一段系统提示（CLI 支持多次 --append-system-prompt）。
-    知识库回答策略走这里，不动通用的 SYNC_SYSTEM_PROMPT。"""
+    知识库回答策略走这里，不动通用的 SYNC_SYSTEM_PROMPT。
+    report_actions：把本轮的写/执行动作附在返回文本末尾（见 format_actions）；
+    压缩摘要那类「产物要原样当上下文用」的调用要关掉，否则动作清单会混进摘要。"""
     cmd = ["claude", "-p", task, "--output-format", "stream-json", "--verbose",
            "--append-system-prompt", SYNC_SYSTEM_PROMPT]
     if extra_system:
@@ -66,8 +127,12 @@ def run_claude(task, work_dir, timeout, session_id=None, permit=False, extra_dir
         timed_out = True
 
     text_parts = []
+    actions = []       # 本轮的写/执行动作，附在回复末尾（见 format_actions）
     new_session_id = None
     used_model = None  # 实际产出答复的主模型（取最后一条 assistant 的 model）
+
+    def tail():
+        return format_actions(actions, work_dir) if report_actions else ""
 
     for line in stdout.splitlines():
         line = line.strip()
@@ -101,10 +166,11 @@ def run_claude(task, work_dir, timeout, session_id=None, permit=False, extra_dir
                         extra_dirs=extra_dirs,
                         model=model,
                         unsafe=unsafe,
-                        extra_system=extra_system
+                        extra_system=extra_system,
+                        report_actions=report_actions,
                     )
 
-                return f"[error] {error_message}", None, used_model
+                return f"[error] {error_message}" + tail(), None, used_model
             new_session_id = event.get("session_id")
             result = event.get("result") or "".join(text_parts).strip()
             # result 为空说明 session 状态异常（如权限拒绝后的残留），清掉重跑
@@ -114,23 +180,28 @@ def run_claude(task, work_dir, timeout, session_id=None, permit=False, extra_dir
                     recovered_task = build_task_with_history(task, history or [])
                     return run_claude(recovered_task, work_dir, timeout, session_id=None,
                                       permit=permit, extra_dirs=extra_dirs, model=model,
-                                      unsafe=unsafe, extra_system=extra_system)
+                                      unsafe=unsafe, extra_system=extra_system,
+                                      report_actions=report_actions)
                 return "(no output)", new_session_id, used_model
             if timed_out:
                 result += f"\n\n[超时（>{timeout}s），响应可能不完整]"
-            return result, new_session_id, used_model
+            return result + tail(), new_session_id, used_model
         elif etype == "assistant":
             msg = event.get("message", {})
             if msg.get("model"):
                 used_model = msg["model"]
             for block in msg.get("content", []):
-                if isinstance(block, dict) and block.get("type") == "text":
+                if not isinstance(block, dict):
+                    continue
+                if block.get("type") == "text":
                     text_parts.append(block.get("text", ""))
+                elif block.get("type") == "tool_use":
+                    _collect_action(block, actions)
 
     result = "".join(text_parts).strip() or stderr.strip() or "(no output)"
     if timed_out:
         result += f"\n\n[超时（>{timeout}s），以上为已生成内容]"
-    return result, new_session_id, used_model
+    return result + tail(), new_session_id, used_model
 
 def format_claude_error(event):
     status = event.get("api_error_status")

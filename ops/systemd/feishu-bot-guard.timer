@@ -1,0 +1,14 @@
+[Unit]
+Description=Run feishu-bot watchdog periodically
+
+[Timer]
+# 开机后 10 分钟起跑（等 feishu-bot 与 mihomo 稳定），此后每 10 分钟一次。
+# 判定窗口是 6 小时、阈值 2 次失败，所以间隔不必短：故障从第 2 次失败起才可判定，
+# 快也快不过用户自己发下一条消息。
+OnBootSec=10min
+OnUnitActiveSec=10min
+# oneshot 用 timer 周期拉起，等价于常驻进程的 Restart=——看门狗自己不会悄悄死掉
+Persistent=true
+
+[Install]
+WantedBy=timers.target

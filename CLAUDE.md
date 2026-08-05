@@ -20,7 +20,9 @@
 - `gitsync.py` — 增量同步：把每个 chat 工作目录的改动**在本地真实提交**（commit message = 本轮飞书任务内容），再把「上次同步以来」的提交打包成增量 `git bundle`（供远程 `git fetch` + `merge --ff-only`；`/resync` 用全量 bundle + `reset --hard` 兜底恢复）
 - `wiki_sync.py` — 飞书知识库 → 本地 markdown 镜像：列知识空间、递归走节点树、docx **block → markdown**（保留标题层级）、按 `obj_edit_time` 增量同步；也可作自检 CLI 独立运行
 - `wiki_index.py` — 知识库索引与检索：按标题小节切块、ollama 取向量、**向量 + MySQL ngram 全文双路 RRF 混合召回**；刻意不依赖 Bot/飞书，将来可整个文件搬走
-- `claude_runner.py` — 调用 `claude` CLI、解析 stream-json、删除磁盘 session 文件
+- `claude_runner.py` — 调用 `claude` CLI、解析 stream-json（含 `tool_use` → 本轮动作回报）、删除磁盘 session 文件
+- `ops/` — 运维面（**刻意不 import 任何项目模块**，见下「自动回滚」）：`snapshot.py` 快照/回滚、
+  `guard.py` 看门狗、`notify.py` 独立告警通道、`envfile.py` 独立 env 解析、`systemd/` unit 模板
 - `.env` — 配置模板（入 git）；`.env.local` — 实际配置（不入 git）
 
 配置统一为 `.env.local`（默认），含共享项 + `BOTS` JSON 列表。
@@ -143,9 +145,82 @@ bundle 传的是真实 git 对象，`fetch`/`merge --ff-only` 要么整体成功
 - **不要用表格承载问题清单**（整表常是一个 block 切不开，每行又太短）。
 - **过期条目及时删除或标注「已废弃」**——检索不区分新旧，陈旧答案会被照样召回当依据。
 
+**启动 / 恢复通知（`STARTUP_NOTIFY`，默认开）**：长连接就绪后主动往群里推一条
+「✅ 已启动」（含时间、启动耗时、`env`/`pid`、代码版本 = 本仓库 HEAD 短 hash + 提交标题），
+改完重启不用盯 `journalctl` 也知道服务起没起来、起的是哪一版。之后每次**断线重连成功**再推
+「🔄 已恢复」。实现在 `feishu_claude.watch_connection`：SDK 只在*重连*成功时回调
+`on_reconnected`、首连不回调，故首连靠后台线程轮询 `ws._conn`（私有属性，读不到时按已就绪处理），
+且**不设超时**——连上多晚都发；首连若走了重连路径，`ready` 未置位时 `on_reconnected` 直接返回，
+不会重复发。`on_reconnected` 跑在 ws 事件循环里，发消息（阻塞 HTTP）必须丢线程，否则掀翻连接。
+通知走 `feishu_api.send_text`（`im.v1.message.create` + `receive_id_type=chat_id`，主动发、
+不针对某条消息回复）。两种通知都带一句「未运行/断线期间的消息不会补处理」——飞书不补发事件。
+**通知范围** `STARTUP_NOTIFY_BOTS`（按 name 或 chat_id，逗号分隔；留空=所有群）：多个群共用一条
+长连接时，重启一次会把每个群都刷一遍，故本机只发给 `feishu-bot` 那个群（work_dir 即本项目，当运维群）。
+
+**本轮动作回报（`claude_runner.format_actions`）**：stream-json 的 assistant 消息里 `content` 是
+一组块，`text` 是它**说**的话、`tool_use` 是它**做**的事。旧版只收 `text`，于是飞书里永远只看得到
+前者——2026-08-04 的事故正是这样：那一轮实际发生了一个 `Write` 写进项目级
+`.claude/settings.local.json`（把 `ANTHROPIC_BASE_URL` 指向一个连不上的内网网关，该 bot 此后
+每次调 LLM 都 ECONNRESET、持续 11 小时无人察觉），而回复读起来只像一段配置建议。现在回复末尾会附
+「📝 本轮动作」，列出**写**（Write/Edit/MultiEdit/NotebookEdit → 文件名）与**执行**（Bash → 命令）。
+取舍：不报 `Read`/`Grep`/`Glob`（只读、量大，全报会淹没正文）；`Bash` 必须报（`/unsafe` 常开，
+能跑任意命令，这恰恰最该被看见）；**绝不回显 `Write` 的 content 或 `Edit` 的 new_string**（可能很大、
+也可能含密钥），只报文件名；路径显示成相对 work_dir 的形式，但**落在 work_dir 之外时保留绝对路径**
+——越界正是最需要看见的；去重 + 超 8 条折叠。压缩摘要那类调用传 `report_actions=False`，否则动作
+清单会混进摘要被当成上下文。
+
+**自动回滚（`ops/`，独立 systemd unit）**：把「重启后有异常就回滚」从 prompt 约定提取成基础设施。
+prompt 约定从原理上不成立——Claude 在飞书 bot 群里被调用时它自己就是 `feishu-bot.service` 的子进程，
+执行 `systemctl restart` 会把整个 cgroup（含它自己）一起杀掉（exit 144、无输出），**承诺回滚的执行者
+在能验证之前就死了**。所以回滚交给 `feishu-bot-guard.service` + `.timer`（每 10 分钟，oneshot），
+它在那个 cgroup 之外。
+
+- **保护范围只有本项目目录**（含 `.env.local` / `.claude/`，排除 `.venv`、`__pycache__`、`.git`）。
+  其余 9 个 work_dir 不进快照——它们跑的是同一份代码，主程序活着就能通过飞书把它们修回来；而
+  work_dir 里全是用户数据（resume 档案、stock 数据、wiki 索引），回滚等于删用户的东西。
+  `.git` 同理排除：回滚它会把真实提交历史和 gitsync 的基线 ref 一起倒回去，且能规避「rsync 撞上
+  并发 git commit 拍到半写状态」。代价是回滚后工作树与 HEAD 不一致，下轮 gitsync 会把这次回滚
+  作为一个正常提交记进历史——反而更诚实。
+- **基线 = 「某一轮任务动手之前」的状态**，不是「上次重启前」也不是「当前状态」。`bot.py` 在调
+  `run_claude` **之前** `take()`，该轮 LLM 成功后才 `promote()` 转正。这是整套设计的支点：写坏配置
+  的那一轮它自己往往是成功的（正是它写坏的），拿完成时刻的状态当基线会把污染态存成 known-good，
+  回滚过去等于没回滚。快照走 rsync `--link-dest` 硬链去重，实测 86ms / 380K，每轮任务拍一次不心疼。
+- **健康信号用真实流量的成功记录**（`audit_logs` 里 `kind='llm'` 的 `ok`），零成本、零延迟、不烧额度。
+  判据必须是「**有成功**」而不是「没失败」——没有调用时「没失败」恒真，基线会被当场毒化。
+- **触发判定按 chat 分组**：某个 chat 在 6 小时窗口内失败 ≥2 次**且零成功**。不能用全局统计——事故当天
+  10 个 bot 里只有 1 个全挂、其余 9 个全程正常，全局会被稀释成「窗口内有成功」，看门狗根本不触发。
+- **另一条判据：服务本身没在运行**。上面那条盖不住「服务整个起不来」——那时不会再产生任何 LLM 记录，
+  窗口里空空如也、`sick` 为空，看门狗会一声不吭地放过去。故先查 `systemctl is-active`：`failed`/
+  `inactive` 直接进分诊；`activating`/`reloading` 属正常启停中间态**必须单列跳过**（`ExecStartPre`
+  探代理最多花 90 秒，把它当成死了会在每次正常重启的窗口里误触发回滚）。服务死掉时网络判据仍然要跑
+  ——`ExecStartPre` 探代理失败正是最常见的起不来原因，那是外部故障，回滚治不了。
+- **分诊**（回滚只治文件，治不了外部故障）：错误文案含额度字样 → 只告警；`curl api.anthropic.com`
+  返回非 401/405（403=被当中国大陆，000=代理挂）→ 只告警；两关都过才回滚。
+- **回滚只做一次**：防抖标记记住基线 id，同一基线回滚过还失败就停手等人工，避免重启死循环。回滚前把
+  现场整份另存 `rejected-<ts>/` 不删——事后要 diff 才知道到底哪一轮写了什么。
+- 回滚后 `restart` → 等 45s → **canary**（在项目目录里真跑一次 `claude -p`）→ 推飞书。服务 `active`
+  不算验证通过：事故当天进程也一直 active。
+- 告警走 `ops/notify.py`：自带凭证、只用标准库 urllib，**不依赖 bot 进程活着**——服务挂了正是最需要
+  告警的时刻。同理整个 `ops/` 不 import 任何项目模块（import 会拖进 db/feishu_api/bot 整条链，其中
+  任意一个坏掉救援脚本自己先起不来）。告警目标由 `GUARD_NOTIFY_BOT` 指定（BOTS 里的 name，留空取第一项）。
+
+```bash
+./ops/install-guard.sh                          # 安装/更新 unit + timer
+.venv/bin/python ops/guard.py --status          # 看窗口内各 chat 的 LLM 成败与当前基线
+.venv/bin/python ops/guard.py --dry-run         # 演练：只判定与打印，不回滚不重启
+.venv/bin/python ops/snapshot.py list|diff      # 快照列表 / 当前状态与基线的差异文件
+.venv/bin/python ops/snapshot.py rollback       # 手动回滚（回滚后需自己 restart）
+```
+
+另有一道内核级防线（与上面互补）：`feishu-bot.service` 的
+`ReadOnlyPaths=/home/ljiawen/project/feishu-bot/.claude`。`--dangerously-skip-permissions` 拆掉的
+是 Claude Code 自己的许可闸，而 `ReadOnlyPaths` 是 mount namespace 只读挂载，claude 绕不过，写入直接
+`EROFS`——这是 `unsafe` 常开状态下唯一还生效的防线。⚠️ **绝不要把它指到 `~/.claude`**：memory、
+session jsonl、OAuth `.credentials.json`（每次刷新都在写）全在那里，锁了服务直接废掉。
+
 `task_timeout` / `heartbeat_interval` / `models` / `max_concurrent` / `auto_compact_threshold`
-/ `wiki_cache_dir` / `wiki_sync_interval` / `wiki_embed_url` / `wiki_embed_model`
-为共享项，写在 `.env.local` 顶层。
+/ `startup_notify` / `guard_notify_bot` / `wiki_cache_dir` / `wiki_sync_interval` / `wiki_embed_url`
+/ `wiki_embed_model` 为共享项，写在 `.env.local` 顶层。
 
 **context 护栏（省额度）**：每轮 `--resume` 都会把整段对话重喂给模型，忘了 `/new` 时 context
 越滚越大、每轮重复烧订阅额度。为此：①每条回复 inline 附带 `ctx N%`，越阈值（60/80%）追加分级提醒；
@@ -199,7 +274,14 @@ journalctl -u feishu-bot.service -n 50 --no-pager
 > 若尚未把服务加入 systemd（无 `feishu-bot.service`），可退回用脚本重启：
 > `./restart.sh local`（按 `--env` 区分 PID/日志）。
 
-启动成功会打印 `connected to wss://...`（每个 app_id 一条）。
+> ⚠️ **自杀式重启陷阱**：在飞书 bot 群里被调用的 Claude，自己就是 `feishu-bot.service` 的子进程，
+> 直接 `systemctl restart` 会把整个 cgroup（含它自己和正在跑的 bash）一起杀掉——表现为 exit 144、
+> 无任何输出，连回执都发不出去。群里要重启就用 **`/restart` 命令**：它把重启交给
+> `systemd-run --collect --no-block` 起的一次性 unit（在 cgroup 之外）延迟 2 秒执行，
+> 回执先发出去，本进程被杀是预期行为。
+
+启动成功会打印 `connected to wss://...`（每个 app_id 一条），并往 `STARTUP_NOTIFY_BOTS`
+指定的群（本机=`feishu-bot` 群）推一条「✅ 已启动」通知——重启后不用盯日志，群里没收到就是没起来。
 
 ## 提交规范
 

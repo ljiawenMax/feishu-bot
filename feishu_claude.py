@@ -10,7 +10,9 @@ app_id 时共享这一条连接。每个 Bot 有自己的 inbox+worker 线程，
 import argparse
 import json
 import os
+import subprocess
 import threading
+import time
 from collections import OrderedDict
 
 import db
@@ -18,6 +20,8 @@ import feishu_api
 from bot import Bot
 
 BASE_DIR = os.path.dirname(__file__)
+
+WS_POLL_INTERVAL = 0.5  # 轮询长连接就绪状态的间隔（秒）
 
 
 def _bracket_balance(text):
@@ -65,6 +69,12 @@ def load_env_file(env_name):
     return env_vars
 
 
+def _as_bool(value, default):
+    if value is None or not str(value).strip():
+        return default
+    return str(value).strip().lower() not in ("0", "false", "no", "off")
+
+
 def load_config(env_name):
     """解析 .env.<name> 为 {db, task_timeout, bots:[...]}。"""
     env = load_env_file(env_name)
@@ -82,6 +92,12 @@ def load_config(env_name):
         # 续聊 context 占用达此百分比即自动压缩（摘要后开新对话）；0 关闭，改由硬闸兜底
         "auto_compact_threshold": int(env.get("AUTO_COMPACT_THRESHOLD", 75)),
         "models": json.loads(env.get("MODELS") or '["opus","sonnet","haiku"]'),
+        # 长连接就绪后往群里推一条「已启动」通知（断线恢复后推「已恢复」）；改完重启时用它确认服务真起来了
+        "startup_notify": _as_bool(env.get("STARTUP_NOTIFY"), True),
+        # 只通知这些机器人（按 name 或 chat_id，逗号分隔）；留空=全部群都通知。
+        # 多个群共用一条长连接时，重启一次会把所有群都刷一遍，用它收敛到一个「运维群」
+        "startup_notify_bots": [x.strip() for x in (env.get("STARTUP_NOTIFY_BOTS") or "").split(",")
+                                if x.strip()],
         # 知识库 RAG 共享项：只有 BOTS 里配了 wiki 字段的机器人才会用到
         "wiki": {
             # 索引缓存目录：必须在 work_dir 之外——gitsync 每轮 `git add -A`，
@@ -94,6 +110,80 @@ def load_config(env_name):
         },
         "bots": json.loads(env["BOTS"]),
     }
+
+
+# ------------------------------------------------------------------ 启动 / 恢复通知
+
+def code_version():
+    """本服务代码的版本（HEAD 短 hash + 提交标题），非 git 仓库/取不到时返回空串。
+    通知里带上它，才能一眼确认「群里跑的是不是我刚改的那版」。"""
+    try:
+        r = subprocess.run(["git", "-C", BASE_DIR, "log", "-1", "--format=%h %s"],
+                           capture_output=True, text=True, timeout=5)
+        return r.stdout.strip() if r.returncode == 0 else ""
+    except Exception:
+        return ""
+
+
+def ws_connected(ws):
+    """长连接是否已建立。SDK 没有公开的连接状态，只能读私有 `_conn`；
+    读不到属性（SDK 改版）时按「已就绪」处理——宁可通知早一点，也不要永远不通知。"""
+    return getattr(ws, "_conn", "unknown") is not None
+
+
+def pick_notify_bots(bots, allow):
+    """从一条长连接下的 bots 里挑出要通知的：allow 为空=全部，否则按 name / chat_id 精确匹配。"""
+    if not allow:
+        return list(bots)
+    return [b for b in bots if b.name in allow or b.chat_id in allow]
+
+
+def notify_chats(bots, text_of, tag):
+    """往每个 bot 的群发一条通知。text_of(bot) 返回该群的文本——同一条长连接下
+    可能挂着多个群，各群只该看到自己那台机器人的信息。"""
+    for b in bots:
+        feishu_api.send_text(b.client, b.chat_id, text_of(b), tag=tag)
+
+
+def watch_connection(ws, bots, env_name, started_at, enabled=True):
+    """为一条长连接挂上通知：就绪后往其下各群推「已启动」，之后每次断线重连成功推「已恢复」。
+
+    首连成功由后台线程轮询 `_conn` 发现（SDK 只在*重连*成功时回调 on_reconnected，
+    首连不回调），不设超时——连上多晚都发，进程退出时 daemon 线程自然结束。"""
+    if not enabled or not bots:
+        return
+    ready = threading.Event()
+    version = code_version()
+
+    def watch():
+        while not ws_connected(ws):
+            time.sleep(WS_POLL_INTERVAL)
+        ready.set()
+        head = ["✅ feishu-bot 已启动，长连接就绪",
+                f"时间：{time.strftime('%Y-%m-%d %H:%M:%S')}"
+                f"（启动耗时 {time.time() - started_at:.1f}s）"]
+        tail = ([f"版本：{version}"] if version else []) + \
+               ["提示：进程未运行期间发的消息不会补处理，如有请重发。"]
+
+        def text_of(b):
+            return "\n".join(head + [f"机器人：{b.name}（env={env_name} pid={os.getpid()}）"] + tail)
+
+        notify_chats(bots, text_of, "startup")
+
+    threading.Thread(target=watch, name=f"notify-{bots[0].app_id[:8]}", daemon=True).start()
+
+    def on_reconnected():
+        # 该回调跑在 ws 的事件循环里、必须立刻返回；发消息是阻塞 HTTP，丢到线程做。
+        # 首连尚未就绪时不发（首连若走了重连路径，交给上面的 watch 发「已启动」，避免重复）。
+        if not ready.is_set():
+            return
+        text = ("🔄 feishu-bot 长连接已恢复\n"
+                f"时间：{time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+                "提示：断线期间飞书不补发事件，那段时间发的消息不会被处理，如有请重发。")
+        threading.Thread(target=notify_chats, args=(bots, lambda b: text, "reconnect"),
+                         daemon=True).start()
+
+    ws.on_reconnected = on_reconnected
 
 
 def pid_file(name):
@@ -118,6 +208,7 @@ def main():
     parser.add_argument("--env", default="local", help="配置名（读取 .env.<name>）")
     args = parser.parse_args()
 
+    started_at = time.time()
     cfg = load_config(args.env)
     engine = db.init_engine(cfg["db"])
     db.create_all(engine)
@@ -154,6 +245,11 @@ def main():
         b.start()
     ws_clients = [feishu_api.build_ws_client(aid, app_secrets[aid], app_chatmaps[aid])
                   for aid in api_clients]
+    # 每条连接就绪/恢复后往其下各群推通知（改完重启时不用盯日志也知道服务起没起来）
+    for aid, ws in zip(api_clients, ws_clients):
+        watch_connection(ws, pick_notify_bots(app_chatmaps[aid].values(),
+                                              cfg["startup_notify_bots"]),
+                         args.env, started_at, enabled=cfg["startup_notify"])
     threads = [threading.Thread(target=ws.start, name=f"ws-{i}", daemon=True)
                for i, ws in enumerate(ws_clients)]
     try:

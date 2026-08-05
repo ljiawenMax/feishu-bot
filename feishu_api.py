@@ -13,6 +13,8 @@ import lark_oapi as lark
 from lark_oapi.api.im.v1 import (
     CreateFileRequest,
     CreateFileRequestBody,
+    CreateMessageRequest,
+    CreateMessageRequestBody,
     GetMessageResourceRequest,
     ReplyMessageRequest,
     ReplyMessageRequestBody,
@@ -254,6 +256,41 @@ def reply_message(client, message_id, text, tag="reply"):
         except Exception as e:
             snd = {"ok": False, "code": None, "msg": str(e), "sent_id": None, "chars": len(chunk)}
             print(f"[feishu][{tag}][error] reply_to={message_id} {i+1}/{total} {e}")
+        sends.append(snd)
+    return SendResult(sends)
+
+
+def send_text(client, chat_id, text, tag="send"):
+    """主动往群里发一条文本消息（不针对某条消息回复，故不需要 message_id）。
+
+    用于「没有触发消息可回」的场景，如进程启动完成、长连接恢复的通知。
+    与 reply_message 一致：分段、审计每段响应、失败只记日志不抛出。"""
+    chunks = split_text(text)
+    total = len(chunks)
+    sends = []
+    for i, chunk in enumerate(chunks):
+        try:
+            req = (CreateMessageRequest.builder()
+                   .receive_id_type("chat_id")
+                   .request_body(CreateMessageRequestBody.builder()
+                                 .receive_id(chat_id)
+                                 .msg_type("text")
+                                 .content(json.dumps({"text": chunk}))
+                                 .build())
+                   .build())
+            resp = client.im.v1.message.create(req)
+            sent_id = resp.data.message_id if resp.data is not None else None
+            snd = {"ok": resp.success(), "code": resp.code, "msg": resp.msg,
+                   "sent_id": sent_id, "chars": len(chunk)}
+            if resp.success():
+                print(f"[feishu][{tag}][ok] chat={chat_id} {i+1}/{total} "
+                      f"sent_id={sent_id} chars={len(chunk)}")
+            else:
+                print(f"[feishu][{tag}][fail] chat={chat_id} {i+1}/{total} "
+                      f"code={resp.code} msg={resp.msg} log_id={resp.get_log_id()}")
+        except Exception as e:
+            snd = {"ok": False, "code": None, "msg": str(e), "sent_id": None, "chars": len(chunk)}
+            print(f"[feishu][{tag}][error] chat={chat_id} {i+1}/{total} {e}")
         sends.append(snd)
     return SendResult(sends)
 
