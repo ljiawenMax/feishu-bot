@@ -1,6 +1,6 @@
 [Unit]
 Description=feishu-bot watchdog: rollback to known-good on sustained LLM failure
-Documentation=file:///home/ljiawen/project/feishu-bot/HANDOVER-2026-08-04.md
+Documentation=file:///home/ljiawen/project/feishu-bot/ops/__init__.py
 After=network-online.target mihomo.service
 Wants=network-online.target mihomo.service
 
@@ -11,7 +11,7 @@ WorkingDirectory=/home/ljiawen/project/feishu-bot
 Environment=HOME=/home/ljiawen
 Environment=PATH=/home/ljiawen/.local/bin:/usr/local/bin:/usr/bin:/bin
 # 独立 unit —— 这是全部要害所在：看门狗必须在 feishu-bot.service 的 cgroup **之外**，
-# 否则它一执行 systemctl restart 就把自己连同正在跑的回滚一起杀掉（见 HANDOVER §3.2）。
+# 否则它一执行 systemctl restart 就把自己连同正在跑的回滚一起杀掉（见 ops/guard.py 模块注释）。
 # 同理这里不加 feishu-bot.service 那条 ReadOnlyPaths：回滚要能写回项目级 .claude/。
 ExecStart=/home/ljiawen/project/feishu-bot/.venv/bin/python -u /home/ljiawen/project/feishu-bot/ops/guard.py
 # 回滚 + 重启 + 等 45s + canary（最长 150s）都在一次执行里，给足余量
