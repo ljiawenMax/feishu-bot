@@ -50,18 +50,25 @@ GUARD_PROCEED, GUARD_BLOCKED, GUARD_COMPACTED = "proceed", "blocked", "compacted
 DEBATE_ROUNDS = 5
 
 # 附件回传协议：Claude 在回复里写 [[SEND_FILE:/abs/path]]，bot 剥离标记并把文件发到群。
-# 路径白名单与体积上限见 Bot._extract_send_files——这是唯一的外传闸门，别放宽。
+# 这是**通用能力**、每轮对话都生效，不绑定任何命令（/sync 的 bundle 走的是另一条独立路径）。
+# 目录白名单已按机主要求撤除（个人自用、单机部署），限制只剩「已存在的普通文件 + 体积 + 条数」，
+# 见 Bot._extract_send_files 里的说明与代价。
 SEND_FILE_RE = re.compile(r"\[\[SEND_FILE:([^\]\n]+)\]\]")
 SEND_FILE_MAX = 3
 SEND_FILE_MAX_BYTES = 20 * 1024 * 1024
 
+# 上传文件自动进上下文：handle_upload 把落盘路径暂存，下一条任务消息自动附带（见 _drain_uploads）。
+# 超过这个时长未被消费就丢弃——几小时前传的文件再塞进 prompt 只会误导。
+UPLOAD_CONTEXT_TTL = 30 * 60
+
 HELP_TEXT = "\n".join([
     "可用命令：",
     "/sessions  — 列出对话，回复序号切换",
-    "/allsessions — 列出本机全部 Claude Code 会话（跨项目/跨群，只读不可切换）",
+    "/allsessions [关键词] — 列出本机全部 Claude Code 会话（跨项目/跨群），回复序号即可接管续聊",
     "/new       — 新建对话（清空历史）",
     "/name <名称> — 重命名当前对话",
-    "/del <序号> — 删除指定对话（序号见 /sessions）",
+    "/del <序号> — 删除指定对话（序号见 /sessions；接管的本机会话只解绑、不删盘）",
+    "/files [clear] — 查看/清空「下一条消息会自动附带」的上传文件",
     "/permit    — 开关工作区文件读写（acceptEdits，不跑命令）",
     "/unsafe    — 开关最高权限（跳过全部权限校验，可执行 bash 命令，谨慎）",
     "/model     — 选择当前对话使用的模型",
@@ -142,8 +149,14 @@ class Bot:
         self.permit_mode = state.get("permit", False)  # acceptEdits：工作区内读写文件
         self.unsafe_mode = state.get("unsafe", False)  # 跳过全部权限校验
 
-        self.pending = None   # "session" | "model"，当前等待用户回复序号的类型
+        self.pending = None   # "session" | "model" | "allsession"，等待用户回复序号的类型
+        self.pending_all = []  # /allsessions 本次列出的本机会话（供回序号接管），随 pending 失效
         self.last_task = None  # {"text", "msg_id", "session_id"}，用于 /retry 重跑
+
+        # 上传文件的「待附带」缓冲：用户传完图/文件后，下一条任务消息自动带上落盘路径。
+        # 传完文件紧接着就是要用它——让用户再手打一遍路径纯属多余。只在 inbox 线程读写
+        # （handle_upload 与 run_task 都在这条线程上），故无需加锁。
+        self.pending_uploads = []  # [{"path", "name", "size_human", "ts"}, ...]
 
         # inbox：长连接事件先入此队列（on_event 快速返回），inbox 线程串行处理命令/上传/入队
         self.inbox = queue.Queue()
@@ -168,6 +181,7 @@ class Bot:
             "/compact": self.cmd_compact,
             "/usage": self.cmd_usage,
             "/del": self.cmd_del,
+            "/files": self.cmd_files,
             "/retry": self.cmd_retry,
             "/sync": self.cmd_sync,
             "/resync": self.cmd_resync,
@@ -201,9 +215,10 @@ class Bot:
             return None
         return data["list"][data["current"]]["id"]
 
-    def new_entry(self, label=None):
+    def new_entry(self, label=None, claude_sid=None, cwd=None, external=False):
         ts = time.strftime("%m-%d %H:%M")
-        return {"id": None, "label": label or f"新对话 {ts}", "model": None, "_row_id": None}
+        return {"id": claude_sid, "label": label or f"新对话 {ts}", "model": None,
+                "cwd": cwd, "external": external, "_row_id": None}
 
     def current_entry(self):
         data = self.sessions
@@ -211,11 +226,24 @@ class Bot:
             return None
         return data["list"][data["current"]]
 
-    def make_session(self, label=None):
-        """创建内存 session 条目并在 DB 中建行，返回条目（含 _row_id）。"""
-        entry = self.new_entry(label)
+    def entry_cwd(self, entry):
+        """某个会话条目实际该在哪个目录下跑 claude：接管来的本机会话用它自己的原项目目录，
+        其余一律是本 bot 的 work_dir。claude --resume 按 cwd 反查 session 文件，
+        目录不对必然 "No conversation found"，所以 cwd 必须跟着会话走、不能写死 work_dir。"""
+        if entry and entry.get("cwd"):
+            return entry["cwd"]
+        return self.work_dir
+
+    def current_cwd(self):
+        return self.entry_cwd(self.current_entry())
+
+    def make_session(self, label=None, claude_sid=None, cwd=None, external=False):
+        """创建内存 session 条目并在 DB 中建行，返回条目（含 _row_id）。
+        claude_sid/cwd/external 只在「接管本机已有会话」时给。"""
+        entry = self.new_entry(label, claude_sid=claude_sid, cwd=cwd, external=external)
         position = len(self.sessions["list"])
-        entry["_row_id"] = self.db(db.insert_session, self.chat_id, entry["label"], position)
+        entry["_row_id"] = self.db(db.insert_session, self.chat_id, entry["label"], position,
+                                   claude_sid=claude_sid, cwd=cwd, external=external)
         return entry
 
     def set_current(self, entry):
@@ -275,9 +303,14 @@ class Bot:
         extra_dirs = ([up] if os.path.isdir(up) else []) + self.extra_dirs
         entry = self.current_entry()
         model = entry.get("model") if entry else None
+        # 接管来的本机会话在它自己的原项目目录下跑；此时把本 bot 的 work_dir 也挂进去，
+        # 免得「在飞书里续聊」反而读不到这个群平时的工作区。
+        cwd = self.entry_cwd(entry)
+        if cwd != self.work_dir and os.path.isdir(self.work_dir):
+            extra_dirs = extra_dirs + [self.work_dir]
         try:
             result, new_sid, used_model = claude_runner.run_claude(
-                run_text or text, self.work_dir, self.task_timeout,
+                run_text or text, cwd, self.task_timeout,
                 session_id, permit=permit, extra_dirs=extra_dirs, history=history,
                 model=model, unsafe=unsafe, extra_system=extra_system,
             )
@@ -300,23 +333,97 @@ class Bot:
             feishu_api.reply_message(self.client, msg["id"], feishu_api.build_sessions_prompt(data["list"], data["current"]))
 
     def cmd_allsessions(self, msg, arg):
-        """列出本机全部 Claude Code 会话：直接扫磁盘 ~/.claude/projects，跨项目/跨群/跨 bot，
-        只读展示（不支持切换，切换仍用 /sessions 操作当前 chat 自己的会话）。"""
+        """列出本机全部 Claude Code 会话（扫 ~/.claude/projects，跨项目/跨群/跨 bot），
+        回复序号即可**接管续聊**：在本群建一个绑定该 session_id + 该项目 cwd 的会话条目，
+        之后每轮 claude --resume 都在原目录下跑，等于把终端里的那段对话搬到飞书接着聊。
+
+        arg 为可选关键词，对标题与项目路径做子串过滤（列表只显示 30 条，靠它捞更早的会话）。"""
         sessions = claude_runner.list_all_sessions()
+        kw = (arg or "").strip().lower()
+        if kw:
+            sessions = [s for s in sessions
+                        if kw in (s["title"] or "").lower() or kw in (s["project"] or "").lower()]
         if not sessions:
-            feishu_api.reply_message(self.client, msg["id"], "本机暂无 Claude Code 会话记录")
+            hint = f"没有匹配「{arg}」的会话" if kw else "本机暂无 Claude Code 会话记录"
+            feishu_api.reply_message(self.client, msg["id"], hint)
             return
         limit = 30
+        shown = sessions[:limit]
         now = time.time()
-        lines = [f"本机共 {len(sessions)} 个 Claude Code 会话（按最近使用倒序，最多显示 {limit} 条）："]
-        for i, s in enumerate(sessions[:limit], 1):
+        head = f"本机共 {len(sessions)} 个 Claude Code 会话"
+        if kw:
+            head += f"（匹配「{arg}」）"
+        head += f"，按最近使用倒序，最多显示 {limit} 条："
+        lines = [head]
+        for i, s in enumerate(shown, 1):
             age = self._human_elapsed(max(0, int(now - s["mtime"]))) + "前"
             title = s["title"] or "(无标题)"
-            lines.append(f"{i}. [{age}] {title}")
+            mark = "" if s["cwd"] else "  ⚠️无法接管(未记录工作目录)"
+            lines.append(f"{i}. [{age}] {title}{mark}")
             lines.append(f"   项目：{s['project']}")
             lines.append(f"   session：{s['session_id']}")
+        lines.append("")
+        lines.append("回复序号即可接管该会话并在本群继续（不影响本机原会话文件，续聊会写进同一份）")
+        self.pending = "allsession"
+        self.pending_all = shown
         feishu_api.reply_message(self.client, msg["id"], "\n".join(lines))
-        print(f"[{self.name}][allsessions] total={len(sessions)}")
+        print(f"[{self.name}][allsessions] total={len(sessions)} shown={len(shown)} kw={kw!r}")
+
+    def _attach_session(self, msg, s):
+        """把一个本机会话接管进本群：新建绑定 session_id + 原项目 cwd 的会话条目并切过去。
+        本机 jsonl 里的历史 bot 的 DB 没有，故顺带回显最近几轮，方便接上话头。"""
+        cwd, sid = s.get("cwd"), s["session_id"]
+        if not cwd:
+            feishu_api.reply_message(self.client, msg["id"],
+                                     "这个会话没记录工作目录，无法接管（--resume 必须在原目录下跑）")
+            return
+        if not os.path.isdir(cwd):
+            feishu_api.reply_message(self.client, msg["id"], f"原项目目录已不存在，无法接管：{cwd}")
+            return
+        if not claude_runner.session_exists(sid, cwd):
+            feishu_api.reply_message(self.client, msg["id"], "会话文件已不存在，无法接管")
+            return
+
+        with self.lock:  # 与 worker 的 update_session 互斥
+            data = self.sessions
+            existing = next((i for i, e in enumerate(data["list"]) if e.get("id") == sid), None)
+            reattached = existing is not None
+            if reattached:  # 已接管过：直接切过去，别撞 sessions 的 (chat_id, sid) 唯一索引
+                data["current"] = existing
+                entry = data["list"][existing]
+            else:
+                label = (s["title"] or os.path.basename(cwd.rstrip("/")) or "本机会话")[:40]
+                entry = self.make_session(label=f"[本机] {label}", claude_sid=sid,
+                                          cwd=cwd, external=True)
+                data["list"].append(entry)
+                data["current"] = len(data["list"]) - 1
+            self.set_current(entry)
+            data["history"] = self.load_history(sid)
+        self.pending = None
+        self.pending_all = []
+
+        note = "已切回先前接管的会话" if reattached else "已接管本机会话"
+        lines = [f"✅ {note}：{entry['label']}", f"工作目录：{cwd}", f"session：{sid}"]
+        # 先把 context 占用摆出来：终端里聊了很久的会话往往一上来就接近上限，
+        # 不说清楚的话，用户发第一条消息就撞上护栏会一头雾水。
+        pct = self._context_pct(sid)
+        if pct is not None:
+            lines.append(f"当前 context 占用 {pct:.0f}%"
+                         + ("（较高，续聊可能先触发自动压缩）" if pct >= self.auto_compact_threshold > 0
+                            else ""))
+        lines.append("后续消息将在该目录下续聊；/sessions 可切回本群自己的对话。")
+        feishu_api.reply_message(self.client, msg["id"], "\n".join(lines))
+        # 回显最近几轮，接上话头（这段历史只在本机 jsonl 里，DB 查不到）
+        tail = []
+        try:
+            tail = claude_runner.session_tail(sid, cwd)
+        except Exception as e:
+            print(f"[{self.name}][attach-tail-error] {e}")
+        for turn in tail:
+            who = "你" if turn["role"] == "user" else "Claude"
+            feishu_api.reply_message(self.client, msg["id"],
+                                     f"{who}：\n{turn['content']}", tag="history")
+        print(f"[{self.name}][attach] sid={sid[:8]}… cwd={cwd}")
 
     def cmd_help(self, msg, arg):
         feishu_api.reply_message(self.client, msg["id"], HELP_TEXT)
@@ -507,10 +614,11 @@ class Bot:
             return
         with self.lock:  # 与 worker 的 update_session 互斥，防列表 pop/重排与写入相撞
             removed = data["list"].pop(didx)
-            # 删磁盘上的 Claude session 文件
-            if removed["id"]:
+            # 删磁盘上的 Claude session 文件。接管来的本机会话（external）只解绑不删盘——
+            # 那是用户自己在终端开的对话，飞书里删一下就毁掉他的现场，代价不对等。
+            if removed["id"] and not removed.get("external"):
                 try:
-                    claude_runner.delete_claude_session(removed["id"], self.work_dir)
+                    claude_runner.delete_claude_session(removed["id"], self.entry_cwd(removed))
                 except Exception as e:
                     print(f"[del] remove claude session file failed: {e}")
             # 删 DB session 行（审计记录经 ON DELETE SET NULL 保留）
@@ -531,8 +639,11 @@ class Bot:
                 data["history"] = self.load_history(cur_entry["id"])
             remaining = len(data["list"])
         self.pending = None
-        feishu_api.reply_message(self.client, msg["id"], f"已删除对话「{removed['label']}」（剩 {remaining} 个）")
-        print(f"[{self.name}][del] removed idx={didx} row={removed.get('_row_id')}")
+        note = "（接管的本机会话，只解绑、磁盘上的会话文件保留）" if removed.get("external") else ""
+        feishu_api.reply_message(self.client, msg["id"],
+                                 f"已删除对话「{removed['label']}」（剩 {remaining} 个）{note}")
+        print(f"[{self.name}][del] removed idx={didx} row={removed.get('_row_id')} "
+              f"external={bool(removed.get('external'))}")
 
     @staticmethod
     def _model_suffix(used_model, ctx_pct=None):
@@ -554,7 +665,7 @@ class Bot:
         if not session_id:
             return None
         try:
-            info = claude_runner.session_context(session_id, self.work_dir)
+            info = claude_runner.session_context(session_id, self.current_cwd())
         except Exception as e:
             print(f"[{self.name}][context-pct-error] {e}")
             return None
@@ -622,6 +733,17 @@ class Bot:
         （下一条任务自动带上）。成功返回 True；无历史或摘要失败返回 False。"""
         with self.lock:
             history = list(self.sessions.get("history", []))
+            entry = self.current_entry()
+        if not history and entry and entry.get("id"):
+            # 接管来的本机会话在 messages 表里没有任何历史（那些对话发生在终端里），
+            # 本地历史为空就直接 return False 的话，护栏一触发就是死路：自动压缩压不动、
+            # 手动 /compact 也说「暂无可压缩的历史」，而这类会话恰恰最容易一上来就顶到阈值。
+            # 退而求其次，从磁盘 session 文件读最近若干轮当摘要素材。
+            try:
+                history = claude_runner.session_tail(entry["id"], self.entry_cwd(entry),
+                                                     rounds=12, max_chars=2000)
+            except Exception as e:
+                print(f"[{self.name}][compact-tail-error] {e}")
         if not history:
             return False
         note = f"（{reason}）" if reason else ""
@@ -632,7 +754,10 @@ class Bot:
             self._push_reply(msg_id, "上下文自动压缩失败，可手动 /new 开新对话", tag="compact")
             return False
         with self.lock:  # 与 worker/命令的会话增删改互斥（同 cmd_new）
-            entry = self.make_session()
+            # 压缩后的新对话继承当前会话的工作目录：从接管来的本机会话压一次就被丢回
+            # bot 的 work_dir 的话，后半段对话会突然对着另一个项目说话。
+            # external 不继承——新会话是 bot 自己建的，/del 该删就删。
+            entry = self.make_session(cwd=(self.current_entry() or {}).get("cwd"))
             entry["seed"] = summary  # 仅内存：下条任务拼进 prompt 后即清除
             self.sessions["list"].append(entry)
             self.sessions["current"] = len(self.sessions["list"]) - 1
@@ -859,6 +984,11 @@ class Bot:
     def run_task(self, msg, text):
         """主线程只做入队 + 立即回执，真正执行在后台 worker，故长任务不冻结 bot。"""
         self.pending = None
+        # 先前上传、尚未被消费的文件在这里并进任务正文。拼进 text（而不是只改 run_text）
+        # 是有意的：路径很短，撑不爆 context，进了 history 之后续聊追问「刚那张图」才有依据。
+        attach = self._drain_uploads()
+        if attach:
+            text = text.rstrip() + "\n" + self._attach_block(attach)
         with self.lock:
             self.last_task = {"text": text, "msg_id": msg["id"],
                               "session_id": self.current_session_id()}
@@ -1112,18 +1242,21 @@ class Bot:
     def _extract_send_files(self, text):
         """解析 Claude 回复里的 [[SEND_FILE:/abs/path]] 标记，返回 (剥离标记的正文, 合法路径, 拒绝说明)。
 
-        白名单：必须是 work_dir 或本 chat 上传目录之下的普通文件（按 realpath 判断，
-        软链也逃不出去），单文件 ≤20MB，一条回复最多 3 个。Claude 可能被上传的文件
-        内容诱导去发送任意路径，这里是唯一的闸门。
+        **通用能力**：每一轮对话都生效，跟命令无关。以前这里有一道目录白名单（只准发
+        work_dir 与本群上传目录之下的文件），实际效果是「Claude 读得到却发不出去」——
+        work_dir 与源码分离的机器人（源码靠 extra_dirs 挂载）永远发不了自己的产物，
+        于是它按系统提示里的规则直接答复「发送不了」。经机主明确决定（个人自用、单机
+        部署）撤除该白名单：现在本机任意可读的普通文件都可外发。
+
+        ⚠️ 代价要清楚：这条通道现在能把本机任何 bot 进程可读的文件送进飞书群，包括
+        .env.local、~/.ssh、各类凭证。上传给 bot 的文件内容如果诱导 Claude 去发某个
+        路径，不再有第二道闸拦它。留下的只是防呆：必须是已存在的普通文件（目录、
+        /dev/* 之类字符设备都挡掉）、单文件 ≤20MB、一条回复最多 3 个。
         """
         paths = SEND_FILE_RE.findall(text)
         if not paths:
             return text, [], []
         clean = SEND_FILE_RE.sub("", text).strip()
-        roots = [os.path.realpath(self.work_dir)]
-        up = uploads.chat_dir(self.chat_id)
-        if os.path.isdir(up):
-            roots.append(os.path.realpath(up))
 
         ok, rejected = [], []
         for raw in paths:
@@ -1134,13 +1267,13 @@ class Bot:
             real = os.path.realpath(p)
             if not os.path.isabs(p):
                 rejected.append(f"{p}：必须是绝对路径")
-            elif not any(real == r or real.startswith(r + os.sep) for r in roots):
-                rejected.append(f"{os.path.basename(p)}：不在本机器人的工作目录内，拒绝发送")
             elif not os.path.isfile(real):
-                rejected.append(f"{os.path.basename(p)}：文件不存在")
+                rejected.append(f"{os.path.basename(p)}：文件不存在或不是普通文件")
             elif os.path.getsize(real) > SEND_FILE_MAX_BYTES:
                 rejected.append(f"{os.path.basename(p)}：超过 "
                                 f"{SEND_FILE_MAX_BYTES // (1024 * 1024)}MB，拒绝发送")
+            elif real in ok:
+                continue  # 同一轮重复标记同一个文件，发一次就够
             else:
                 ok.append(real)
         return clean, ok, rejected
@@ -1284,7 +1417,7 @@ class Bot:
     # ---------------------------------------------------------- 消息处理 / 主循环
 
     def handle_select(self, msg, idx):
-        """pending 状态下用数字消息选择对话 / 模型。"""
+        """pending 状态下用数字消息选择：本群对话 / 本机会话（接管）/ 模型。"""
         if self.pending == "session":
             sessions = self.sessions["list"]
             if 0 <= idx < len(sessions):
@@ -1299,6 +1432,12 @@ class Bot:
                 print(f"[{self.name}][session] switched to idx={idx}")
             else:
                 feishu_api.reply_message(self.client, msg["id"], f"无效序号，请输入 1～{len(sessions)}")
+        elif self.pending == "allsession":
+            shown = self.pending_all
+            if 0 <= idx < len(shown):
+                self._attach_session(msg, shown[idx])
+            else:
+                feishu_api.reply_message(self.client, msg["id"], f"无效序号，请输入 1～{len(shown)}")
         elif self.pending == "model":
             options = ["默认（不指定）"] + list(self.models)  # idx 0=默认
             if 0 <= idx < len(options):
@@ -1328,18 +1467,70 @@ class Bot:
             return
         self.db(db.record_upload, msg["id"], self.chat_id, msg.get("resource_type"),
                 info["file_name"], info["path"], info["size"], info["content_type"])
+        # 传完文件下一句就是要用它——把路径存进待附带缓冲，下一条任务消息自动带上，
+        # 不必让用户再把回复里的路径手抄一遍。富文本内嵌图（handle_post_images）走同一个
+        # 缓冲，附带说明由 run_task 统一拼，两条上传路径不再各拼各的。
+        pending = self._remember_upload(info)
         feishu_api.reply_message(self.client, msg["id"], "\n".join([
             "已保存上传文件：",
             info["path"],
             f"大小 {info['size_human']}",
-            "（如需分析，发任务引用此路径）",
+            f"（已加入下一条消息的上下文{f'，共 {pending} 个待附带' if pending > 1 else ''}，"
+            "直接说要做什么即可；发 /files 可查看或清空）",
         ]))
-        print(f"[{self.name}][upload] {info['path']} ({info['size_human']})")
+        print(f"[{self.name}][upload] {info['path']} ({info['size_human']}) pending={pending}")
+
+    # -------------------------------------------------- 上传文件自动进上下文
+
+    def _remember_upload(self, info):
+        """把刚落盘的上传文件记入待附带缓冲，返回当前待附带数量。"""
+        self._expire_uploads()
+        self.pending_uploads.append({"path": info["path"], "name": info["file_name"],
+                                     "size_human": info["size_human"], "ts": time.time()})
+        return len(self.pending_uploads)
+
+    def _expire_uploads(self):
+        """丢弃超过 TTL 的待附带文件：几小时前传的东西再塞进 prompt 只会误导。"""
+        cutoff = time.time() - UPLOAD_CONTEXT_TTL
+        self.pending_uploads = [u for u in self.pending_uploads if u["ts"] >= cutoff]
+
+    def _drain_uploads(self):
+        """取走并清空待附带的上传文件（一次任务消费一次，不重复附带）。"""
+        self._expire_uploads()
+        items, self.pending_uploads = self.pending_uploads, []
+        return items
+
+    @staticmethod
+    def _attach_block(items):
+        """把待附带文件拼成一段附在用户消息后面的说明。"""
+        lines = ["", "[随消息附带的文件，可直接读取]"]
+        lines += [f"{u['path']}（{u['size_human']}）" for u in items]
+        return "\n".join(lines)
+
+    def cmd_files(self, msg, arg):
+        """查看/清空「下一条消息会自动附带」的上传文件。"""
+        if arg.strip() in ("clear", "清空"):
+            n = len(self.pending_uploads)
+            self.pending_uploads = []
+            feishu_api.reply_message(self.client, msg["id"], f"已清空待附带文件（{n} 个）")
+            return
+        self._expire_uploads()
+        if not self.pending_uploads:
+            feishu_api.reply_message(self.client, msg["id"],
+                                     "当前没有待附带的上传文件（上传后 "
+                                     f"{UPLOAD_CONTEXT_TTL // 60} 分钟内发任务会自动带上）")
+            return
+        lines = ["下一条消息会自动附带这些文件："]
+        for i, u in enumerate(self.pending_uploads, 1):
+            lines.append(f"{i}. {u['path']}（{u['size_human']}）")
+        lines.append("发 /files clear 可清空")
+        feishu_api.reply_message(self.client, msg["id"], "\n".join(lines))
 
     def handle_post_images(self, msg):
-        """下载 post 富文本里内嵌的图片，写台账，返回 (文字, [本地路径,...])。"""
+        """下载 post 富文本里内嵌的图片，写台账，把落盘路径记入待附带缓冲，返回 (文字, 张数)。
+        内嵌图和单发图走同一个缓冲，附带说明由 run_task 统一拼——两条路径别各拼各的。"""
         text = msg.get("text", "")
-        paths = []
+        n = 0
         for idx, image_key in enumerate(msg.get("images", []), 1):
             synth = {"id": msg["id"], "file_key": image_key,
                      "resource_type": "image", "file_name": f"img{idx}"}
@@ -1350,8 +1541,9 @@ class Bot:
                 continue
             self.db(db.record_upload, msg["id"], self.chat_id, "image",
                     info["file_name"], info["path"], info["size"], info["content_type"])
-            paths.append(info["path"])
-        return text, paths
+            self._remember_upload(info)
+            n += 1
+        return text, n
 
     def handle_unsupported(self, msg):
         """处理不了的消息（不支持的类型）：留痕到 DB + 回提示。"""
@@ -1371,11 +1563,9 @@ class Bot:
             return
         # 富文本 post：下载内嵌图片；有图则作为带附件的任务，纯文本则按文本继续
         if msg.get("kind") == "post":
-            ptext, paths = self.handle_post_images(msg)
-            if paths:
-                full = (ptext or "请查看随附的图片").rstrip()
-                full += "\n\n[随消息附带的图片，可直接读取]\n" + "\n".join(paths)
-                self.run_task(msg, full)
+            ptext, n_img = self.handle_post_images(msg)
+            if n_img:
+                self.run_task(msg, (ptext or "请查看随附的图片").rstrip())
                 return
             msg = {**msg, "text": ptext}  # 纯文本 post，降级为普通文本处理
         text = (msg.get("text") or "").strip()

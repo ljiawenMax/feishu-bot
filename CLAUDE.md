@@ -13,14 +13,17 @@
 
 - `feishu_claude.py` — 入口：解析 `.env.<name>`、建 DB engine、**按 app_id 分组建长连接**、管理 PID
 - `bot.py` — `Bot` 类：单个机器人的消息分发、命令处理、会话编排（业务主体，改功能主要看这里）
-- `models.py` — SQLAlchemy ORM 模型：`BotState` / `Conversation`(表 sessions) / `Message` / `Upload`(表 uploads)
+- `models.py` — SQLAlchemy ORM 模型：`BotState` / `Conversation`(表 sessions，含会话级 `cwd`/`external`)
+  / `Message` / `Upload`(表 uploads)
 - `db.py` — 数据库层：engine/session 管理 + 基于 ORM 的数据访问（不再手写 SQL）
 - `feishu_api.py` — 飞书交互层（基于 lark-oapi SDK）：长连接客户端与事件分发、事件归一、回复/下载、文本分段
 - `uploads.py` — 上传图片/文件/压缩包的安全下载与存储（隔离目录 700、文件 600、文件名消毒、不自动解压）
 - `gitsync.py` — 增量同步：把每个 chat 工作目录的改动**在本地真实提交**（commit message = 本轮飞书任务内容），再把「上次同步以来」的提交打包成增量 `git bundle`（供远程 `git fetch` + `merge --ff-only`；`/resync` 用全量 bundle + `reset --hard` 兜底恢复）
 - `wiki_sync.py` — 飞书知识库 → 本地 markdown 镜像：列知识空间、递归走节点树、docx **block → markdown**（保留标题层级）、按 `obj_edit_time` 增量同步；也可作自检 CLI 独立运行
 - `wiki_index.py` — 知识库索引与检索：按标题小节切块、ollama 取向量、**向量 + MySQL ngram 全文双路 RRF 混合召回**；刻意不依赖 Bot/飞书，将来可整个文件搬走
-- `claude_runner.py` — 调用 `claude` CLI、解析 stream-json（含 `tool_use` → 本轮动作回报）、删除磁盘 session 文件
+- `claude_runner.py` — 调用 `claude` CLI、解析 stream-json（含 `tool_use` → 本轮动作回报）、
+  磁盘 session 文件的枚举/探查/回显/删除（`list_all_sessions`/`session_exists`/`session_tail`/
+  `session_context`/`delete_claude_session`，都以 cwd 定位 `~/.claude/projects/<key>/`）
 - `ops/` — 运维面（**刻意不 import 任何项目模块**，见下「自动回滚」）：`snapshot.py` 快照/回滚、
   `guard.py` 看门狗、`notify.py` 独立告警通道、`envfile.py` 独立 env 解析、`systemd/` unit 模板
 - `.env` — 配置模板（入 git）；`.env.local` — 实际配置（不入 git）
@@ -41,8 +44,11 @@ DB 访问走 SQLAlchemy ORM；每次操作开短生命周期 Session（线程安
 > 注意：长连接断线期间飞书**不补发**漏掉的事件（SDK 会自动重连）；进程未运行时发的消息不会补处理。
 
 **一 chat_id 一 work_dir**：每个机器人绑定一个群（chat_id）+ 一个工作目录（`work_dir` 单字符串，
-省略回退家目录 `~`），chat_id 唯一。视觉隔离靠分群；一个群内用 `/new`、`/sessions` 手动管理多个对话
-（不在群内切换目录）。会话与 `permit`/`unsafe` 权限均按 `chat_id` 分区，持久化在 `bot_state` 表。
+省略回退家目录 `~`），chat_id 唯一。视觉隔离靠分群；一个群内用 `/new`、`/sessions` 手动管理多个对话。
+会话与 `permit`/`unsafe` 权限均按 `chat_id` 分区，持久化在 `bot_state` 表。
+**唯一的例外是「接管本机会话」**（`/allsessions` 回序号）：那种会话在 `sessions.cwd` 里记着自己的
+项目目录、在那里跑，见下文「接管本机 Claude Code 会话」。取工作目录一律走 `Bot.entry_cwd()`，
+别再直接读 `self.work_dir`。
 
 ## BOTS 每项字段说明（`.env.local` 里的 `BOTS` JSON 列表）
 
@@ -70,10 +76,57 @@ Claude 可据此按人分账（`resume` 项目就用它做 `--owner`）。拿不
 
 **附件回传协议 `[[SEND_FILE:/abs/path]]`**：Claude 在回复正文里写这个标记，`_push_reply`
 会剥离标记、正常发送正文，随后把对应文件作为文件消息补发到群（复用 `feishu_api.upload_file`
-+ `reply_file`）。**白名单是唯一的外传闸门**（`Bot._extract_send_files`）：必须是绝对路径、
-realpath 落在 `work_dir` 或本 chat 上传目录之下（软链与 `..` 都逃不出去）、是普通文件、
-单文件 ≤20MB、一条回复最多 3 个；被拒的会在正文末尾列出原因。放宽它等于允许被上传文件
-里的内容诱导 Claude 外传任意路径，别动。
++ `reply_file`）。**这是通用能力，每一轮对话都生效、不绑定任何命令**——`/sync` 发 bundle 走的是
+`_send_bundle` 另一条独立路径，两者没有关系。能力说明写在 `claude_runner.SYNC_SYSTEM_PROMPT` 里，
+每次调用都 `--append-system-prompt` 带上，所以 Claude 任何时候都知道自己能发文件。
+
+**目录白名单已于 2026-08-30 按机主决定撤除**（个人自用、单机部署）。撤除的直接原因：旧白名单只认
+`work_dir` 与本 chat 上传目录，而 `resume`/`stock` 这类「work_dir 是专用空目录、源码靠 `extra_dirs`
+挂进来」的机器人，产物天然落在 `extra_dirs` 里——Claude 读得到却发不出去，于是它照着系统提示里的
+规则直接回一句「发送不了」，看起来像是这个功能压根不存在。现在 `Bot._extract_send_files` 只剩防呆：
+必须是绝对路径、realpath 是**已存在的普通文件**（目录、`/dev/*` 之类字符设备挡掉）、单文件 ≤20MB、
+一条回复最多 3 个、同一路径重复标记只发一次；被拒的会在正文末尾列出原因。
+⚠️ **代价要清楚**：这条通道现在能把 bot 进程可读的**任意**本机文件送进飞书群——`.env.local`、
+`~/.ssh`、各类凭证都在内；上传给 bot 的文件若诱导 Claude 去发某个路径，不再有第二道闸拦它。
+要收回就把 roots 白名单加回 `_extract_send_files`（建议 roots = 当前会话有效 cwd + 上传目录 +
+`extra_dirs`，而不是退回只认 `work_dir` 的旧版）。
+
+**上传文件自动进上下文**：传完文件下一句话就是要用它，让用户再手抄一遍路径纯属多余。
+`handle_upload` 落盘后把路径记进 `Bot.pending_uploads` 缓冲，**下一条任务消息**由 `run_task`
+统一拼一段「[随消息附带的文件，可直接读取]」附在正文后（`_drain_uploads` + `_attach_block`），
+消费即清空、不重复附带。富文本内嵌图（`handle_post_images`）改成也只往这个缓冲里塞，
+两条上传路径共用同一套拼装逻辑，不再各拼各的。要点：
+- **拼进 `text` 而不是只改 `run_text`**（与知识库 RAG 注入相反）：路径很短撑不爆 context，
+  进了 history 之后续聊追问「刚那张图」才有依据；RAG 资料动辄几千字才必须绕开 history。
+- 缓冲**只在 inbox 线程读写**（`handle_upload` 与 `run_task` 都在这条线程上），故不加锁。
+- `UPLOAD_CONTEXT_TTL`（默认 30 分钟）过期即丢——几小时前传的文件再塞进 prompt 只会误导。
+- 只在内存里，进程重启即丢（`uploads` 表仍有台账）。`/files` 查看待附带、`/files clear` 清空。
+
+**接管本机 Claude Code 会话**：`/allsessions` 扫 `~/.claude/projects` 列出本机全部会话
+（可带关键词过滤标题/项目路径），**回复序号即接管**：在本群建一个绑定该 `session_id` 的会话条目，
+之后每轮 `--resume` 都在**那个会话原本的项目目录**下跑，等于把终端里的对话搬到飞书接着聊。
+- **cwd 必须下放到会话级**，这是能不能做成的关键：Claude Code 的 session 文件存在
+  `~/.claude/projects/<cwd 把 / 换成 - >/<sid>.jsonl`，`--resume` 在别的目录下跑必然
+  `No conversation found`。故 `sessions` 表加 `cwd` 列（NULL=用本 bot 的 `work_dir`），
+  `Bot.entry_cwd()` 是唯一取值口，`execute_claude` / `_context_pct` / `delete_claude_session`
+  全部改用它，不再直接读 `self.work_dir`。接管期间本 bot 的 `work_dir` 会作为 `--add-dir` 挂进去。
+- **`external` 列让 `/del` 只解绑、不删盘**：那是用户自己在终端里的对话，飞书里手滑删一下就毁掉
+  他的现场，代价完全不对等。压缩（`_do_compact`）新建的会话**继承 cwd 但不继承 external**——
+  不继承 cwd 的话，压一次就被悄悄丢回 bot 的 work_dir，后半段对话对着另一个项目说话。
+- **`cwd` 取自 session 文件里的首条 `cwd` 事件**，不是从目录名反解：目录名是把 `/` 换成 `-`
+  编码来的、不可逆（路径本身含 `-` 时还原不出）。拿不到 cwd 的会话在列表里标「⚠️无法接管」。
+- 接管后会回显最近 3 轮对话（`claude_runner.session_tail`）——这段历史只存在于本机 jsonl 里，
+  bot 的 `messages` 表没有，不回显的话接不上话头。只取 text 块，`tool_use`/`tool_result`
+  与 `<command-name>` 之类 CLI 注入全部滤掉，否则群会被过程噪音刷爆。
+- **gitsync 仍然只认 `work_dir`，不跟着接管会话走**：`/sync` 会 `git add -A` + 真提交，跟去别的
+  项目等于替用户往他自己的仓库里塞提交。接管会话期间要同步那个项目，用它自己的群或手动 git。
+- **context 护栏要为它开个后门**：终端里聊久了的会话一接管往往就接近上限，而它在 `messages` 表里
+  没有任何历史（那些话发生在终端里），`_do_compact` 照旧「本地历史为空 → return False」的话，
+  护栏一触发就是死路——自动压缩压不动、手动 `/compact` 也答「暂无可压缩的历史」，而这类会话恰恰
+  最容易一上来就顶到阈值。故本地历史为空时改从 `session_tail(rounds=12)` 读盘取素材。接管时的
+  回执也会直接把 context 占用报出来，免得用户发第一条就莫名撞墙。
+- 续聊会写进本机那份 jsonl（这正是「延续」的含义）。若同一 session 在终端里也开着，两边并发写
+  同一文件会互相覆盖——接管前先把终端那边退出。
 
 **增量 bundle 同步（gitsync）**：`work_dir` 是 git 仓库时可用。**同步 = 先在本地当前分支真提交，
 再打包真实历史**：每轮先 `git add -A` + `git commit`（message 首行 = 本轮飞书任务正文，正文标注

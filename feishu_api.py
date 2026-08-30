@@ -339,9 +339,13 @@ def reply_file(client, message_id, file_key, tag="file"):
 
 
 def build_sessions_prompt(sessions, current_idx):
-    """sessions: list of {"id": session_id_or_None, "label": str}"""
+    """sessions: list of {"id": session_id_or_None, "label": str, "cwd": str|None}
+    接管来的本机会话（cwd 非空）额外标出工作目录——它不在本群的 work_dir 下跑，
+    不标的话切过去后「文件怎么都对不上」会很难查。"""
     lines = ["对话列表，回复序号切换："]
     for i, s in enumerate(sessions, 1):
         marker = " ◀ 当前" if i - 1 == current_idx else ""
         lines.append(f"{i}. {s['label']}{marker}")
+        if s.get("cwd"):
+            lines.append(f"   目录：{s['cwd']}")
     return "\n".join(lines)

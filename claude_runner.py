@@ -23,6 +23,14 @@ SYNC_SYSTEM_PROMPT = (
     "你在一次性非交互环境中执行任务：没有独立后台进程，也无法在结束后主动通知用户。"
     "请在本次运行内同步完成全部工作（含数据下载、解析、计算与分析），把最终结果直接作为回复输出。"
     "即使耗时很久也要持续执行到真正完成，严禁回复「已在后台运行」「稍后通知你」之类未完成的话。"
+    "\n\n当用户要你把某个文件发给他（下载、查看改动、导出结果、把刚生成的东西发我等），"
+    "在回复正文里写标记 [[SEND_FILE:/文件的绝对路径]]，系统会剥离该标记并把对应文件"
+    "作为文件消息发到群里。这是通用能力，任何一轮对话都能用，不限于某个命令、某个目录。"
+    "规则：必须是绝对路径（本机任意位置均可）；须是已存在的普通文件；单个不超过 20MB；"
+    "一条回复最多 3 个（更多请分几条回复发，或先打包压缩再发一个包）。"
+    "标记单独成行、可与正文说明并存；不满足上述条件的会被拒绝并在正文末尾说明原因。"
+    "路径不确定时先自己确认文件存在，不要凭猜写标记。"
+    "只有用户确有取文件的需求时才用它，不要平白无故外发文件。"
 )
 
 
@@ -310,6 +318,10 @@ def list_all_sessions():
             cwd, title = _peek_session_meta(entry.path)
             results.append({
                 "project": cwd or project_dir.name,
+                # cwd=None 表示这份 session 文件里没记过工作目录。目录名是把 / 换成 - 编码来的、
+                # 不可逆（路径本身含 - 时还原不出），故这类会话只能只读展示、不能接管：
+                # claude --resume 必须在原 cwd 下跑才找得到它。
+                "cwd": cwd,
                 "session_id": entry.name[:-len(".jsonl")],
                 "title": title,
                 "mtime": mtime,
@@ -342,6 +354,59 @@ def _peek_session_meta(path, max_lines=200):
     except OSError:
         pass
     return cwd, title
+
+
+def session_exists(claude_session_id, work_dir):
+    """磁盘上是否有这份 session 文件（接管前的存在性校验）。"""
+    project_key = work_dir.replace("/", "-")
+    path = os.path.expanduser(f"~/.claude/projects/{project_key}/{claude_session_id}.jsonl")
+    return os.path.exists(path)
+
+
+def session_tail(claude_session_id, work_dir, rounds=3, max_chars=600):
+    """读磁盘 session 文件，取最近 rounds 轮真实对话（user/assistant 的纯文本），正序返回
+    [{"role", "content"}, ...]。用于接管本机会话后回显「上次聊到哪」——这段历史只存在于
+    本机 jsonl 里，bot 自己的 messages 表没有。取不到返回 []。
+
+    只收 text 块：tool_use / tool_result 是过程噪音，回显出来会把群刷爆；以 < 开头的
+    （<command-name>、<local-command-stdout> 之类 CLI 注入）也跳过，那不是人说的话。
+    """
+    project_key = work_dir.replace("/", "-")
+    path = os.path.expanduser(f"~/.claude/projects/{project_key}/{claude_session_id}.jsonl")
+    if not os.path.exists(path):
+        return []
+    turns = []
+    try:
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                msg = event.get("message")
+                if not isinstance(msg, dict):
+                    continue
+                role = msg.get("role")
+                if role not in ("user", "assistant"):
+                    continue
+                content = msg.get("content")
+                if isinstance(content, str):
+                    text = content
+                elif isinstance(content, list):
+                    text = "\n".join(b.get("text", "") for b in content
+                                     if isinstance(b, dict) and b.get("type") == "text")
+                else:
+                    continue
+                text = text.strip()
+                if not text or text.startswith("<"):
+                    continue
+                turns.append({"role": role, "content": text[:max_chars]})
+    except OSError:
+        return []
+    return turns[-rounds * 2:]
 
 
 def delete_claude_session(claude_session_id, work_dir):

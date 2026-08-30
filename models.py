@@ -57,6 +57,12 @@ class Conversation(Base):
     claude_session_id: Mapped[str | None] = mapped_column(String(64))
     label: Mapped[str | None] = mapped_column(String(255))
     model: Mapped[str | None] = mapped_column(String(64))  # 该对话选定的模型，NULL=默认
+    # 该对话执行时的工作目录，NULL=用 bot 自己的 work_dir。只有「接管本机已有会话」时才非空：
+    # claude --resume 按 cwd 反查 session 文件，不在原项目目录下跑必然 "No conversation found"。
+    cwd: Mapped[str | None] = mapped_column(String(512))
+    # 该对话是否是从本机接管来的（非本 bot 创建）。/del 时只解绑、不删磁盘 session 文件——
+    # 那是用户自己在终端里的对话，删掉等于毁了他的现场。
+    external: Mapped[bool] = mapped_column(Boolean, default=False)
     is_current: Mapped[bool] = mapped_column(Boolean, default=False)
     position: Mapped[int] = mapped_column(Integer, default=0)
     created_at: Mapped["DateTime"] = mapped_column(DateTime, server_default=func.now())

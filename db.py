@@ -41,6 +41,8 @@ def migrate(engine):
     adds = [
         ("sessions", "model", "VARCHAR(64)"),
         ("messages", "model", "VARCHAR(64)"),
+        ("sessions", "cwd", "VARCHAR(512)"),
+        ("sessions", "external", "BOOLEAN NOT NULL DEFAULT FALSE"),
     ]
     with engine.begin() as c:
         for tbl, col, typ in adds:
@@ -90,7 +92,8 @@ def load_state(s, chat_id):
     ).all()
     for conv in rows:
         data["list"].append({"id": conv.claude_session_id, "label": conv.label,
-                             "model": conv.model, "_row_id": conv.id})
+                             "model": conv.model, "cwd": conv.cwd,
+                             "external": bool(conv.external), "_row_id": conv.id})
         if conv.is_current:
             data["current"] = len(data["list"]) - 1
 
@@ -123,11 +126,14 @@ def save_bot_state(s, chat_id, permit, unsafe):
     s.merge(BotState(chat_id=chat_id, permit=permit, unsafe=unsafe))
 
 
-def insert_session(s, chat_id, label, position, claude_sid=None):
-    """新建一条 session 行，返回其代理主键 _row_id"""
+def insert_session(s, chat_id, label, position, claude_sid=None, cwd=None, external=False):
+    """新建一条 session 行，返回其代理主键 _row_id。
+    cwd/external 只在「接管本机已有会话」时给：cwd 是该 session 的原项目目录，
+    external 让 /del 只解绑不删盘。"""
     conv = Conversation(
         chat_id=chat_id,
         claude_session_id=claude_sid, label=label, position=position,
+        cwd=cwd, external=external,
     )
     s.add(conv)
     s.flush()  # 拿到自增主键
