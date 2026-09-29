@@ -44,31 +44,40 @@ DB 访问走 SQLAlchemy ORM；每次操作开短生命周期 Session（线程安
 
 ## 命令清单（2026-09-29 精简后）
 
-命令只保留**不可替代的护栏与高频入口**，共 7 个；其余能力一律走自然语言。
+命令只保留**不可替代的护栏与高频入口**，共 10 个；其余能力一律走自然语言。
 
 | 命令 | 作用 | 保留理由 |
 |---|---|---|
 | `/new` | 新建对话（清空历史） | 护栏，不可替代 |
 | `/sessions` | 列对话，回序号切换 | 高频（14 次/18 天） |
 | `/del <序号>` | 删对话 | 高频（13 次/18 天） |
+| `/name <名称>` | 给当前对话改名 | 机主要求保留（2026-09-29 恢复） |
+| `/allsessions [关键词]` | 列本机全部会话，回序号接管 | 机主要求保留（2026-09-29 恢复） |
+| `/permit` | 开关工作区文件读写（acceptEdits） | 护栏，**绝不能交给 LLM 自己开** |
 | `/unsafe` | 开关最高权限 | 护栏，**绝不能交给 LLM 自己开** |
 | `/usage` | 查订阅用量 | 高频（18 次/18 天） |
 | `/debate <辩题>` | 正反方各 5 轮辩论 | 待阶段 4 重构为 skill 后移除 |
 | `/help` | 帮助 | — |
 
-**2026-09-29 撤除的 10 个命令**（依据：18 天 journal + 79 天 `audit_logs` + `sessions` 表实测）：
+**2026-09-29 撤除的 9 个命令**（依据：18 天 journal + 79 天 `audit_logs` + `sessions` 表实测）：
 `/compact`（手动 0 次，24 次压缩全自动）、`/retry`（2 次/79 天）、`/files`（0）、
 `/model`（**59 个会话 `sessions.model` 全为 NULL，从未生效过**）、`/context`（1 次，与 inline
-`ctx N%` 重复）、`/wiki`（0，CLI 等价）、`/permit`（0，98% 轮次直接用 unsafe）、`/name`（0）、
-`/allsessions`（0）、`/sync` `/resync`（0，见 gitsync 段）、`/restart`（0，见「自杀式重启陷阱」）。
+`ctx N%` 重复）、`/wiki`（0，CLI 等价）、`/sync` `/resync`（0，见 gitsync 段）、
+`/restart`（0，见「自杀式重启陷阱」）。
 
-撤除的是**命令入口**，不是能力：`_do_compact`、`_wiki_reference`、`list_all_sessions`、
+**同日恢复的 3 个**（`/allsessions`、`/name`、`/permit`）：撤除依据只有「零使用」，而零使用可能
+只是这三个还没轮到用、不等于没价值——`/permit` 更是与 `/unsafe` 同源的权限护栏，护栏按定义就不能
+交给 LLM 自己开，不该跟纯便利命令一起算。机主要求恢复后按原样搬回（`cmd_allsessions` /
+`_attach_session` / `cmd_name` / `cmd_permit` + `handle_select` 的 `allsession` 分支），
+唯一删掉的是两句「发 /retry 重跑上一条任务」提示——`/retry` 与 `last_task` 已不存在。
+
+撤除的是**命令入口**，不是能力：`_do_compact`、`_wiki_reference`、
 `pending_uploads` 等底层全部保留，阶段 2~4 会以 tool 形式回归。详见 `docs/OPTIMIZATION.md`。
 
 **一 chat_id 一 work_dir**：每个机器人绑定一个群（chat_id）+ 一个工作目录（`work_dir` 单字符串，
 省略回退家目录 `~`），chat_id 唯一。视觉隔离靠分群；一个群内用 `/new`、`/sessions` 手动管理多个对话。
 会话与 `permit`/`unsafe` 权限均按 `chat_id` 分区，持久化在 `bot_state` 表。
-**唯一的例外是「接管本机会话」**（底层能力仍在，命令入口已撤除）：那种会话在 `sessions.cwd` 里记着自己的
+**唯一的例外是「接管本机会话」**（`/allsessions`）：那种会话在 `sessions.cwd` 里记着自己的
 项目目录、在那里跑，见下文「接管本机 Claude Code 会话」。取工作目录一律走 `Bot.entry_cwd()`，
 别再直接读 `self.work_dir`。
 
@@ -127,10 +136,10 @@ Claude 可据此按人分账（`resume` 项目就用它做 `--owner`）。拿不
 **接管本机 Claude Code 会话**：扫 `~/.claude/projects` 列出本机全部会话，接管后在本群建一个
 绑定该 `session_id` 的会话条目，之后每轮 `--resume` 都在**那个会话原本的项目目录**下跑，
 等于把终端里的对话搬到飞书接着聊。
-⚠️ **`/allsessions` 命令已于 2026-09-29 撤除**（18 天零使用，「列表+数序号」交互太笨重）。
-底层能力（`claude_runner.list_all_sessions` / `session_exists` / `session_tail`、`sessions.cwd`
-/ `external` 列、`Bot.entry_cwd()`）**全部保留**，等阶段 4 的 tool 落地后用自然语言接管。
-在那之前这条链路没有入口，属于暂时休眠的代码。
+入口是 `/allsessions [关键词]`（一度在 2026-09-29 撤除、同日按机主要求恢复）：列表按最近使用倒序、
+最多 30 条，关键词对标题与项目路径做子串过滤（靠它捞更早的会话），回复序号即接管。
+阶段 4 的 tool 落地后会多一条自然语言入口，命令仍保留——「列表+数序号」在会话多时比让 LLM
+猜哪个会话更准。
 - **cwd 必须下放到会话级**，这是能不能做成的关键：Claude Code 的 session 文件存在
   `~/.claude/projects/<cwd 把 / 换成 - >/<sid>.jsonl`，`--resume` 在别的目录下跑必然
   `No conversation found`。故 `sessions` 表加 `cwd` 列（NULL=用本 bot 的 `work_dir`），

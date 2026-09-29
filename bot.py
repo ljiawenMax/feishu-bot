@@ -64,13 +64,16 @@ HELP_TEXT = "\n".join([
     "/sessions  — 列出对话，回复序号切换",
     "/new       — 新建对话（清空历史）",
     "/del <序号> — 删除指定对话（序号见 /sessions；接管的本机会话只解绑、不删盘）",
+    "/name <名称> — 给当前对话改名（便于在 /sessions 里认出来）",
+    "/allsessions [关键词] — 列出本机全部 Claude Code 会话（跨项目/跨群），回复序号即可接管续聊",
+    "/permit    — 开关工作区文件读写（acceptEdits，不跑命令）",
     "/unsafe    — 开关最高权限（跳过全部权限校验，可执行 bash 命令，谨慎）",
     "/usage     — 查看 Claude 订阅用量（5 小时窗 / 7 天）",
     "/debate <辩题> — 正反方各5轮辩论（每轮实时推送）",
     "/help      — 显示此帮助",
     "",
     "其余能力一律用自然语言：发文件、重启服务、压缩上下文（已自动）、",
-    "查知识库、接管本机会话等，直接说就行。",
+    "查知识库等，直接说就行。",
 ])
 
 # 知识库检索注入：每轮取 top_k 个条目、总字数上限（越大越费 context，见 CLAUDE.md）
@@ -126,12 +129,11 @@ class Bot:
         state = self.db(db.load_state, self.chat_id) or {}
         # {"list": [{id, label, model, _row_id}, ...], "current": idx, "history": [...]}
         self.sessions = state.get("sessions") or {"list": [], "current": 0, "history": []}
-        # acceptEdits：工作区内读写文件。/permit 命令已撤除（实测 0 次使用，98% 轮次直接用
-        # unsafe），该档位仅由 cmd_unsafe 的互斥逻辑清零；要开只能改 DB。
-        self.permit_mode = state.get("permit", False)
+        self.permit_mode = state.get("permit", False)  # acceptEdits：工作区内读写文件
         self.unsafe_mode = state.get("unsafe", False)  # 跳过全部权限校验
 
-        self.pending = None   # "session"：等待用户回复序号切换对话
+        self.pending = None   # "session" | "allsession"，等待用户回复序号的类型
+        self.pending_all = []  # /allsessions 本次列出的本机会话（供回序号接管），随 pending 失效
 
         # 上传文件的「待附带」缓冲：用户传完图/文件后，下一条任务消息自动带上落盘路径。
         # 传完文件紧接着就是要用它——让用户再手打一遍路径纯属多余。只在 inbox 线程读写
@@ -156,6 +158,9 @@ class Bot:
             "/usage": self.cmd_usage,
             "/del": self.cmd_del,
             "/debate": self.cmd_debate,
+            "/allsessions": self.cmd_allsessions,
+            "/name": self.cmd_name,
+            "/permit": self.cmd_permit,
         }
 
     # ------------------------------------------------------------------ DB
@@ -300,8 +305,116 @@ class Bot:
             self.pending = "session"
             feishu_api.reply_message(self.client, msg["id"], feishu_api.build_sessions_prompt(data["list"], data["current"]))
 
+    def cmd_allsessions(self, msg, arg):
+        """列出本机全部 Claude Code 会话（扫 ~/.claude/projects，跨项目/跨群/跨 bot），
+        回复序号即可**接管续聊**：在本群建一个绑定该 session_id + 该项目 cwd 的会话条目，
+        之后每轮 claude --resume 都在原目录下跑，等于把终端里的那段对话搬到飞书接着聊。
+
+        arg 为可选关键词，对标题与项目路径做子串过滤（列表只显示 30 条，靠它捞更早的会话）。"""
+        sessions = claude_runner.list_all_sessions()
+        kw = (arg or "").strip().lower()
+        if kw:
+            sessions = [s for s in sessions
+                        if kw in (s["title"] or "").lower() or kw in (s["project"] or "").lower()]
+        if not sessions:
+            hint = f"没有匹配「{arg}」的会话" if kw else "本机暂无 Claude Code 会话记录"
+            feishu_api.reply_message(self.client, msg["id"], hint)
+            return
+        limit = 30
+        shown = sessions[:limit]
+        now = time.time()
+        head = f"本机共 {len(sessions)} 个 Claude Code 会话"
+        if kw:
+            head += f"（匹配「{arg}」）"
+        head += f"，按最近使用倒序，最多显示 {limit} 条："
+        lines = [head]
+        for i, s in enumerate(shown, 1):
+            age = self._human_elapsed(max(0, int(now - s["mtime"]))) + "前"
+            title = s["title"] or "(无标题)"
+            mark = "" if s["cwd"] else "  ⚠️无法接管(未记录工作目录)"
+            lines.append(f"{i}. [{age}] {title}{mark}")
+            lines.append(f"   项目：{s['project']}")
+            lines.append(f"   session：{s['session_id']}")
+        lines.append("")
+        lines.append("回复序号即可接管该会话并在本群继续（不影响本机原会话文件，续聊会写进同一份）")
+        self.pending = "allsession"
+        self.pending_all = shown
+        feishu_api.reply_message(self.client, msg["id"], "\n".join(lines))
+        print(f"[{self.name}][allsessions] total={len(sessions)} shown={len(shown)} kw={kw!r}")
+
+    def _attach_session(self, msg, s):
+        """把一个本机会话接管进本群：新建绑定 session_id + 原项目 cwd 的会话条目并切过去。
+        本机 jsonl 里的历史 bot 的 DB 没有，故顺带回显最近几轮，方便接上话头。"""
+        cwd, sid = s.get("cwd"), s["session_id"]
+        if not cwd:
+            feishu_api.reply_message(self.client, msg["id"],
+                                     "这个会话没记录工作目录，无法接管（--resume 必须在原目录下跑）")
+            return
+        if not os.path.isdir(cwd):
+            feishu_api.reply_message(self.client, msg["id"], f"原项目目录已不存在，无法接管：{cwd}")
+            return
+        if not claude_runner.session_exists(sid, cwd):
+            feishu_api.reply_message(self.client, msg["id"], "会话文件已不存在，无法接管")
+            return
+
+        with self.lock:  # 与 worker 的 update_session 互斥
+            data = self.sessions
+            existing = next((i for i, e in enumerate(data["list"]) if e.get("id") == sid), None)
+            reattached = existing is not None
+            if reattached:  # 已接管过：直接切过去，别撞 sessions 的 (chat_id, sid) 唯一索引
+                data["current"] = existing
+                entry = data["list"][existing]
+            else:
+                label = (s["title"] or os.path.basename(cwd.rstrip("/")) or "本机会话")[:40]
+                entry = self.make_session(label=f"[本机] {label}", claude_sid=sid,
+                                          cwd=cwd, external=True)
+                data["list"].append(entry)
+                data["current"] = len(data["list"]) - 1
+            self.set_current(entry)
+            data["history"] = self.load_history(sid)
+        self.pending = None
+        self.pending_all = []
+
+        note = "已切回先前接管的会话" if reattached else "已接管本机会话"
+        lines = [f"✅ {note}：{entry['label']}", f"工作目录：{cwd}", f"session：{sid}"]
+        # 先把 context 占用摆出来：终端里聊了很久的会话往往一上来就接近上限，
+        # 不说清楚的话，用户发第一条消息就撞上护栏会一头雾水。
+        pct = self._context_pct(sid)
+        if pct is not None:
+            lines.append(f"当前 context 占用 {pct:.0f}%"
+                         + ("（较高，续聊可能先触发自动压缩）" if pct >= self.auto_compact_threshold > 0
+                            else ""))
+        lines.append("后续消息将在该目录下续聊；/sessions 可切回本群自己的对话。")
+        feishu_api.reply_message(self.client, msg["id"], "\n".join(lines))
+        # 回显最近几轮，接上话头（这段历史只在本机 jsonl 里，DB 查不到）
+        tail = []
+        try:
+            tail = claude_runner.session_tail(sid, cwd)
+        except Exception as e:
+            print(f"[{self.name}][attach-tail-error] {e}")
+        for turn in tail:
+            who = "你" if turn["role"] == "user" else "Claude"
+            feishu_api.reply_message(self.client, msg["id"],
+                                     f"{who}：\n{turn['content']}", tag="history")
+        print(f"[{self.name}][attach] sid={sid[:8]}… cwd={cwd}")
+
     def cmd_help(self, msg, arg):
         feishu_api.reply_message(self.client, msg["id"], HELP_TEXT)
+
+    def cmd_name(self, msg, arg):
+        """给当前对话改名——/sessions 列表里全是「新对话 09-29 16:40」时根本认不出哪个是哪个。"""
+        if not arg:
+            feishu_api.reply_message(self.client, msg["id"], "用法：/name <名称>")
+            return
+        data = self.sessions
+        if data["list"]:
+            entry = data["list"][data["current"]]
+            entry["label"] = arg
+            if entry.get("_row_id"):
+                self.db(db.update_session, entry["_row_id"], label=arg)
+            feishu_api.reply_message(self.client, msg["id"], f"当前对话已命名为「{arg}」")
+        else:
+            feishu_api.reply_message(self.client, msg["id"], "当前没有活跃的对话")
 
     def cmd_new(self, msg, arg):
         with self.lock:  # 与 worker 的 update_session 互斥，防会话列表被并发改乱
@@ -315,6 +428,19 @@ class Bot:
         self.pending = None
         feishu_api.reply_message(self.client, msg["id"], f"已创建新对话（共 {total} 个），发送任务即可开始")
         print(f"[{self.name}][new-session] total={total}")
+
+    def cmd_permit(self, msg, arg):
+        self.permit_mode = not self.permit_mode
+        on = self.permit_mode
+        # 与 unsafe 互斥：开 permit 则关掉 unsafe
+        cleared = on and self.unsafe_mode
+        if on:
+            self.unsafe_mode = False
+        self.save_bot_state()
+        status = "已开启（可在工作区读写/修改文件，不执行命令）" if on else "已关闭"
+        note = "（已自动关闭最高权限 unsafe）" if cleared else ""
+        feishu_api.reply_message(self.client, msg["id"], f"权限模式 {status}{note}")
+        print(f"[{self.name}][permit]={on}")
 
     def cmd_unsafe(self, msg, arg):
         self.unsafe_mode = not self.unsafe_mode
@@ -517,7 +643,7 @@ class Bot:
         if self.unsafe_mode:
             return "⚠️ 最高权限(unsafe)开启中，可执行任意命令 — 用完发 /unsafe 关闭"
         if self.permit_mode:
-            return "🔓 文件读写(permit)开启中 — 发 /unsafe 两次可清掉该档位"
+            return "🔓 文件读写(permit)开启中 — 用完发 /permit 关闭"
         return ""
 
     def _start_heartbeat(self, msg_id):
@@ -943,22 +1069,27 @@ class Bot:
                     detail=(f"sent_id={s.get('sent_id')}" if s["ok"] else s.get("msg")))
 
     def handle_select(self, msg, idx):
-        """pending 状态下用数字消息选择本群对话。"""
-        if self.pending != "session":
-            return
-        sessions = self.sessions["list"]
-        if 0 <= idx < len(sessions):
-            with self.lock:  # 与 worker 的 update_session 互斥
-                self.sessions["current"] = idx
-                entry = sessions[idx]
-                self.set_current(entry)
-                self.sessions["history"] = self.load_history(entry["id"])
-            self.pending = None
-            feishu_api.reply_message(self.client, msg["id"], f"已切换到对话 {idx + 1}：{entry['label']}")
-            self._send_recent_history(msg["id"])
-            print(f"[{self.name}][session] switched to idx={idx}")
-        else:
-            feishu_api.reply_message(self.client, msg["id"], f"无效序号，请输入 1～{len(sessions)}")
+        """pending 状态下用数字消息选择：本群对话（/sessions）/ 本机会话接管（/allsessions）。"""
+        if self.pending == "session":
+            sessions = self.sessions["list"]
+            if 0 <= idx < len(sessions):
+                with self.lock:  # 与 worker 的 update_session 互斥
+                    self.sessions["current"] = idx
+                    entry = sessions[idx]
+                    self.set_current(entry)
+                    self.sessions["history"] = self.load_history(entry["id"])
+                self.pending = None
+                feishu_api.reply_message(self.client, msg["id"], f"已切换到对话 {idx + 1}：{entry['label']}")
+                self._send_recent_history(msg["id"])
+                print(f"[{self.name}][session] switched to idx={idx}")
+            else:
+                feishu_api.reply_message(self.client, msg["id"], f"无效序号，请输入 1～{len(sessions)}")
+        elif self.pending == "allsession":
+            shown = self.pending_all
+            if 0 <= idx < len(shown):
+                self._attach_session(msg, shown[idx])
+            else:
+                feishu_api.reply_message(self.client, msg["id"], f"无效序号，请输入 1～{len(shown)}")
 
     def handle_upload(self, msg):
         """下载并安全存储上传的图片/文件/压缩包，写台账，回复保存路径。"""
