@@ -12,25 +12,23 @@ import os
 import queue
 import re
 import subprocess
-import tempfile
 import threading
 import time
 
 import claude_runner
 import db
 import feishu_api
-import gitsync
 import uploads
 import usage
 import wiki_index
 import wiki_sync
 from ops import snapshot as ops_snapshot
 
-# Claude 标准上下文窗口大小（token）；用于 /context 计算占用百分比
+# Claude 标准上下文窗口大小（token）；用于计算 context 占用百分比（每条回复 inline 附带）
 CONTEXT_WINDOW = 200000
 
 # context 占用护栏阈值（百分比）：随每条回复 inline 提示，越高越醒目
-CONTEXT_WARN = 60   # 软提醒：建议 /new 或 /compact
+CONTEXT_WARN = 60   # 软提醒：建议 /new
 CONTEXT_HIGH = 80   # 强提醒
 CONTEXT_HARD = 92   # 硬闸：未开自动压缩时，触顶即暂停执行、要求手动处理
 
@@ -46,11 +44,11 @@ COMPACT_PROMPT = (
 # _context_guard 返回状态
 GUARD_PROCEED, GUARD_BLOCKED, GUARD_COMPACTED = "proceed", "blocked", "compacted"
 
-# /debate 正反方各自的发言轮数
+# /debate 正反方各自的发言轮数（阶段 4 将重构为 skill）
 DEBATE_ROUNDS = 5
 
 # 附件回传协议：Claude 在回复里写 [[SEND_FILE:/abs/path]]，bot 剥离标记并把文件发到群。
-# 这是**通用能力**、每轮对话都生效，不绑定任何命令（/sync 的 bundle 走的是另一条独立路径）。
+# 这是**通用能力**、每轮对话都生效，不绑定任何命令。
 # 目录白名单已按机主要求撤除（个人自用、单机部署），限制只剩「已存在的普通文件 + 体积 + 条数」，
 # 见 Bot._extract_send_files 里的说明与代价。
 SEND_FILE_RE = re.compile(r"\[\[SEND_FILE:([^\]\n]+)\]\]")
@@ -64,26 +62,15 @@ UPLOAD_CONTEXT_TTL = 30 * 60
 HELP_TEXT = "\n".join([
     "可用命令：",
     "/sessions  — 列出对话，回复序号切换",
-    "/allsessions [关键词] — 列出本机全部 Claude Code 会话（跨项目/跨群），回复序号即可接管续聊",
     "/new       — 新建对话（清空历史）",
-    "/name <名称> — 重命名当前对话",
     "/del <序号> — 删除指定对话（序号见 /sessions；接管的本机会话只解绑、不删盘）",
-    "/files [clear] — 查看/清空「下一条消息会自动附带」的上传文件",
-    "/permit    — 开关工作区文件读写（acceptEdits，不跑命令）",
     "/unsafe    — 开关最高权限（跳过全部权限校验，可执行 bash 命令，谨慎）",
-    "/model     — 选择当前对话使用的模型",
-    "/context   — 查看当前对话的 context 窗口占用",
-    "/compact   — 压缩当前对话上下文（摘要后开新对话、自动带上摘要，省额度）",
     "/usage     — 查看 Claude 订阅用量（5 小时窗 / 7 天）",
-    "/retry     — 用当前权限重跑上一条任务",
-    "/sync [说明] — 把改动在本地提交（可自定义 commit message）并把增量 .bundle 发出"
-    "（远程 git fetch + merge --ff-only）",
-    "/resync    — 全量重新同步（忽略此前增量基线，远程 git fetch + reset --hard 强制拉平；/sync 报 "
-    "non-fast-forward 时用这个恢复）",
     "/debate <辩题> — 正反方各5轮辩论（每轮实时推送）",
-    "/wiki [sync|search <词>|spaces] — 飞书知识库：查看状态 / 立即同步 / 调试检索 / 列空间",
-    "/restart   — 重启 feishu-bot 服务（带外自救；起来后各群会收到启动通知）",
     "/help      — 显示此帮助",
+    "",
+    "其余能力一律用自然语言：发文件、重启服务、压缩上下文（已自动）、",
+    "查知识库、接管本机会话等，直接说就行。",
 ])
 
 # 知识库检索注入：每轮取 top_k 个条目、总字数上限（越大越费 context，见 CLAUDE.md）
@@ -94,7 +81,7 @@ WIKI_MAX_CHARS = 3000
 class Bot:
     """飞书消息驱动 Claude Code 的轮询服务，状态持久化在 MySQL。"""
 
-    def __init__(self, bot_cfg, session_factory, task_timeout, models=None,
+    def __init__(self, bot_cfg, session_factory, task_timeout,
                  heartbeat_interval=60, run_slot=None, client=None,
                  auto_compact_threshold=75, wiki_cfg=None):
         self.name = bot_cfg["name"]
@@ -111,7 +98,6 @@ class Bot:
         # 发送/下载用的 SDK 客户端（同 app_id 的多个 Bot 共用一个；token 由其内部管理）
         self.client = client
         self.task_timeout = task_timeout
-        self.models = models or ["opus", "sonnet", "haiku"]  # /model 可选清单
         self.heartbeat_interval = heartbeat_interval  # 长任务心跳间隔秒数，0=禁用
         # 全局并发闸（所有 bot 共享一个）：限制同时运行的 claude 进程数；未传时不限流
         self.run_slot = run_slot or threading.BoundedSemaphore(1000)
@@ -119,12 +105,6 @@ class Bot:
         # 自动压缩阈值（context 占用百分比）：续聊前若达此值，先把本地历史摘要成一段
         # 上下文、开新对话再执行，避免每轮都重复烧满额度。<=0 关闭（改由 CONTEXT_HARD 硬闸兜底）。
         self.auto_compact_threshold = auto_compact_threshold
-
-        # 增量 bundle 同步：每轮任务后把「上次同步以来」的改动打包成 .bundle 发到群，供远程 git fetch。
-        # 需 work_dir 是 git 仓库；sync_patch=True 开启自动发送（/sync /resync 手动发送不受此开关限制）。
-        # 是否 git 仓库改为命令执行时实时判断（见 _git_ready），不在启动时缓存——
-        # 允许「先起服务、后 git init」，不必为此重启进程。
-        self.sync_patch = bool(bot_cfg.get("sync_patch", False))
 
         # 飞书知识库 RAG：配了 wiki.space_id 才启用。索引按 space_id 分区（不按 chat_id），
         # 多个群配同一知识库时共享一份索引，不重复建也不重复占内存。
@@ -137,7 +117,7 @@ class Bot:
                                               self.wiki_space_id)
                          if self.wiki_space_id else None)
         self.wiki_index = None          # 加载好的索引；整体替换，读侧无锁
-        self.wiki_status = "未同步"      # /wiki 展示用
+        self.wiki_status = "未同步"      # 最近一次同步结果（供日志/排查）
         self.wiki_lock = threading.Lock()  # 只护「同步+重建」这段，检索不加锁
 
         self.Session = session_factory
@@ -146,12 +126,12 @@ class Bot:
         state = self.db(db.load_state, self.chat_id) or {}
         # {"list": [{id, label, model, _row_id}, ...], "current": idx, "history": [...]}
         self.sessions = state.get("sessions") or {"list": [], "current": 0, "history": []}
-        self.permit_mode = state.get("permit", False)  # acceptEdits：工作区内读写文件
+        # acceptEdits：工作区内读写文件。/permit 命令已撤除（实测 0 次使用，98% 轮次直接用
+        # unsafe），该档位仅由 cmd_unsafe 的互斥逻辑清零；要开只能改 DB。
+        self.permit_mode = state.get("permit", False)
         self.unsafe_mode = state.get("unsafe", False)  # 跳过全部权限校验
 
-        self.pending = None   # "session" | "model" | "allsession"，等待用户回复序号的类型
-        self.pending_all = []  # /allsessions 本次列出的本机会话（供回序号接管），随 pending 失效
-        self.last_task = None  # {"text", "msg_id", "session_id"}，用于 /retry 重跑
+        self.pending = None   # "session"：等待用户回复序号切换对话
 
         # 上传文件的「待附带」缓冲：用户传完图/文件后，下一条任务消息自动带上落盘路径。
         # 传完文件紧接着就是要用它——让用户再手打一遍路径纯属多余。只在 inbox 线程读写
@@ -170,24 +150,12 @@ class Bot:
         # 命令分发表：命令 -> 处理方法(msg, arg)
         self.commands = {
             "/sessions": self.cmd_sessions,
-            "/allsessions": self.cmd_allsessions,
             "/help": self.cmd_help,
-            "/name": self.cmd_name,
             "/new": self.cmd_new,
-            "/permit": self.cmd_permit,
             "/unsafe": self.cmd_unsafe,
-            "/model": self.cmd_model,
-            "/context": self.cmd_context,
-            "/compact": self.cmd_compact,
             "/usage": self.cmd_usage,
             "/del": self.cmd_del,
-            "/files": self.cmd_files,
-            "/retry": self.cmd_retry,
-            "/sync": self.cmd_sync,
-            "/resync": self.cmd_resync,
             "/debate": self.cmd_debate,
-            "/wiki": self.cmd_wiki,
-            "/restart": self.cmd_restart,
         }
 
     # ------------------------------------------------------------------ DB
@@ -332,115 +300,8 @@ class Bot:
             self.pending = "session"
             feishu_api.reply_message(self.client, msg["id"], feishu_api.build_sessions_prompt(data["list"], data["current"]))
 
-    def cmd_allsessions(self, msg, arg):
-        """列出本机全部 Claude Code 会话（扫 ~/.claude/projects，跨项目/跨群/跨 bot），
-        回复序号即可**接管续聊**：在本群建一个绑定该 session_id + 该项目 cwd 的会话条目，
-        之后每轮 claude --resume 都在原目录下跑，等于把终端里的那段对话搬到飞书接着聊。
-
-        arg 为可选关键词，对标题与项目路径做子串过滤（列表只显示 30 条，靠它捞更早的会话）。"""
-        sessions = claude_runner.list_all_sessions()
-        kw = (arg or "").strip().lower()
-        if kw:
-            sessions = [s for s in sessions
-                        if kw in (s["title"] or "").lower() or kw in (s["project"] or "").lower()]
-        if not sessions:
-            hint = f"没有匹配「{arg}」的会话" if kw else "本机暂无 Claude Code 会话记录"
-            feishu_api.reply_message(self.client, msg["id"], hint)
-            return
-        limit = 30
-        shown = sessions[:limit]
-        now = time.time()
-        head = f"本机共 {len(sessions)} 个 Claude Code 会话"
-        if kw:
-            head += f"（匹配「{arg}」）"
-        head += f"，按最近使用倒序，最多显示 {limit} 条："
-        lines = [head]
-        for i, s in enumerate(shown, 1):
-            age = self._human_elapsed(max(0, int(now - s["mtime"]))) + "前"
-            title = s["title"] or "(无标题)"
-            mark = "" if s["cwd"] else "  ⚠️无法接管(未记录工作目录)"
-            lines.append(f"{i}. [{age}] {title}{mark}")
-            lines.append(f"   项目：{s['project']}")
-            lines.append(f"   session：{s['session_id']}")
-        lines.append("")
-        lines.append("回复序号即可接管该会话并在本群继续（不影响本机原会话文件，续聊会写进同一份）")
-        self.pending = "allsession"
-        self.pending_all = shown
-        feishu_api.reply_message(self.client, msg["id"], "\n".join(lines))
-        print(f"[{self.name}][allsessions] total={len(sessions)} shown={len(shown)} kw={kw!r}")
-
-    def _attach_session(self, msg, s):
-        """把一个本机会话接管进本群：新建绑定 session_id + 原项目 cwd 的会话条目并切过去。
-        本机 jsonl 里的历史 bot 的 DB 没有，故顺带回显最近几轮，方便接上话头。"""
-        cwd, sid = s.get("cwd"), s["session_id"]
-        if not cwd:
-            feishu_api.reply_message(self.client, msg["id"],
-                                     "这个会话没记录工作目录，无法接管（--resume 必须在原目录下跑）")
-            return
-        if not os.path.isdir(cwd):
-            feishu_api.reply_message(self.client, msg["id"], f"原项目目录已不存在，无法接管：{cwd}")
-            return
-        if not claude_runner.session_exists(sid, cwd):
-            feishu_api.reply_message(self.client, msg["id"], "会话文件已不存在，无法接管")
-            return
-
-        with self.lock:  # 与 worker 的 update_session 互斥
-            data = self.sessions
-            existing = next((i for i, e in enumerate(data["list"]) if e.get("id") == sid), None)
-            reattached = existing is not None
-            if reattached:  # 已接管过：直接切过去，别撞 sessions 的 (chat_id, sid) 唯一索引
-                data["current"] = existing
-                entry = data["list"][existing]
-            else:
-                label = (s["title"] or os.path.basename(cwd.rstrip("/")) or "本机会话")[:40]
-                entry = self.make_session(label=f"[本机] {label}", claude_sid=sid,
-                                          cwd=cwd, external=True)
-                data["list"].append(entry)
-                data["current"] = len(data["list"]) - 1
-            self.set_current(entry)
-            data["history"] = self.load_history(sid)
-        self.pending = None
-        self.pending_all = []
-
-        note = "已切回先前接管的会话" if reattached else "已接管本机会话"
-        lines = [f"✅ {note}：{entry['label']}", f"工作目录：{cwd}", f"session：{sid}"]
-        # 先把 context 占用摆出来：终端里聊了很久的会话往往一上来就接近上限，
-        # 不说清楚的话，用户发第一条消息就撞上护栏会一头雾水。
-        pct = self._context_pct(sid)
-        if pct is not None:
-            lines.append(f"当前 context 占用 {pct:.0f}%"
-                         + ("（较高，续聊可能先触发自动压缩）" if pct >= self.auto_compact_threshold > 0
-                            else ""))
-        lines.append("后续消息将在该目录下续聊；/sessions 可切回本群自己的对话。")
-        feishu_api.reply_message(self.client, msg["id"], "\n".join(lines))
-        # 回显最近几轮，接上话头（这段历史只在本机 jsonl 里，DB 查不到）
-        tail = []
-        try:
-            tail = claude_runner.session_tail(sid, cwd)
-        except Exception as e:
-            print(f"[{self.name}][attach-tail-error] {e}")
-        for turn in tail:
-            who = "你" if turn["role"] == "user" else "Claude"
-            feishu_api.reply_message(self.client, msg["id"],
-                                     f"{who}：\n{turn['content']}", tag="history")
-        print(f"[{self.name}][attach] sid={sid[:8]}… cwd={cwd}")
-
     def cmd_help(self, msg, arg):
         feishu_api.reply_message(self.client, msg["id"], HELP_TEXT)
-
-    def cmd_name(self, msg, arg):
-        if not arg:
-            feishu_api.reply_message(self.client, msg["id"], "用法：/name <名称>")
-            return
-        data = self.sessions
-        if data["list"]:
-            entry = data["list"][data["current"]]
-            entry["label"] = arg
-            if entry.get("_row_id"):
-                self.db(db.update_session, entry["_row_id"], label=arg)
-            feishu_api.reply_message(self.client, msg["id"], f"当前对话已命名为「{arg}」")
-        else:
-            feishu_api.reply_message(self.client, msg["id"], "当前没有活跃的对话")
 
     def cmd_new(self, msg, arg):
         with self.lock:  # 与 worker 的 update_session 互斥，防会话列表被并发改乱
@@ -455,21 +316,6 @@ class Bot:
         feishu_api.reply_message(self.client, msg["id"], f"已创建新对话（共 {total} 个），发送任务即可开始")
         print(f"[{self.name}][new-session] total={total}")
 
-    def cmd_permit(self, msg, arg):
-        self.permit_mode = not self.permit_mode
-        on = self.permit_mode
-        # 与 unsafe 互斥：开 permit 则关掉 unsafe
-        cleared = on and self.unsafe_mode
-        if on:
-            self.unsafe_mode = False
-        self.save_bot_state()
-        status = "已开启（可在工作区读写/修改文件，不执行命令）" if on else "已关闭"
-        note = "（已自动关闭最高权限 unsafe）" if cleared else ""
-        feishu_api.reply_message(self.client, msg["id"], f"权限模式 {status}{note}")
-        print(f"[{self.name}][permit]={on}")
-        if on and self.last_task:
-            feishu_api.reply_message(self.client, msg["id"], "是否用新权限重跑上一条任务？发送 /retry 确认")
-
     def cmd_unsafe(self, msg, arg):
         self.unsafe_mode = not self.unsafe_mode
         on = self.unsafe_mode
@@ -483,80 +329,6 @@ class Bot:
         note = "（已自动关闭文件读写 permit）" if cleared else ""
         feishu_api.reply_message(self.client, msg["id"], f"最高权限 {status}{note}")
         print(f"[{self.name}][unsafe]={on}")
-        if on and self.last_task:
-            feishu_api.reply_message(self.client, msg["id"], "是否用新权限重跑上一条任务？发送 /retry 确认")
-
-    def cmd_model(self, msg, arg):
-        """列出可选模型，回复序号选择（作用于当前对话）。"""
-        # 确保有一个 session 承载模型选择（无则按首用初始化）
-        if not self.sessions["list"]:
-            entry = self.make_session()
-            self.sessions = {"list": [entry], "current": 0, "history": []}
-            self.set_current(entry)
-        cur = self.current_entry()
-        cur_model = cur.get("model") if cur else None
-        options = ["默认（不指定）"] + list(self.models)  # 序号 1=默认，2..=各模型
-        # 当前选中项在 options 里的下标
-        cur_pos = 0 if not cur_model else (self.models.index(cur_model) + 1 if cur_model in self.models else -1)
-        lines = ["选择当前对话使用的模型，回复序号："]
-        for i, name in enumerate(options, 1):
-            lines.append(f"{i}. {name}{' ◀ 当前' if i - 1 == cur_pos else ''}")
-        self.pending = "model"
-        feishu_api.reply_message(self.client, msg["id"], "\n".join(lines))
-
-    def cmd_context(self, msg, arg):
-        """查看当前对话的 context 窗口占用（读磁盘 session 文件的最近一轮用量）。"""
-        entry = self.current_entry()
-        if not entry or not entry.get("id"):
-            feishu_api.reply_message(self.client, msg["id"],
-                                     "当前对话还没开始，暂无 context 信息（先发一条任务）")
-            return
-        info = claude_runner.session_context(entry["id"], self.work_dir)
-        if not info:
-            feishu_api.reply_message(self.client, msg["id"],
-                                     "读不到当前对话的 context 记录（session 文件不存在或尚无用量）")
-            return
-        feishu_api.reply_message(self.client, msg["id"], self._format_context(entry, info))
-        print(f"[{self.name}][context] used={info['total_input']} model={info.get('model')}")
-
-    def cmd_compact(self, msg, arg):
-        """手动压缩当前对话上下文：排入后台 worker，摘要后开新对话并把摘要设为其
-        seed（下一条任务自动带上），从而清空 context 重新计费。"""
-        if not self.sessions.get("history"):
-            feishu_api.reply_message(self.client, msg["id"],
-                                     "当前对话暂无可压缩的历史（先发几条任务再压缩）")
-            return
-        self.task_queue.put({"kind": "compact", "msg_id": msg["id"]})
-        feishu_api.reply_message(self.client, msg["id"], "🗜 已排入后台压缩当前对话上下文…")
-
-    @staticmethod
-    def _fmt_tokens(n):
-        """token 数人性化：42299→42.3k、200000→200k、856→856。"""
-        if n >= 1000:
-            v = n / 1000
-            return f"{v:.0f}k" if v == int(v) else f"{v:.1f}k"
-        return str(n)
-
-    def _format_context(self, entry, info):
-        used = info["total_input"]
-        pct = min(used / CONTEXT_WINDOW * 100, 100)
-        filled = round(pct / 10)
-        bar = "▓" * filled + "░" * (10 - filled)
-        model = info.get("model") or entry.get("model") or "默认"
-        if model.startswith("claude-"):
-            model = model[7:]
-        # 本地历史每轮 = user+assistant 两条
-        turns = len(self.sessions.get("history", [])) // 2
-        return "\n".join([
-            f"📊 当前对话「{entry['label']}」",
-            f"模型：{model}",
-            f"Context：{self._fmt_tokens(used)} / {self._fmt_tokens(CONTEXT_WINDOW)} tokens（{pct:.0f}%）",
-            f"{bar} {pct:.0f}%",
-            f"├ 缓存读取：{self._fmt_tokens(info['cache_read'])}",
-            f"├ 缓存创建：{self._fmt_tokens(info['cache_creation'])}",
-            f"└ 新输入：{self._fmt_tokens(info['input'])}",
-            f"本地历史：{turns} 轮（session 失效时用于重建 context）",
-        ])
 
     def cmd_usage(self, msg, arg):
         """查看 Claude 订阅用量（官方 oauth/usage 端点，按需+缓存）。"""
@@ -572,33 +344,6 @@ class Bot:
             text = f"[error] 查询用量失败: {e}"
         feishu_api.reply_message(self.client, msg["id"], text)
         print(f"[{self.name}][usage] queried")
-
-    def cmd_restart(self, msg, arg):
-        """重启整个 feishu-bot 服务（带外自救通道）。
-
-        **必须交给 systemd-run 起的一次性 unit 去执行**：命令是在 feishu-bot.service 的
-        cgroup 里跑的，直接 `systemctl restart` 会把整个 cgroup（含发命令的这个线程）一起
-        杀掉——表现为无声消失、连回执都发不出去。transient unit 在 cgroup 外，本进程被杀
-        是预期行为。sleep 2 是留给回执的发送窗口。
-        """
-        unit = f"feishu-bot-restart-{int(time.time())}"
-        cmd = ["sudo", "-n", "systemd-run", "--collect", "--no-block", f"--unit={unit}",
-               "/bin/sh", "-c", "sleep 2; systemctl restart feishu-bot.service"]
-        try:
-            r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-        except Exception as e:
-            feishu_api.reply_message(self.client, msg["id"], f"[error] 重启失败: {e}")
-            return
-        if r.returncode != 0:
-            feishu_api.reply_message(self.client, msg["id"],
-                                     f"[error] 重启失败: {(r.stderr or r.stdout).strip()[:400]}")
-            return
-        feishu_api.reply_message(
-            self.client, msg["id"],
-            "🔄 已请求重启服务（2 秒后执行）。\n"
-            "起来后各群会收到「✅ 已启动」通知；一分钟内没收到就是没起来。\n"
-            "注意：重启期间的消息飞书不会补发。")
-        print(f"[{self.name}][restart] scheduled unit={unit}")
 
     def cmd_del(self, msg, arg):
         data = self.sessions
@@ -699,7 +444,7 @@ class Bot:
             self._push_reply(
                 msg_id,
                 f"🛑 当前对话 context 已达 {pct:.0f}%，为避免持续消耗额度已暂停执行。\n"
-                "请发 /compact 压缩上下文，或 /new 开新对话后重试。")
+                "请发 /new 开新对话后重试（或直接说「压缩一下上下文」）。")
             return GUARD_BLOCKED
         return GUARD_PROCEED
 
@@ -736,8 +481,8 @@ class Bot:
             entry = self.current_entry()
         if not history and entry and entry.get("id"):
             # 接管来的本机会话在 messages 表里没有任何历史（那些对话发生在终端里），
-            # 本地历史为空就直接 return False 的话，护栏一触发就是死路：自动压缩压不动、
-            # 手动 /compact 也说「暂无可压缩的历史」，而这类会话恰恰最容易一上来就顶到阈值。
+            # 本地历史为空就直接 return False 的话，护栏一触发就是死路：压缩压不动，
+            # 而这类会话恰恰最容易一上来就顶到阈值。
             # 退而求其次，从磁盘 session 文件读最近若干轮当摘要素材。
             try:
                 history = claude_runner.session_tail(entry["id"], self.entry_cwd(entry),
@@ -772,7 +517,7 @@ class Bot:
         if self.unsafe_mode:
             return "⚠️ 最高权限(unsafe)开启中，可执行任意命令 — 用完发 /unsafe 关闭"
         if self.permit_mode:
-            return "🔓 文件读写(permit)开启中 — 用完发 /permit 关闭"
+            return "🔓 文件读写(permit)开启中 — 发 /unsafe 两次可清掉该档位"
         return ""
 
     def _start_heartbeat(self, msg_id):
@@ -805,41 +550,6 @@ class Bot:
             return f"{seconds // 60}m"
         return f"{seconds // 3600}h{(seconds % 3600) // 60:02d}m"
 
-    def cmd_retry(self, msg, arg):
-        with self.lock:
-            t = self.last_task
-        if not t:
-            feishu_api.reply_message(self.client, msg["id"], "没有可重跑的任务")
-            return
-        self._enqueue({"kind": "retry", "text": t["text"], "msg_id": t["msg_id"],
-                       "session_id": t["session_id"]},
-                      msg["id"], verb="重跑")
-
-    def _git_ready(self):
-        """实时判断 work_dir 是否已是 git 仓库（不缓存：允许启动服务后再 git init）。"""
-        return gitsync.is_git_repo(self.work_dir)
-
-    def cmd_sync(self, msg, arg):
-        """手动把「上次同步以来」的改动本地提交 + 打包成 .bundle 发出（无视 sync_patch 开关）。
-        `/sync <说明>` 可自定义本次提交的 commit message。"""
-        if not self._git_ready():
-            feishu_api.reply_message(self.client, msg["id"],
-                                     f"工作目录不是 git 仓库，无法生成同步文件：{self.work_dir}")
-            return
-        self._send_bundle(msg["id"], announce_empty=True, full=False,
-                          task_text=arg, sender_id=msg.get("sender_id"))
-
-    def cmd_resync(self, msg, arg):
-        """全量重新同步：不依赖增量基线，以本机当前 HEAD 为准打包完整历史，
-        远程 fetch 后 reset --hard 强制拉平。用于 /sync 报 non-fast-forward
-        （基线与远程实际状态不一致）时的恢复手段。"""
-        if not self._git_ready():
-            feishu_api.reply_message(self.client, msg["id"],
-                                     f"工作目录不是 git 仓库，无法生成同步文件：{self.work_dir}")
-            return
-        self._send_bundle(msg["id"], announce_empty=True, full=True,
-                          task_text=arg, sender_id=msg.get("sender_id"))
-
     def cmd_debate(self, msg, arg):
         """辩题入队：两个独立 Claude session 分饰正反方，交替发言，详见 _execute_debate_job。"""
         if not arg:
@@ -850,18 +560,22 @@ class Bot:
 
     # --------------------------------------------------------------- 知识库（RAG）
 
-    def _wiki_refresh(self, log=None):
+    def _wiki_refresh(self, log=None, verbose=False):
         """增量同步知识库 + 重建索引 + 换上新索引。返回 (ok, 描述文本)。
 
         整个过程在 wiki_lock 内串行（同一 bot 不并发重建）；检索侧读的是 self.wiki_index
         引用，这里构建完才整体替换，故检索不需要等锁、也不会读到半截索引。"""
         log = log or (lambda s: print(f"[{self.name}][wiki] {s}"))
+        quiet = (lambda s: None)
         with self.wiki_lock:
             try:
                 stats = wiki_sync.sync_space(self.client, self.wiki_space_id,
                                              self.wiki_dir, self.wiki_root_node, log=log)
+                # 无变更时不透传 log：定时同步每 30 分钟跑一次，实测 18 天里 866 轮
+                # 有 864 轮什么都没变，无条件打印会把 journal 刷成 40% 的空转播报。
+                changed = bool(stats["added"] + stats["updated"] + stats["removed"] + stats["failed"])
                 wiki_index.build(self.wiki_dir, self.wiki_cfg,
-                                 session_factory=self.Session, log=log)
+                                 session_factory=self.Session, log=log if changed else quiet)
                 self.wiki_index = wiki_index.load(self.wiki_dir)
             except Exception as e:
                 self.wiki_status = f"同步失败（{time.strftime('%m-%d %H:%M')}）：{e}"
@@ -870,8 +584,10 @@ class Bot:
         n = len(self.wiki_index) if self.wiki_index else 0
         desc = (f"新增 {stats['added']} / 更新 {stats['updated']} / 删除 {stats['removed']} / "
                 f"未变 {stats['unchanged']}" + (f" / 失败 {stats['failed']}" if stats["failed"] else ""))
+        # wiki_status 始终更新（状态随时可查），只有日志静默——静默不丢信息
         self.wiki_status = f"{time.strftime('%m-%d %H:%M')} 同步完成，{desc}，共 {n} 个条目"
-        print(f"[{self.name}][wiki] {desc}, chunks={n}")
+        if changed or verbose:
+            print(f"[{self.name}][wiki] {desc}, chunks={n}")
         return True, desc
 
     def _wiki_worker(self):
@@ -901,86 +617,6 @@ class Bot:
               + " | ".join(h["breadcrumb"][-40:] for h in hits[:3]))
         return wiki_index.format_reference(hits, max_chars=WIKI_MAX_CHARS)
 
-    def cmd_wiki(self, msg, arg):
-        """/wiki 状态 | /wiki sync 立即同步 | /wiki search <词> 调试召回 | /wiki spaces 列空间"""
-        mid = msg["id"]
-        arg = (arg or "").strip()
-        sub, _, rest = arg.partition(" ")
-        rest = rest.strip()
-
-        if sub == "spaces":
-            try:
-                spaces = wiki_sync.list_spaces(self.client)
-            except Exception as e:
-                feishu_api.reply_message(self.client, mid, f"列出知识空间失败：{e}")
-                return
-            if not spaces:
-                feishu_api.reply_message(self.client, mid,
-                    "没有可见的知识空间。\n多半是机器人应用还没被加为知识库成员："
-                    "知识库 → 设置 → 成员管理 → 添加应用（飞书对此不报权限错，只返回空列表）")
-                return
-            lines = [f"可见知识空间（{len(spaces)} 个）："]
-            lines += [f"{i}. {s['name']}\n   space_id={s['space_id']}"
-                      for i, s in enumerate(spaces, 1)]
-            feishu_api.reply_message(self.client, mid, "\n".join(lines))
-            return
-
-        if not self.wiki_space_id:
-            feishu_api.reply_message(self.client, mid,
-                "本群未配置知识库。\n发 /wiki spaces 列出可见知识空间，"
-                "把 space_id 填进 .env.local 对应机器人的 wiki 字段后重启服务。")
-            return
-
-        if sub == "sync":
-            feishu_api.reply_message(self.client, mid, "📚 正在同步知识库…")
-            ok, desc = self._wiki_refresh()
-            feishu_api.reply_message(self.client, mid,
-                                     f"✅ 同步完成：{desc}" if ok else f"❌ 同步失败：{desc}")
-            return
-
-        if sub == "search":
-            if not rest:
-                feishu_api.reply_message(self.client, mid, "用法：/wiki search <关键词>")
-                return
-            idx = self.wiki_index
-            if idx is None or not len(idx):
-                feishu_api.reply_message(self.client, mid, "知识库尚无索引，先发 /wiki sync")
-                return
-            try:
-                hits = wiki_index.search(idx, rest, self.wiki_cfg,
-                                         top_k=self.wiki_top_k, session_factory=self.Session)
-            except Exception as e:
-                feishu_api.reply_message(self.client, mid, f"检索失败：{e}")
-                return
-            if not hits:
-                feishu_api.reply_message(self.client, mid, f"没有命中「{rest}」")
-                return
-            lines = [f"「{rest}」命中 {len(hits)} 条："]
-            for i, h in enumerate(hits, 1):
-                v = f"{h['vec_score']:.3f}" if h["vec_score"] is not None else "-"
-                f_ = f"{h['ft_score']:.2f}" if h["ft_score"] is not None else "-"
-                snippet = h["text"][:100].replace("\n", " ")
-                lines.append(f"\n{i}. [向量 {v} / 全文 {f_}] {h['breadcrumb']}\n   {snippet}…")
-            feishu_api.reply_message(self.client, mid, "\n".join(lines))
-            return
-
-        idx = self.wiki_index
-        lines = [
-            "📚 知识库状态",
-            f"space_id：{self.wiki_space_id}" + (f"（子树 {self.wiki_root_node}）"
-                                                if self.wiki_root_node else ""),
-            f"条目数：{len(idx) if idx else 0}",
-            f"模型：{self.wiki_cfg.get('embed_model')}",
-            f"每轮注入：Top {self.wiki_top_k}",
-            f"自动同步：每 {max(int(self.wiki_cfg.get('sync_interval', 1800)), 60) // 60} 分钟",
-            f"最近一次：{self.wiki_status}",
-            "",
-            "/wiki sync 立即同步 · /wiki search <词> 看召回 · /wiki spaces 列空间",
-        ]
-        feishu_api.reply_message(self.client, mid, "\n".join(lines))
-
-    # --------------------------------------------------------------- 任务执行（异步）
-
     def run_task(self, msg, text):
         """主线程只做入队 + 立即回执，真正执行在后台 worker，故长任务不冻结 bot。"""
         self.pending = None
@@ -989,9 +625,6 @@ class Bot:
         attach = self._drain_uploads()
         if attach:
             text = text.rstrip() + "\n" + self._attach_block(attach)
-        with self.lock:
-            self.last_task = {"text": text, "msg_id": msg["id"],
-                              "session_id": self.current_session_id()}
         self._enqueue({"kind": "task", "text": text, "msg_id": msg["id"],
                        "sender_id": msg.get("sender_id")},
                       msg["id"], verb="执行")
@@ -1025,35 +658,25 @@ class Bot:
         if job["kind"] == "debate":
             self._execute_debate_job(job)
             return
-        if job["kind"] == "compact":
-            if not self._do_compact(job["msg_id"], reason="手动 /compact"):
-                self._push_reply(job["msg_id"], "当前对话暂无可压缩的历史（先发几条任务再压缩）")
-            return
         text, msg_id = job["text"], job["msg_id"]
-        is_retry = job["kind"] == "retry"
 
         # 锁内：准备会话状态、快照 history（短临界区，不含长调用）
         with self.lock:
-            if is_retry:
-                session_id, history, first_task = job.get("session_id"), None, None
-                is_new = session_id is None
-                seed = None
-            else:
-                is_new = self.current_session_id() is None
-                if not self.sessions["list"]:  # 首用，建 session 条目
-                    entry = self.make_session()
-                    self.sessions = {"list": [entry], "current": 0, "history": []}
-                    self.set_current(entry)
-                session_id = self.current_session_id()
-                history = list(self.sessions.get("history", []))
-                first_task = text if is_new else None
-                cur = self.current_entry()
-                seed = cur.get("seed") if cur else None
+            is_new = self.current_session_id() is None
+            if not self.sessions["list"]:  # 首用，建 session 条目
+                entry = self.make_session()
+                self.sessions = {"list": [entry], "current": 0, "history": []}
+                self.set_current(entry)
+            session_id = self.current_session_id()
+            history = list(self.sessions.get("history", []))
+            first_task = text if is_new else None
+            cur = self.current_entry()
+            seed = cur.get("seed") if cur else None
             permit_mode = self.permit_mode
             unsafe_mode = self.unsafe_mode
 
         # 档1/档2：续聊前按 context 占用护栏——达阈值自动压缩，未开压缩且触顶则硬闸拦下
-        if not is_retry and session_id and not is_new:
+        if session_id and not is_new:
             status = self._context_guard(msg_id, session_id)
             if status == GUARD_BLOCKED:
                 return
@@ -1077,7 +700,7 @@ class Bot:
         if job.get("sender_id"):
             run_text = f"[飞书用户: {job['sender_id']}]\n{run_text}"
 
-        print(f"[{self.name}][{'retry' if is_retry else 'task'}] permit={permit_mode} "
+        print(f"[{self.name}][task] permit={permit_mode} "
               f"unsafe={unsafe_mode} session={'new' if is_new else str(session_id)[:8] + '…'} | {text[:60]}")
 
         # 锁外：长耗时执行 + 心跳（此期间主循环命令不被阻塞）
@@ -1106,7 +729,7 @@ class Bot:
         print(f"[{self.name}][llm] elapsed={self._human_elapsed(int(elapsed))} "
               f"model={used_model} error={is_err} timed_out={'超时' in result} chars={len(result)} "
               f"sid={str(new_sid)[:8] + '…' if new_sid else '-'} | {result[:120].replace(chr(10), ' ')}")
-        self.db(db.record_audit, self.chat_id, "llm", "retry" if is_retry else "task",
+        self.db(db.record_audit, self.chat_id, "llm", "task",
                 message_id=msg_id, ok=not is_err, model=used_model,
                 elapsed_ms=int(elapsed * 1000), chars=len(result), detail=result[:2000])
 
@@ -1118,7 +741,7 @@ class Bot:
 
         # 锁内：更新对话历史（保留最近 20 轮）+ 审计；成功后清除已消费的压缩 seed
         with self.lock:
-            if not is_retry and not result.startswith("[error]"):
+            if not result.startswith("[error]"):
                 data = self.sessions
                 data.setdefault("history", [])
                 data["history"].append({"role": "user", "content": text})
@@ -1143,11 +766,6 @@ class Bot:
         self._push_reply(msg_id, result + suffix + tail)
         print(f"[{self.name}][done] pushed to {msg_id} model={used_model}")
 
-        # 任务成功后自动把这一轮改动本地提交 + 打包成 .bundle 发到群（供远程 git fetch），
-        # 本轮任务正文即 commit message，故本机/远程 git log 都能看出每轮改了什么
-        if self.sync_patch and not is_err:
-            self._send_bundle(msg_id, announce_empty=False, full=False,
-                              task_text=text, sender_id=job.get("sender_id"))
 
     def _execute_debate_job(self, job):
         """辩论编排：两个独立 Claude session（正/反方）交替发言 DEBATE_ROUNDS 轮，
@@ -1324,134 +942,23 @@ class Bot:
                     ok=s["ok"], code=s["code"], chars=s.get("chars"),
                     detail=(f"sent_id={s.get('sent_id')}" if s["ok"] else s.get("msg")))
 
-    def _commit_message(self, task_text, sender_id):
-        """本轮同步提交的 commit message：首行取任务正文首句（≤72 字），正文标出
-        来源与飞书发言人，便于事后在 git log 里追溯这轮改动是谁、因什么任务产生的。"""
-        first = (task_text or "").strip().splitlines()
-        subject = first[0].strip() if first else ""
-        if len(subject) > 72:
-            subject = subject[:69] + "..."
-        if not subject:
-            subject = gitsync.DEFAULT_MESSAGE
-        body = [f"via: feishu-sync ({self.name})"]
-        if sender_id:
-            body.append(f"feishu-user: {sender_id}")
-        return subject + "\n\n" + "\n".join(body) + "\n"
-
-    def _send_bundle(self, msg_id, announce_empty=False, full=False,
-                     task_text=None, sender_id=None):
-        """把工作树改动在本地提交，并生成同步 bundle 发到群（远程 git fetch 应用）。
-        full=False：「上次同步以来」的增量，远程 fetch 后 merge --ff-only 快进；
-        full=True（/resync）：不依赖增量基线，远程 fetch 后 reset --hard 强制拉平。
-        announce_empty=True（手动 /sync）时，无改动/无仓库也回一句提示；自动调用则静默跳过。"""
-        if not self._git_ready():
-            return
-        message = self._commit_message(task_text, sender_id)
-        tmpdir = tempfile.mkdtemp(prefix="feishu-sync-")
-        tmp_path = os.path.join(tmpdir, "sync.bundle")
-        try:
-            info = gitsync.full_bundle(self.work_dir, self.chat_id, tmp_path, message) if full \
-                else gitsync.incremental_bundle(self.work_dir, self.chat_id, tmp_path, message)
-        except Exception as e:
-            print(f"[{self.name}][sync-error] {e}")
-            feishu_api.reply_message(self.client, msg_id, f"[error] 生成同步 bundle 失败: {e}", tag="patch")
-            return
-        if not info:
-            if announce_empty:
-                feishu_api.reply_message(self.client, msg_id, "自上次同步以来没有代码改动，无需同步")
-            return
-        # 本轮打包了哪些提交（含本次自动提交与你手动做的 commit），直接列在群里
-        log_lines = [f"  {sha} {subj}" for sha, subj in info.get("commits", [])]
-
-        seq = info["seq"]
-        # 文件名带上 work_dir 标识，便于在群里区分是同步哪个工作目录（各目录 seq 独立起算）
-        slug = re.sub(r"[^A-Za-z0-9_.-]", "_", os.path.basename(os.path.normpath(self.work_dir))) or "root"
-        fname = f"{slug}-{seq:04d}-feishu-sync.bundle"
-        path = os.path.join(tmpdir, fname)
-        os.rename(tmp_path, path)
-        if full:
-            note = "\n".join([
-                f"📦 第 {seq} 轮【全量】同步 bundle：{fname}（忽略远程此前状态，强制以本机当前为准）",
-                f"HEAD {info['tip']}" + ("（本轮已在本地提交）" if info["new_commit"] else "（工作树无改动，直接打包现有历史）"),
-                *(["最近提交："] + log_lines if log_lines else []),
-                "远程执行（会把当前分支强制重置为本机 HEAD；如远程有未提交改动请先自行处理）：",
-                f"  git bundle verify {fname}",
-                f"  git fetch ./{fname} {info['tip_ref']}:sync-full",
-                "  git reset --hard sync-full",
-                "  git branch -d sync-full",
-            ])
-        else:
-            head_line = f"基线 {info['base']} → {info['tip']}（{info['n_commits']} 个提交）"
-            if not info["new_commit"]:
-                head_line += "，本轮工作树无改动、同步的是你自己的提交"
-            note = "\n".join([
-                f"📦 第 {seq} 轮增量同步 bundle：{fname}",
-                head_line,
-                *(["本轮提交："] + log_lines if log_lines else []),
-                "远程执行（按序号顺序逐个应用，务必按序、勿跳号）：",
-                f"  git bundle verify {fname}",
-                f"  git fetch ./{fname} {info['tip_ref']}:sync-incoming",
-                "  git merge --ff-only sync-incoming",
-                "  git branch -d sync-incoming",
-                "若上面报 \"not possible to fast-forward\"（远程有本机没有的提交、两边历史分叉）：",
-                "  · 想保留两边历史、生成一个 merge commit（代码基本一致时通常自动合，改到同处才会冲突，解决后 git commit 即可）：",
-                "      git merge --no-ff sync-incoming && git branch -d sync-incoming",
-                "  · 想直接以本机为准、丢弃远程本地分叉：改发 /resync 全量拉平（远程 reset --hard）。",
-            ])
-        try:
-            file_key = feishu_api.upload_file(self.client, path, fname)
-            res = feishu_api.reply_file(self.client, msg_id, file_key, tag="patch")
-            self._audit_sends(msg_id, "patch", res)
-            feishu_api.reply_message(self.client, msg_id, note, tag="patch")
-            print(f"[{self.name}][sync] sent seq={seq} full={full} bytes={os.path.getsize(path)} to {msg_id}")
-        except Exception as e:
-            print(f"[{self.name}][sync-error] send failed: {e}")
-            feishu_api.reply_message(self.client, msg_id, f"[error] 发送同步 bundle 失败: {e}", tag="patch")
-        finally:
-            try:
-                os.remove(path)
-                os.rmdir(tmpdir)
-            except OSError:
-                pass
-
-    # ---------------------------------------------------------- 消息处理 / 主循环
-
     def handle_select(self, msg, idx):
-        """pending 状态下用数字消息选择：本群对话 / 本机会话（接管）/ 模型。"""
-        if self.pending == "session":
-            sessions = self.sessions["list"]
-            if 0 <= idx < len(sessions):
-                with self.lock:  # 与 worker 的 update_session 互斥
-                    self.sessions["current"] = idx
-                    entry = sessions[idx]
-                    self.set_current(entry)
-                    self.sessions["history"] = self.load_history(entry["id"])
-                self.pending = None
-                feishu_api.reply_message(self.client, msg["id"], f"已切换到对话 {idx + 1}：{entry['label']}")
-                self._send_recent_history(msg["id"])
-                print(f"[{self.name}][session] switched to idx={idx}")
-            else:
-                feishu_api.reply_message(self.client, msg["id"], f"无效序号，请输入 1～{len(sessions)}")
-        elif self.pending == "allsession":
-            shown = self.pending_all
-            if 0 <= idx < len(shown):
-                self._attach_session(msg, shown[idx])
-            else:
-                feishu_api.reply_message(self.client, msg["id"], f"无效序号，请输入 1～{len(shown)}")
-        elif self.pending == "model":
-            options = ["默认（不指定）"] + list(self.models)  # idx 0=默认
-            if 0 <= idx < len(options):
-                model = None if idx == 0 else self.models[idx - 1]
-                entry = self.current_entry()
-                self.pending = None
-                if entry:
-                    entry["model"] = model
-                    if entry.get("_row_id"):
-                        self.db(db.set_session_model, entry["_row_id"], model)
-                feishu_api.reply_message(self.client, msg["id"], f"当前对话模型已设为：{options[idx]}")
-                print(f"[{self.name}][model] -> {model}")
-            else:
-                feishu_api.reply_message(self.client, msg["id"], f"无效序号，请输入 1～{len(options)}")
+        """pending 状态下用数字消息选择本群对话。"""
+        if self.pending != "session":
+            return
+        sessions = self.sessions["list"]
+        if 0 <= idx < len(sessions):
+            with self.lock:  # 与 worker 的 update_session 互斥
+                self.sessions["current"] = idx
+                entry = sessions[idx]
+                self.set_current(entry)
+                self.sessions["history"] = self.load_history(entry["id"])
+            self.pending = None
+            feishu_api.reply_message(self.client, msg["id"], f"已切换到对话 {idx + 1}：{entry['label']}")
+            self._send_recent_history(msg["id"])
+            print(f"[{self.name}][session] switched to idx={idx}")
+        else:
+            feishu_api.reply_message(self.client, msg["id"], f"无效序号，请输入 1～{len(sessions)}")
 
     def handle_upload(self, msg):
         """下载并安全存储上传的图片/文件/压缩包，写台账，回复保存路径。"""
@@ -1506,25 +1013,6 @@ class Bot:
         lines = ["", "[随消息附带的文件，可直接读取]"]
         lines += [f"{u['path']}（{u['size_human']}）" for u in items]
         return "\n".join(lines)
-
-    def cmd_files(self, msg, arg):
-        """查看/清空「下一条消息会自动附带」的上传文件。"""
-        if arg.strip() in ("clear", "清空"):
-            n = len(self.pending_uploads)
-            self.pending_uploads = []
-            feishu_api.reply_message(self.client, msg["id"], f"已清空待附带文件（{n} 个）")
-            return
-        self._expire_uploads()
-        if not self.pending_uploads:
-            feishu_api.reply_message(self.client, msg["id"],
-                                     "当前没有待附带的上传文件（上传后 "
-                                     f"{UPLOAD_CONTEXT_TTL // 60} 分钟内发任务会自动带上）")
-            return
-        lines = ["下一条消息会自动附带这些文件："]
-        for i, u in enumerate(self.pending_uploads, 1):
-            lines.append(f"{i}. {u['path']}（{u['size_human']}）")
-        lines.append("发 /files clear 可清空")
-        feishu_api.reply_message(self.client, msg["id"], "\n".join(lines))
 
     def handle_post_images(self, msg):
         """下载 post 富文本里内嵌的图片，写台账，把落盘路径记入待附带缓冲，返回 (文字, 张数)。

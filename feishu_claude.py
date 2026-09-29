@@ -91,7 +91,6 @@ def load_config(env_name):
         "max_concurrent": int(env.get("MAX_CONCURRENT", 3)),  # 全局同时运行的 claude 上限
         # 续聊 context 占用达此百分比即自动压缩（摘要后开新对话）；0 关闭，改由硬闸兜底
         "auto_compact_threshold": int(env.get("AUTO_COMPACT_THRESHOLD", 75)),
-        "models": json.loads(env.get("MODELS") or '["opus","sonnet","haiku"]'),
         # 长连接就绪后往群里推一条「已启动」通知（断线恢复后推「已恢复」）；改完重启时用它确认服务真起来了
         "startup_notify": _as_bool(env.get("STARTUP_NOTIFY"), True),
         # 只通知这些机器人（按 name 或 chat_id，逗号分隔）；留空=全部群都通知。
@@ -229,7 +228,7 @@ def main():
             api_clients[aid] = feishu_api.build_client(aid, bc["app_secret"])
             app_secrets[aid] = bc["app_secret"]
             app_chatmaps[aid] = {}
-        b = Bot(bc, session_factory, cfg["task_timeout"], cfg["models"],
+        b = Bot(bc, session_factory, cfg["task_timeout"],
                 cfg["heartbeat_interval"], run_slot=run_slot, client=api_clients[aid],
                 auto_compact_threshold=cfg["auto_compact_threshold"],
                 wiki_cfg=cfg["wiki"])

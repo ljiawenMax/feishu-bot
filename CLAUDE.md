@@ -18,7 +18,6 @@
 - `db.py` — 数据库层：engine/session 管理 + 基于 ORM 的数据访问（不再手写 SQL）
 - `feishu_api.py` — 飞书交互层（基于 lark-oapi SDK）：长连接客户端与事件分发、事件归一、回复/下载、文本分段
 - `uploads.py` — 上传图片/文件/压缩包的安全下载与存储（隔离目录 700、文件 600、文件名消毒、不自动解压）
-- `gitsync.py` — 增量同步：把每个 chat 工作目录的改动**在本地真实提交**（commit message = 本轮飞书任务内容），再把「上次同步以来」的提交打包成增量 `git bundle`（供远程 `git fetch` + `merge --ff-only`；`/resync` 用全量 bundle + `reset --hard` 兜底恢复）
 - `wiki_sync.py` — 飞书知识库 → 本地 markdown 镜像：列知识空间、递归走节点树、docx **block → markdown**（保留标题层级）、按 `obj_edit_time` 增量同步；也可作自检 CLI 独立运行
 - `wiki_index.py` — 知识库索引与检索：按标题小节切块、ollama 取向量、**向量 + MySQL ngram 全文双路 RRF 混合召回**；刻意不依赖 Bot/飞书，将来可整个文件搬走
 - `claude_runner.py` — 调用 `claude` CLI、解析 stream-json（含 `tool_use` → 本轮动作回报）、
@@ -43,10 +42,33 @@ DB 访问走 SQLAlchemy ORM；每次操作开短生命周期 Session（线程安
 
 > 注意：长连接断线期间飞书**不补发**漏掉的事件（SDK 会自动重连）；进程未运行时发的消息不会补处理。
 
+## 命令清单（2026-09-29 精简后）
+
+命令只保留**不可替代的护栏与高频入口**，共 7 个；其余能力一律走自然语言。
+
+| 命令 | 作用 | 保留理由 |
+|---|---|---|
+| `/new` | 新建对话（清空历史） | 护栏，不可替代 |
+| `/sessions` | 列对话，回序号切换 | 高频（14 次/18 天） |
+| `/del <序号>` | 删对话 | 高频（13 次/18 天） |
+| `/unsafe` | 开关最高权限 | 护栏，**绝不能交给 LLM 自己开** |
+| `/usage` | 查订阅用量 | 高频（18 次/18 天） |
+| `/debate <辩题>` | 正反方各 5 轮辩论 | 待阶段 4 重构为 skill 后移除 |
+| `/help` | 帮助 | — |
+
+**2026-09-29 撤除的 10 个命令**（依据：18 天 journal + 79 天 `audit_logs` + `sessions` 表实测）：
+`/compact`（手动 0 次，24 次压缩全自动）、`/retry`（2 次/79 天）、`/files`（0）、
+`/model`（**59 个会话 `sessions.model` 全为 NULL，从未生效过**）、`/context`（1 次，与 inline
+`ctx N%` 重复）、`/wiki`（0，CLI 等价）、`/permit`（0，98% 轮次直接用 unsafe）、`/name`（0）、
+`/allsessions`（0）、`/sync` `/resync`（0，见 gitsync 段）、`/restart`（0，见「自杀式重启陷阱」）。
+
+撤除的是**命令入口**，不是能力：`_do_compact`、`_wiki_reference`、`list_all_sessions`、
+`pending_uploads` 等底层全部保留，阶段 2~4 会以 tool 形式回归。详见 `docs/OPTIMIZATION.md`。
+
 **一 chat_id 一 work_dir**：每个机器人绑定一个群（chat_id）+ 一个工作目录（`work_dir` 单字符串，
 省略回退家目录 `~`），chat_id 唯一。视觉隔离靠分群；一个群内用 `/new`、`/sessions` 手动管理多个对话。
 会话与 `permit`/`unsafe` 权限均按 `chat_id` 分区，持久化在 `bot_state` 表。
-**唯一的例外是「接管本机会话」**（`/allsessions` 回序号）：那种会话在 `sessions.cwd` 里记着自己的
+**唯一的例外是「接管本机会话」**（底层能力仍在，命令入口已撤除）：那种会话在 `sessions.cwd` 里记着自己的
 项目目录、在那里跑，见下文「接管本机 Claude Code 会话」。取工作目录一律走 `Bot.entry_cwd()`，
 别再直接读 `self.work_dir`。
 
@@ -59,7 +81,6 @@ DB 访问走 SQLAlchemy ORM；每次操作开短生命周期 Session（线程安
   "app_secret": "飞书应用 App Secret",
   "chat_id": "监听的群聊 ID（格式 oc_xxxxxx，唯一）",
   "work_dir": "Claude Code 执行任务的工作目录（绝对路径，可省略→家目录 ~）",
-  "sync_patch": "可选布尔（默认 false）：每轮任务成功后自动把增量 .bundle 发到群，供远程 git fetch",
   "extra_dirs": "可选字符串数组：额外挂进工作区的只读目录（--add-dir），启动时过滤掉不存在的路径",
   "wiki": "可选对象：绑定飞书知识库做 RAG，{space_id, root_node（可选，只同步某子树）, top_k（默认5）}"
 }
@@ -76,8 +97,8 @@ Claude 可据此按人分账（`resume` 项目就用它做 `--owner`）。拿不
 
 **附件回传协议 `[[SEND_FILE:/abs/path]]`**：Claude 在回复正文里写这个标记，`_push_reply`
 会剥离标记、正常发送正文，随后把对应文件作为文件消息补发到群（复用 `feishu_api.upload_file`
-+ `reply_file`）。**这是通用能力，每一轮对话都生效、不绑定任何命令**——`/sync` 发 bundle 走的是
-`_send_bundle` 另一条独立路径，两者没有关系。能力说明写在 `claude_runner.SYNC_SYSTEM_PROMPT` 里，
++ `reply_file`）。**这是通用能力，每一轮对话都生效、不绑定任何命令。**
+能力说明写在 `claude_runner.SYNC_SYSTEM_PROMPT` 里，
 每次调用都 `--append-system-prompt` 带上，所以 Claude 任何时候都知道自己能发文件。
 
 **目录白名单已于 2026-08-30 按机主决定撤除**（个人自用、单机部署）。撤除的直接原因：旧白名单只认
@@ -100,11 +121,16 @@ Claude 可据此按人分账（`resume` 项目就用它做 `--owner`）。拿不
   进了 history 之后续聊追问「刚那张图」才有依据；RAG 资料动辄几千字才必须绕开 history。
 - 缓冲**只在 inbox 线程读写**（`handle_upload` 与 `run_task` 都在这条线程上），故不加锁。
 - `UPLOAD_CONTEXT_TTL`（默认 30 分钟）过期即丢——几小时前传的文件再塞进 prompt 只会误导。
-- 只在内存里，进程重启即丢（`uploads` 表仍有台账）。`/files` 查看待附带、`/files clear` 清空。
+- 只在内存里，进程重启即丢（`uploads` 表仍有台账）。查看/清空的 `/files` 命令已撤除
+  （2026-09-29，零使用），需要时直接问「现在有哪些待附带文件」。
 
-**接管本机 Claude Code 会话**：`/allsessions` 扫 `~/.claude/projects` 列出本机全部会话
-（可带关键词过滤标题/项目路径），**回复序号即接管**：在本群建一个绑定该 `session_id` 的会话条目，
-之后每轮 `--resume` 都在**那个会话原本的项目目录**下跑，等于把终端里的对话搬到飞书接着聊。
+**接管本机 Claude Code 会话**：扫 `~/.claude/projects` 列出本机全部会话，接管后在本群建一个
+绑定该 `session_id` 的会话条目，之后每轮 `--resume` 都在**那个会话原本的项目目录**下跑，
+等于把终端里的对话搬到飞书接着聊。
+⚠️ **`/allsessions` 命令已于 2026-09-29 撤除**（18 天零使用，「列表+数序号」交互太笨重）。
+底层能力（`claude_runner.list_all_sessions` / `session_exists` / `session_tail`、`sessions.cwd`
+/ `external` 列、`Bot.entry_cwd()`）**全部保留**，等阶段 4 的 tool 落地后用自然语言接管。
+在那之前这条链路没有入口，属于暂时休眠的代码。
 - **cwd 必须下放到会话级**，这是能不能做成的关键：Claude Code 的 session 文件存在
   `~/.claude/projects/<cwd 把 / 换成 - >/<sid>.jsonl`，`--resume` 在别的目录下跑必然
   `No conversation found`。故 `sessions` 表加 `cwd` 列（NULL=用本 bot 的 `work_dir`），
@@ -118,37 +144,21 @@ Claude 可据此按人分账（`resume` 项目就用它做 `--owner`）。拿不
 - 接管后会回显最近 3 轮对话（`claude_runner.session_tail`）——这段历史只存在于本机 jsonl 里，
   bot 的 `messages` 表没有，不回显的话接不上话头。只取 text 块，`tool_use`/`tool_result`
   与 `<command-name>` 之类 CLI 注入全部滤掉，否则群会被过程噪音刷爆。
-- **gitsync 仍然只认 `work_dir`，不跟着接管会话走**：`/sync` 会 `git add -A` + 真提交，跟去别的
-  项目等于替用户往他自己的仓库里塞提交。接管会话期间要同步那个项目，用它自己的群或手动 git。
 - **context 护栏要为它开个后门**：终端里聊久了的会话一接管往往就接近上限，而它在 `messages` 表里
   没有任何历史（那些话发生在终端里），`_do_compact` 照旧「本地历史为空 → return False」的话，
-  护栏一触发就是死路——自动压缩压不动、手动 `/compact` 也答「暂无可压缩的历史」，而这类会话恰恰
+  护栏一触发就是死路——压缩压不动，而这类会话恰恰
   最容易一上来就顶到阈值。故本地历史为空时改从 `session_tail(rounds=12)` 读盘取素材。接管时的
   回执也会直接把 context 占用报出来，免得用户发第一条就莫名撞墙。
 - 续聊会写进本机那份 jsonl（这正是「延续」的含义）。若同一 session 在终端里也开着，两边并发写
   同一文件会互相覆盖——接管前先把终端那边退出。
 
-**增量 bundle 同步（gitsync）**：`work_dir` 是 git 仓库时可用。**同步 = 先在本地当前分支真提交，
-再打包真实历史**：每轮先 `git add -A` + `git commit`（message 首行 = 本轮飞书任务正文，正文标注
-`via: feishu-sync` 与发言人 open_id；`/sync <说明>` 可手动指定），因此本机和远程的 `git log`
-完全一致、都能看出每轮改了什么、是谁触发的，群消息里也会列出本轮打包的提交摘要。提交走
-`--no-verify` + 关 gpg 签名（同步不该被 pre-commit hook 或签名配置阻断），用户配了
-`user.name/email` 就用用户身份、没配才回退 `feishu-sync` 身份。**代价：会写入你的提交历史，
-且 `add -A` 会把暂存区一并提交**（旧版造游离快照、不碰 HEAD，代价是本机 `git log` 查不到任何
-同步记录、远程只收到一条 message 全一样的匿名快照链，本机自己的 commit 反而被压平丢失）。
-每个 chat 维护隐藏基线 ref `refs/feishu-sync/<chat_id>` 指向「上次已发送的提交」，每轮打包
-`基线..HEAD`（尊重 .gitignore），带序号发到群，发完基线前移，故下轮只含新增提交、远程按序
-`git fetch` 后 `merge --ff-only` 逐轮叠加；你自己手动做的 commit 也会一并同步过去。
-`sync_patch=true` 开启自动发送；`/sync` 命令随时手动发送（不受开关限制）。基线若不是当前 HEAD
-的祖先（本机 rebase/reset/切分支改写过历史），增量已无法快进，会直接报错要求改发 `/resync`，
-而不是发出一个远程必然 ff 失败的 bundle（此时本轮改动已提交到本地、不会丢）。前提：远程与本机同版本、
-只被动接收同步文件——一旦这个前提被打破（远程曾脱离 gitsync 被整体覆盖过等），`merge --ff-only` 会
-明确报 "not possible to fast-forward" 而不是像旧版 `git apply` 那样含糊报错；此时发 `/resync`，会打包
-一份不依赖增量基线、以本机当前工作树为准的全量 bundle，远程 `fetch` 后 `reset --hard` 即可强制拉平、
-重新开始计增量。之所以从 `git diff`/`git apply` 换成 bundle：patch 是纯文本，靠上下文行匹配应用，一旦
-基线偏了会在多个文件上同时出现「文件已存在」「上下文对不上」等含糊报错，很难定位是哪一轮出的问题；
-bundle 传的是真实 git 对象，`fetch`/`merge --ff-only` 要么整体成功要么明确失败，配合 `/resync` 能可靠
-自愈。
+**增量 bundle 同步（gitsync）已于 2026-09-29 整套移除**。撤除依据：`tag='patch'` 共 52 次
+调用全部来自**两个已下线的群**（`oc_d140cbad…` 46 次、`oc_aecd3e00…` 6 次），当前在线的 9 个 bot
+无一使用过，`sync_patch` 在所有 bot 上均为 false，最后一次使用距撤除日 53 天。
+删除范围：`gitsync.py`（219 行）、`/sync`、`/resync`、`Bot._send_bundle`、`_commit_message`、
+`_git_ready`、`sync_patch` 配置项。隐藏基线 ref `refs/feishu-sync/<chat_id>` 留在仓库里无害。
+将来若又需要远程同步：让 Claude 用自然语言直接跑 git（它本来就能），或按需重写——
+`git bundle` + `fetch` + `merge --ff-only` 的做法本身是对的，只是没人用。
 
 **飞书知识库 RAG（wiki_sync + wiki_index）**：给某个 chat 绑一个飞书知识空间，提问时先检索
 相关条目、把片段注入 prompt，让 Claude 基于知识库回答并注明来源。只有配了 `wiki.space_id`
@@ -165,18 +175,22 @@ bundle 传的是真实 git 对象，`fetch`/`merge --ff-only` 要么整体成功
   出差的钱」这类完全换词的问法只有向量能召回。两路各取 Top-20 后按 RRF 融合（只看排名不看
   绝对分，规避两路分数量纲不同）。
 - **索引按 `space_id` 分区**（不按 chat_id）存在 `WIKI_CACHE_DIR` 下，多个群配同一知识库时
-  共享一份索引。**缓存目录必须在 `work_dir` 之外**——gitsync 每轮 `git add -A`，镜像落进
-  work_dir 会被整个提交进你的 git 历史。
+  共享一份索引。**缓存目录放在 `work_dir` 之外**——原因是 gitsync 每轮 `git add -A`
+  会把镜像整个提交进 git 历史；gitsync 已移除，但保持在外面仍然更干净（不污染工作区）。
 - **注入只改 `run_text`，不进 history**：审计与压缩摘要仍用用户原文，否则历史会被资料撑爆、
   摘要也跟着跑偏。代价是 `--resume` 续聊会让历轮资料在 session 里累积，**context 比不开知识库
   涨得快**，靠 `AUTO_COMPACT_THRESHOLD` 自动压缩兜底；每轮注入上限为 Top 5 × 3000 字。
 - 同步：启动时一次 + 后台每 `WIKI_SYNC_INTERVAL` 秒增量一次（按 `obj_edit_time` 只重拉变更
-  文档，只对变更文档重新编码）。`/wiki sync` 随时手动触发。飞书云文档有 `drive.file.edit_v1`
+  文档，只对变更文档重新编码）。**无变更时不打日志**——实测 18 天 866 轮同步有 864 轮
+  什么都没变，无条件打印会把 journal 刷成 40% 的空转播报（`_wiki_refresh` 的 `changed` 判断）。
+  `wiki_status` 字段仍每轮更新，静默不丢信息。飞书云文档有 `drive.file.edit_v1`
   事件可做秒级刷新，但要逐文件订阅、且新增节点无事件、断线不补发，故只能当加速器，定时扫描
   必须保留（本版未做事件订阅）。
 - 前置：开放平台开 `wiki:wiki:readonly` + `docx:document:readonly`，并且**必须把机器人应用
   加为该知识库的成员**（知识库 → 设置 → 成员管理 → 添加应用）。不加成员时飞书**不报权限错，
-  只返回空列表**——所以判据是：`/wiki spaces` 或 `--spaces` 返回空 = 还没加成员，不是代码问题。
+  只返回空列表**——所以判据是：`--spaces` 返回空 = 还没加成员，不是代码问题。
+- **`/wiki` 命令已于 2026-09-29 撤除**（零使用）。四个子命令 CLI 完全等价，见下「启动方式」。
+  RAG 注入本体（`_wiki_reference`，每轮检索+注入）与后台同步（`_wiki_worker`）全部保留。
 - 依赖 ollama（systemd 常驻）：`ollama pull quentinz/bge-small-zh-v1.5`。模型驻留时长走请求体
   的 `keep_alive` 参数控制，不动系统配置。换模型会改变向量维度，需 `--rebuild` 全量重建。
 
@@ -231,9 +245,9 @@ prompt 约定从原理上不成立——Claude 在飞书 bot 群里被调用时�
 - **保护范围只有本项目目录**（含 `.env.local` / `.claude/`，排除 `.venv`、`__pycache__`、`.git`）。
   其余 9 个 work_dir 不进快照——它们跑的是同一份代码，主程序活着就能通过飞书把它们修回来；而
   work_dir 里全是用户数据（resume 档案、stock 数据、wiki 索引），回滚等于删用户的东西。
-  `.git` 同理排除：回滚它会把真实提交历史和 gitsync 的基线 ref 一起倒回去，且能规避「rsync 撞上
-  并发 git commit 拍到半写状态」。代价是回滚后工作树与 HEAD 不一致，下轮 gitsync 会把这次回滚
-  作为一个正常提交记进历史——反而更诚实。
+  `.git` 同理排除：回滚它会把真实提交历史倒回去，且能规避「rsync 撞上并发 git commit
+  拍到半写状态」。代价是回滚后工作树与 HEAD 不一致，需要自己 `git status` 看一眼。
+  （原先还有一条理由是「gitsync 的基线 ref 会被一起倒回」，gitsync 已于 2026-09-29 移除。）
 - **基线 = 「某一轮任务动手之前」的状态**，不是「上次重启前」也不是「当前状态」。`bot.py` 在调
   `run_claude` **之前** `take()`，该轮 LLM 成功后才 `promote()` 转正。这是整套设计的支点：写坏配置
   的那一轮它自己往往是成功的（正是它写坏的），拿完成时刻的状态当基线会把污染态存成 known-good，
@@ -287,7 +301,7 @@ prompt 约定从原理上不成立——Claude 在飞书 bot 群里被调用时�
 `EROFS`——这是 `unsafe` 常开状态下唯一还生效的防线。⚠️ **绝不要把它指到 `~/.claude`**：memory、
 session jsonl、OAuth `.credentials.json`（每次刷新都在写）全在那里，锁了服务直接废掉。
 
-`task_timeout` / `heartbeat_interval` / `models` / `max_concurrent` / `auto_compact_threshold`
+`task_timeout` / `heartbeat_interval` / `max_concurrent` / `auto_compact_threshold`
 / `startup_notify` / `guard_notify_bot` / `wiki_cache_dir` / `wiki_sync_interval` / `wiki_embed_url`
 / `wiki_embed_model` 为共享项，写在 `.env.local` 顶层。
 
@@ -296,7 +310,9 @@ session jsonl、OAuth `.credentials.json`（每次刷新都在写）全在那里
 ②续聊前若 context 占用达 `AUTO_COMPACT_THRESHOLD`（默认 75%，0 关闭）自动压缩——把本地历史用
 便宜模型（haiku）摘要成一段上下文、开新对话（`/new`）并把摘要作为新会话首轮 prompt 的前缀带上，
 从而清空 context 重新计费又不丢脉络；③关掉自动压缩时，92% 硬闸兜底：触顶暂停执行、要求手动
-`/compact` 或 `/new`。`/compact` 命令随时手动触发同样的「摘要→开新对话→下轮带摘要」流程。
+`/new`（或直接说「压缩一下上下文」）。
+**`/compact` 命令已于 2026-09-29 撤除**：18 天内 24 次压缩**全部**是 `reason=context` 自动触发，
+手动零次。`_do_compact` 本体保留，只是没有手动入口了。
 （`POLL_INTERVAL` 已废弃：改用长连接推送，不再轮询；保留仅为兼容旧配置。）
 
 ## 飞书开放平台前置配置
@@ -345,9 +361,20 @@ journalctl -u feishu-bot.service -n 50 --no-pager
 
 > ⚠️ **自杀式重启陷阱**：在飞书 bot 群里被调用的 Claude，自己就是 `feishu-bot.service` 的子进程，
 > 直接 `systemctl restart` 会把整个 cgroup（含它自己和正在跑的 bash）一起杀掉——表现为 exit 144、
-> 无任何输出，连回执都发不出去。群里要重启就用 **`/restart` 命令**：它把重启交给
-> `systemd-run --collect --no-block` 起的一次性 unit（在 cgroup 之外）延迟 2 秒执行，
-> 回执先发出去，本进程被杀是预期行为。
+> 无任何输出，连回执都发不出去。**必须把重启交给 cgroup 之外的一次性 unit**：
+>
+> ```bash
+> sudo -n systemd-run --collect --no-block --unit=feishu-bot-restart-$(date +%s) \
+>   /bin/sh -c "sleep 25; systemctl restart feishu-bot.service"
+> ```
+>
+> **延迟要留够**：本轮回复还在生成管道里，被杀就发不出去了。实测 LLM 自己判断用 25 秒是对的，
+> 别照搬旧 `/restart` 命令的 `sleep 2`——那是同步回执（`reply_message` 返回后才 sleep）才够用。
+> 起来后各群会收到「✅ 已启动」通知，一分钟内没收到就是没起来。
+>
+> **`/restart` 命令已于 2026-09-29 撤除**（18 天零使用；实测用自然语言让 LLM 重启每次都成功，
+> 且它自己选的延迟与验证步骤比命令的硬编码更准）。阶段 2 会以 `restart_service` tool 回归，
+> 届时时序挂在「回复推送完成」这个点上，延迟能缩回 2 秒且零丢回执风险。
 
 启动成功会打印 `connected to wss://...`（每个 app_id 一条），并往 `STARTUP_NOTIFY_BOTS`
 指定的群（本机=`feishu-bot` 群）推一条「✅ 已启动」通知——重启后不用盯日志，群里没收到就是没起来。
