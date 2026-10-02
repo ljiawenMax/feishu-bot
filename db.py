@@ -28,7 +28,8 @@ def init_engine(db_cfg):
         f"@{db_cfg['host']}:{db_cfg['port']}/{db_cfg['dbname']}?charset=utf8mb4"
     )
     # pool_recycle：MySQL 默认 8h 断空闲连接，主动回收避免用到失效连接
-    return create_engine(url, pool_pre_ping=True, pool_recycle=3600, future=True)
+    return create_engine(url, pool_pre_ping=True, pool_recycle=3600, future=True,
+                         connect_args={"connect_timeout": 10, "read_timeout": 30, "write_timeout": 30})
 
 
 def create_all(engine):
@@ -97,6 +98,16 @@ def load_state(s, chat_id):
         if conv.is_current:
             data["current"] = len(data["list"]) - 1
 
+    # 摘要与新会话在同一事务保存，首次续聊前重启也不会丢失上下文。
+    empty_rows = {entry["_row_id"]: entry for entry in data["list"] if not entry["id"]}
+    if empty_rows:
+        summaries = s.execute(select(Message.session_id, Message.content)
+                              .where(Message.chat_id == chat_id,
+                                     Message.session_id.in_(empty_rows), Message.role == "summary")
+                              .order_by(Message.id)).all()
+        for row_id, summary in summaries:
+            empty_rows[row_id]["seed"] = summary
+
     # 为当前 session 重建对话历史（最近 40 条）
     if data["list"]:
         cur_entry = data["list"][data["current"]]
@@ -114,7 +125,7 @@ def load_history(s, chat_id, claude_sid, limit=40):
         .where(
             Message.chat_id == chat_id,
             Message.claude_session_id == claude_sid,
-            Message.role.is_not(None),
+            Message.role.in_(("user", "assistant")),
         )
         .order_by(Message.id.desc())
         .limit(limit)
@@ -126,7 +137,7 @@ def save_bot_state(s, chat_id, permit, unsafe):
     s.merge(BotState(chat_id=chat_id, permit=permit, unsafe=unsafe))
 
 
-def insert_session(s, chat_id, label, position, claude_sid=None, cwd=None, external=False):
+def insert_session(s, chat_id, label, position, claude_sid=None, cwd=None, external=False, seed=None):
     """新建一条 session 行，返回其代理主键 _row_id。
     cwd/external 只在「接管本机已有会话」时给：cwd 是该 session 的原项目目录，
     external 让 /del 只解绑不删盘。"""
@@ -137,6 +148,8 @@ def insert_session(s, chat_id, label, position, claude_sid=None, cwd=None, exter
     )
     s.add(conv)
     s.flush()  # 拿到自增主键
+    if seed:
+        append_message(s, conv.id, chat_id, None, "summary", seed)
     return conv.id
 
 
@@ -227,3 +240,20 @@ def record_unhandled(s, message_id, chat_id, msg_type, content):
     s.add(Unhandled(
         message_id=message_id, chat_id=chat_id, msg_type=msg_type, content=content,
     ))
+
+
+def search_history(s, chat_id, query, limit=20):
+    """查本群全部会话历史；转义 LIKE 通配符，限制结果大小。"""
+    rows = s.scalars(select(Message).where(
+        Message.chat_id == chat_id, Message.content.contains(query, autoescape=True)
+    ).order_by(Message.id.desc()).limit(limit)).all()
+    return [{"role": r.role, "content": (r.content or "")[:4000],
+             "session_id": r.claude_session_id,
+             "created_at": r.created_at.isoformat() if r.created_at else None} for r in rows]
+
+
+def list_uploads(s, chat_id, limit=10):
+    rows = s.scalars(select(Upload).where(Upload.chat_id == chat_id)
+                     .order_by(Upload.id.desc()).limit(limit)).all()
+    return [{"name": r.file_name, "path": r.path, "size": r.size,
+             "created_at": r.created_at.isoformat() if r.created_at else None} for r in rows]

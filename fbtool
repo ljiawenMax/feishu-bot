@@ -1,0 +1,61 @@
+#!/usr/bin/env python3
+"""LLM 能力 CLI：纯标准库，单请求 JSONL，不加载 SDK 或数据库。"""
+import argparse
+import json
+import os
+import socket
+import sys
+
+MAX_REQUEST = 65536
+
+
+def call(operation, arguments):
+    required = ('FEISHU_BOT_SOCK', 'FEISHU_TOOL_TOKEN', 'FEISHU_CHAT_ID', 'FEISHU_MSG_ID')
+    if not all(os.environ.get(k) for k in required):
+        raise ValueError('只能在飞书任务上下文中调用 fbtool')
+    request = {'operation': operation, 'arguments': arguments,
+               'token': os.environ['FEISHU_TOOL_TOKEN'],
+               'chat_id': os.environ['FEISHU_CHAT_ID'], 'msg_id': os.environ['FEISHU_MSG_ID']}
+    data = (json.dumps(request, ensure_ascii=False) + '\n').encode()
+    if len(data) > MAX_REQUEST:
+        raise ValueError('请求超过 64KB')
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as conn:
+        conn.settimeout(90)
+        conn.connect(os.environ['FEISHU_BOT_SOCK'])
+        conn.sendall(data)
+        with conn.makefile('rb') as stream:
+            response = stream.readline(1024 * 1024 + 1)
+    if not response.endswith(b'\n') or len(response) > 1024 * 1024:
+        raise ValueError('工具响应不完整或过大')
+    return json.loads(response)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    sub = parser.add_subparsers(dest='operation', required=True)
+    for name, field in [('send_file', 'path'), ('send_image', 'path'),
+                        ('send_text', 'text'), ('wiki_search', 'query'),
+                        ('history_search', 'query'), ('speak', 'text')]:
+        p = sub.add_parser(name)
+        p.add_argument(field)
+    p = sub.add_parser('list_uploads')
+    p.add_argument('--limit', type=int, default=10)
+    for name in ('restart_service', 'git_local_changes', 'compact_context'):
+        sub.add_parser(name)
+    args = vars(parser.parse_args())
+    operation = args.pop('operation')
+    try:
+        if operation == 'speak':
+            # TTS + ssh 同步完成，不占 bot 进程，也不经 socket。
+            from speaker import speak
+            response = {'ok': True, 'result': speak(args['text'])}
+        else:
+            response = call(operation, args)
+    except Exception as e:
+        response = {'ok': False, 'error': str(e)}
+    print(json.dumps(response, ensure_ascii=False))
+    return 0 if response.get('ok') else 1
+
+
+if __name__ == '__main__':
+    sys.exit(main())

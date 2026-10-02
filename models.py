@@ -23,7 +23,6 @@ from sqlalchemy import (
     Integer,
     String,
     func,
-    text,
 )
 from sqlalchemy.dialects.mysql import LONGTEXT
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column

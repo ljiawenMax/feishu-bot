@@ -13,6 +13,8 @@ import lark_oapi as lark
 from lark_oapi.api.im.v1 import (
     CreateFileRequest,
     CreateFileRequestBody,
+    CreateImageRequest,
+    CreateImageRequestBody,
     CreateMessageRequest,
     CreateMessageRequestBody,
     GetMessageResourceRequest,
@@ -336,6 +338,21 @@ def reply_file(client, message_id, file_key, tag="file"):
         snd = {"ok": False, "code": None, "msg": str(e), "sent_id": None, "chars": None}
         print(f"[feishu][{tag}][error] reply_to={message_id} {e}")
     return SendResult([snd])
+
+
+def reply_image_path(client, message_id, path):
+    """上传图片并回复 image 消息；不把图表变成通用文件消息。"""
+    with open(path, 'rb') as image:
+        body = CreateImageRequestBody.builder().image_type('message').image(image).build()
+        resp = client.im.v1.image.create(CreateImageRequest.builder().request_body(body).build())
+    if not resp.success():
+        raise RuntimeError(f"上传图片失败：code={resp.code} msg={resp.msg}")
+    body = (ReplyMessageRequestBody.builder().msg_type('image')
+            .content(json.dumps({'image_key': resp.data.image_key})).build())
+    resp = client.im.v1.message.reply(
+        ReplyMessageRequest.builder().message_id(message_id).request_body(body).build())
+    return SendResult([{'ok': resp.success(), 'code': resp.code, 'msg': resp.msg,
+                        'sent_id': resp.data.message_id if resp.data else None, 'chars': None}])
 
 
 def build_sessions_prompt(sessions, current_idx):
