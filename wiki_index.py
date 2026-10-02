@@ -13,6 +13,8 @@
 完全换词的问法只有向量能召回。两路各取 Top-N 后用 RRF 融合。
 """
 
+from core.locking import locked_space
+
 import json
 import math
 import os
@@ -162,7 +164,7 @@ def embed(texts, cfg, batch=32):
     for i in range(0, len(texts), batch):
         part = texts[i:i + batch]
         last = None
-        for attempt in range(3):
+        for attempt in range(cfg.get("embed_attempts", 3)):
             try:
                 r = requests.post(url, json={"model": model, "input": part,
                                              "keep_alive": cfg.get("keep_alive", "30m")},
@@ -195,6 +197,7 @@ def _read_json(path, default):
         return default
 
 
+@locked_space(0)
 def build(dest, cfg, session_factory=None, log=print):
     """（增量）重建索引。只对 manifest 里 edit_time 变化的文档重新切块+编码，
     其余复用上一版向量。返回 chunk 总数。
@@ -210,7 +213,7 @@ def build(dest, cfg, session_factory=None, log=print):
     if old_chunks and meta.get("model") == cfg["embed_model"]:
         try:
             old_vecs = np.load(os.path.join(dest, VECTORS_FILE))
-        except OSError:
+        except (OSError, ValueError, EOFError):
             old_vecs = None
     if old_vecs is None or len(old_chunks) != len(old_vecs):
         old_chunks, old_vecs = [], None
@@ -252,6 +255,8 @@ def build(dest, cfg, session_factory=None, log=print):
     if not chunks:
         log("[wiki-index] 没有可索引的内容")
         _save(dest, [], None, cfg)
+        if session_factory is not None:
+            _sync_db(session_factory, os.path.basename(dest.rstrip("/")), [], log)
         return 0
 
     dim = int(old_vecs.shape[1]) if old_vecs is not None and len(old_vecs) else 0
@@ -274,7 +279,7 @@ def build(dest, cfg, session_factory=None, log=print):
 
 
 def _save(dest, chunks, matrix, cfg):
-    """先写临时文件再整体 rename，读侧不用加锁也不会读到半截索引。"""
+    """锁内写临时文件并 rename；build/load 共用目录锁，保证 chunk 与向量成对读取。"""
     import numpy as np
 
     os.makedirs(dest, exist_ok=True)
@@ -335,6 +340,7 @@ class Index:
         return len(self.chunks)
 
 
+@locked_space(0)
 def load(dest):
     """加载索引；没有索引返回 None。"""
     import numpy as np
@@ -344,7 +350,9 @@ def load(dest):
         return None
     try:
         matrix = np.load(os.path.join(dest, VECTORS_FILE))
-    except OSError:
+    except (OSError, ValueError, EOFError):
+        return None
+    if matrix.ndim != 2:
         return None
     if len(matrix) != len(chunks):
         return None
@@ -354,7 +362,8 @@ def load(dest):
 def _vector_hits(idx, query, cfg, n=RECALL_N):
     import numpy as np
 
-    qv = np.asarray(_normalize(embed([QUERY_PREFIX + query], cfg)[0]), dtype=np.float32)
+    query_cfg = {**cfg, "embed_timeout": cfg.get("query_timeout", 10), "embed_attempts": 1}
+    qv = np.asarray(_normalize(embed([QUERY_PREFIX + query], query_cfg)[0]), dtype=np.float32)
     if qv.shape[0] != idx.matrix.shape[1]:
         raise RuntimeError(f"query 维度 {qv.shape[0]} 与索引 {idx.matrix.shape[1]} 不一致，"
                            f"请重建索引（--rebuild）")
@@ -384,8 +393,16 @@ def search(idx, query, cfg, top_k=5, session_factory=None):
     RRF 只看排名不看绝对分，天然规避「两路分数量纲不同」的问题。"""
     if idx is None or not len(idx):
         return []
-    vec = _vector_hits(idx, query, cfg)
+    vector_error = None
+    try:
+        vec = _vector_hits(idx, query, cfg)
+    except Exception as e:
+        vector_error = e
+        vec = []
+        print(f"[wiki-index][vector-error] 向量检索不可用，尝试全文检索: {e}")
     ft = _fulltext_hits(idx, query, session_factory)
+    if vector_error and not ft:
+        raise RuntimeError(f"向量检索失败，全文检索无可用结果: {vector_error}") from vector_error
     fused = {}
     for rank, (i, _s) in enumerate(vec):
         fused[i] = fused.get(i, 0.0) + 1.0 / (RRF_K + rank + 1)
@@ -429,8 +446,16 @@ def format_reference(hits, max_chars=3000):
 
 def debug_search(idx, query, cfg, top_k=5, session_factory=None):
     """自检 CLI 用：分别打印向量路、全文路、融合结果，便于判断是哪一路出问题。"""
-    vec = _vector_hits(idx, query, cfg)
+    vector_error = None
+    try:
+        vec = _vector_hits(idx, query, cfg)
+    except Exception as e:
+        vector_error = e
+        vec = []
+        print(f"[wiki-index][vector-error] 向量检索不可用，尝试全文检索: {e}")
     ft = _fulltext_hits(idx, query, session_factory)
+    if vector_error and not ft:
+        raise RuntimeError(f"向量检索失败，全文检索无可用结果: {vector_error}") from vector_error
 
     def label(i):
         c = idx.chunks[i]

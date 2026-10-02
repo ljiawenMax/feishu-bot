@@ -18,6 +18,9 @@
     python -m wiki_sync --env local --bot <name> --search "问题"
 """
 
+from core.locking import locked_space
+
+import hashlib
 import json
 import os
 import re
@@ -43,6 +46,14 @@ def _api(resp, what):
     return resp.data
 
 
+def _next_page(data, seen):
+    token = data.page_token
+    if not token or token in seen:
+        raise RuntimeError("翻页令牌缺失或重复，结果不完整")
+    seen.add(token)
+    return token
+
+
 # ------------------------------------------------------------------ 知识空间 / 节点树
 
 def list_spaces(client):
@@ -50,7 +61,7 @@ def list_spaces(client):
 
     返回空列表通常不是没建知识库，而是**机器人应用还没被加为知识库成员**
     （知识库 → 设置 → 成员管理 → 添加应用）；这种情况飞书不报权限错，只给空列表。"""
-    spaces, token = [], None
+    spaces, token, seen = [], None, set()
     for _ in range(MAX_PAGES):
         b = ListSpaceRequest.builder().page_size(50)
         if token:
@@ -60,13 +71,15 @@ def list_spaces(client):
             spaces.append({"space_id": s.space_id, "name": s.name})
         if not data.has_more:
             break
-        token = data.page_token
+        token = _next_page(data, seen)
+    else:
+        raise RuntimeError("知识空间翻页超过上限，结果不完整")
     return spaces
 
 
 def _list_children(client, space_id, parent_node_token=None):
     """列某个父节点下的直接子节点（翻页取全）。"""
-    items, token = [], None
+    items, token, seen = [], None, set()
     for _ in range(MAX_PAGES):
         b = ListSpaceNodeRequest.builder().space_id(space_id).page_size(50)
         if parent_node_token:
@@ -77,7 +90,9 @@ def _list_children(client, space_id, parent_node_token=None):
         items.extend(data.items or [])
         if not data.has_more:
             break
-        token = data.page_token
+        token = _next_page(data, seen)
+    else:
+        raise RuntimeError("知识库节点翻页超过上限，结果不完整，取消同步")
     return items
 
 
@@ -87,10 +102,13 @@ def walk_tree(client, space_id, root_node=None):
 
     breadcrumb 是从根到该节点的标题路径（不含自身），会被拼进 chunk 文本——
     知识库目录树本身就是检索信号，所以文档别平铺在根节点。"""
-    out = []
+    out, visited = [], set()
 
     def walk(parent_token, trail):
         for n in _list_children(client, space_id, parent_token):
+            if not n.node_token or n.node_token in visited:
+                raise RuntimeError("知识库节点重复或形成环，取消同步")
+            visited.add(n.node_token)
             title = (n.title or "").strip() or "(无标题)"
             out.append({
                 "node_token": n.node_token,
@@ -265,7 +283,7 @@ def fetch_markdown(client, node):
         return f"（此节点类型为 {obj_type}，未抓取正文，请点击来源链接查看）"
 
     try:
-        blocks, token = [], None
+        blocks, token, seen = [], None, set()
         for _ in range(MAX_PAGES):
             b = ListDocumentBlockRequest.builder().document_id(obj_token).page_size(500)
             if token:
@@ -274,7 +292,9 @@ def fetch_markdown(client, node):
             blocks.extend(data.items or [])
             if not data.has_more:
                 break
-            token = data.page_token
+            token = _next_page(data, seen)
+        else:
+            raise RuntimeError("文档 block 翻页超过上限，改用完整原文")
         md = blocks_to_markdown(blocks)
         if md:
             return md
@@ -292,10 +312,11 @@ _UNSAFE = re.compile(r"[^\w一-鿿.-]+")
 
 
 def safe_filename(title, node_token):
-    """文件名消毒：只留字母数字汉字点横线，并带上 node_token 前 8 位保证唯一
+    """文件名消毒：只留字母数字汉字点横线，并带上完整 node_token 的摘要避免前缀碰撞
     （同名文档在知识库里很常见）。"""
     base = _UNSAFE.sub("_", (title or "").strip()).strip("_.")[:60] or "untitled"
-    return f"{base}-{(node_token or '')[:8]}.md"
+    suffix = hashlib.sha256((node_token or "").encode()).hexdigest()[:24]
+    return f"{base}-{suffix}.md"
 
 
 def _frontmatter(node):
@@ -330,6 +351,7 @@ def _write_manifest(dest, manifest):
     os.replace(tmp, path)
 
 
+@locked_space(2)
 def sync_space(client, space_id, dest, root_node=None, log=print):
     """把知识空间增量同步到 dest 目录，返回统计 dict。
 
@@ -389,6 +411,7 @@ def _rm(path):
         pass
 
 
+@locked_space(0)
 def clear_space(dest):
     """清空某空间的本地镜像与索引（换 embedding 模型/需要全量重建时用）。"""
     shutil.rmtree(dest, ignore_errors=True)
@@ -445,20 +468,26 @@ def _cli():
     import wiki_index
     dest = wiki_index.space_dir(cfg["wiki"]["cache_dir"], space_id)
 
-    if args.rebuild:
-        clear_space(dest)
-        print(f"[i] 已清空 {dest}，将全量重建")
+    import db
+    engine = db.init_engine(cfg["db"])
+    session_factory = db.make_session_factory(engine)
     if args.sync or args.rebuild:
-        stats = sync_space(client, space_id, dest, wiki_cfg.get("root_node"))
-        print(f"同步完成：{stats}")
-        n = wiki_index.build(dest, cfg["wiki"])
-        print(f"索引完成：{n} 个 chunk")
+        from core.locking import index_lock
+        with index_lock(dest):
+            if args.rebuild:
+                clear_space(dest)
+                print(f"[i] 已清空 {dest}，将全量重建")
+            stats = sync_space(client, space_id, dest, wiki_cfg.get("root_node"))
+            print(f"同步完成：{stats}")
+            n = wiki_index.build(dest, cfg["wiki"], session_factory=session_factory)
+            print(f"索引完成：{n} 个 chunk")
 
     if args.search:
         idx = wiki_index.load(dest)
         if idx is None:
             raise SystemExit("尚无索引，先跑 --sync")
-        wiki_index.debug_search(idx, args.search, cfg["wiki"], top_k=args.top_k)
+        wiki_index.debug_search(idx, args.search, cfg["wiki"], top_k=args.top_k,
+                                session_factory=session_factory)
 
 
 if __name__ == "__main__":
