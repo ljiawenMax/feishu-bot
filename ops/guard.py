@@ -133,13 +133,13 @@ def sick_chats(stats):
 
 # ----------------------------------------------------------------- 分诊
 
-def probe_anthropic():
-    """返回 (http_code, 是否健康)。401/405 = 通道健康（只是没带鉴权）；
-    403 = 被当成中国大陆出口；000 = 代理挂了。"""
+def probe_openai():
+    """返回 (http_code, 是否健康)。401/405 = Codex 订阅服务可达（未携带凭证）；
+    这里只判断网络，不判断订阅或模型授权。000 = 无法连接。"""
     try:
         out = subprocess.run(
             ["curl", "-o", "/dev/null", "-s", "-w", "%{http_code}", "--max-time", "20",
-             "-X", "POST", "https://api.anthropic.com/v1/messages"],
+             "https://chatgpt.com/backend-api/codex/models"],
             capture_output=True, text=True, timeout=30,
         ).stdout.strip()
     except Exception:
@@ -157,15 +157,15 @@ def triage(sick, down_state=None):
     details = " ".join((s.get("last_fail") or "") for s in sick.values()).lower()
     if any(m in details for m in QUOTA_MARKERS):
         return False, "错误文案指向订阅额度用尽——回滚治不了额度"
-    code, healthy = probe_anthropic()
+    code, healthy = probe_openai()
     if not healthy:
-        hint = {"403": "出口 IP 被判为中国大陆", "000": "代理不通"}.get(code, "")
+        hint = {"403": "订阅服务访问受限", "000": "代理不通"}.get(code, "")
         extra = "（服务起不来很可能就是 ExecStartPre 探代理失败）" if down_state else ""
-        return False, (f"api.anthropic.com 探测返回 {code}（期望 401/405）"
+        return False, (f"chatgpt.com 探测返回 {code}（期望 401/405）"
                        f"{('：' + hint) if hint else ''}{extra}——外部原因，回滚治不了")
     if down_state:
         return True, f"服务{down_state}、网络正常 → 判定为本机状态问题"
-    return True, f"api.anthropic.com 探测 {code} 正常、非额度问题 → 判定为本机状态问题"
+    return True, f"chatgpt.com 探测 {code} 正常、非额度问题 → 判定为本机状态问题"
 
 
 # ----------------------------------------------------------------- 回滚与验证
@@ -266,7 +266,7 @@ VERDICT_LABEL = {"up": "运行中", "starting": "正在启动", "crashloop": "�
 def verify_service_up(window=VERIFY_STABLE, interval=5):
     """回滚后验证服务**真的起来了**：连续 window 秒 active 且 NRestarts 不再增长。
 
-    这条是 canary() 顶不了的：canary 在 ROOT 里跑 claude，与服务起没起来无关，
+    这条是 canary() 顶不了的：canary 在 ROOT 里跑 Codex，与服务起没起来无关，
     服务崩着它照样通过。反过来 NRestarts 只看增量不看绝对值——
     手动 restart 不会把它清零（本机实测停在 31）。
     """
@@ -309,25 +309,43 @@ def config_error(env_name):
 
 
 def canary():
-    """真正验证 LLM 通道：在 ROOT 里跑一次 claude。这是唯一能证明「回滚确实修好了」的证据——
+    """真正验证 LLM 通道：在 ROOT 里跑一次 Codex。这是唯一能证明「回滚确实修好了」的证据——
     服务 active 只说明进程活着，事故当天进程也一直 active。"""
     env = dict(os.environ)
-    env["HOME"] = os.path.expanduser("~")
-    env["PATH"] = f"{env['HOME']}/.local/bin:/usr/local/bin:/usr/bin:/bin"
+    for key in ("OPENAI_API_KEY", "CODEX_API_KEY", "OPENAI_BASE_URL"):
+        env.pop(key, None)
+    env["PATH"] = f"{os.path.expanduser('~')}/.local/bin:" + env.get("PATH", "/usr/bin:/bin")
     try:
+        login = subprocess.run(["codex", "login", "status"], env=env,
+                               capture_output=True, text=True, timeout=10)
+        if login.returncode or "chatgpt" not in (login.stdout + login.stderr).lower():
+            return False, "canary 未使用 ChatGPT 订阅登录，请执行 codex login"
         r = subprocess.run(
-            ["claude", "-p", "reply with the single word: ok", "--output-format", "json"],
+            ["codex", "exec", "--json", "--ephemeral", "--skip-git-repo-check",
+             "-c", 'model_provider="openai"', "-c", 'approval_policy="never"',
+             "-c", 'sandbox_mode="read-only"',
+             "reply with the single word: ok; do not use tools"],
             cwd=snapshot.ROOT, env=env, capture_output=True, text=True, timeout=CANARY_TIMEOUT,
         )
-    except subprocess.TimeoutExpired:
-        return False, f"canary 超时（>{CANARY_TIMEOUT}s）"
-    try:
-        data = json.loads(r.stdout.strip().splitlines()[-1])
-    except Exception:
-        return False, f"canary 输出无法解析: {(r.stdout or r.stderr)[:200]}"
-    if data.get("is_error"):
-        return False, f"canary 返回错误: {str(data.get('result'))[:200]}"
-    return True, str(data.get("result", ""))[:100]
+    except (subprocess.TimeoutExpired, OSError) as e:
+        return False, f"canary 执行失败: {e}"
+    completed, answer, error = False, "", ""
+    for line in r.stdout.splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if event.get("type") == "turn.completed":
+            completed = True
+        elif event.get("type") == "item.completed":
+            item = event.get("item") or {}
+            if item.get("type") == "agent_message":
+                answer = item.get("text") or ""
+        elif event.get("type") in ("turn.failed", "error"):
+            error = str(event.get("error") or event.get("message") or "Codex error")
+    if r.returncode or not completed or answer.strip().lower() != "ok":
+        return False, f"canary 返回错误: {(error or answer or r.stderr)[:200]}"
+    return True, answer[:100]
 
 
 # ----------------------------------------------------------------- 主流程
@@ -502,7 +520,7 @@ def run(env, dry_run=False, env_name="local"):
     rok, rinfo = restart_service()
     time.sleep(VERIFY_WAIT)
     # 服务死了那一类（crashloop/down）的验证判据是「服务真的稳住了」，canary 只作附加确认：
-    # canary 在 ROOT 里跑 claude，与服务起没起来无关，服务崩着它照样通过。
+    # canary 在 ROOT 里跑 Codex，与服务起没起来无关，服务崩着它照样通过。
     sok, sinfo = verify_service_up()
     cok, cinfo = canary()
     recovered = rok and sok and (cok or bool(down_state))
