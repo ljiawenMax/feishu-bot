@@ -1,5 +1,9 @@
 # feishu-claude-bot
 
+> 2026-10-03：运行后端已迁到 Codex，core / fbtool / 两个 skill / 语音能力已实现。
+> 本文以下为迁移前设计记录，当前命令、权限与启动说明以 README.md 为准。
+> `/allsessions` `/name` `/permit` 保留；辩论走 feishu-debate skill。
+
 ## 项目目标
 
 本地运行的服务，监听飞书群消息，将消息内容作为任务交给 Claude Code 执行，把执行结果回复到飞书。
