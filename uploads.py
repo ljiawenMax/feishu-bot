@@ -5,6 +5,8 @@
 文件名消毒防路径穿越，不自动解压，超过大小上限拒绝。bot 只存不跑。
 """
 
+import hashlib
+import tempfile
 import os
 import re
 
@@ -36,7 +38,7 @@ def _safe_filename(name):
     name = os.path.basename(name)
     name = _SAFE_RE.sub("_", name)
     name = name.lstrip("._-")
-    name = name[:120]
+    name = name[:120].encode("utf-8")[:200].decode("utf-8", errors="ignore")
     return name or "file"
 
 
@@ -84,19 +86,13 @@ def save_upload(client, msg, chat_id):
     超过大小上限抛 TooLarge；其它失败抛原异常（已清理临时文件）。
     client 为 lark-oapi SDK 客户端（token 由其内部管理）。"""
     d = _ensure_dir(chat_id)
-    prefix = _safe_filename(msg["id"])[-16:] or "msg"  # 唯一前缀，避免覆盖
+    prefix = hashlib.sha256((msg["id"] + "\0" + msg["file_key"]).encode()).hexdigest()[:24]
     raw = msg.get("file_name") or ""
     safe = _safe_filename(raw) if raw else (
         "image" if msg.get("resource_type") == "image" else "file"
     )
 
-    part = os.path.join(d, f".{prefix}.part")
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-    try:
-        fd = os.open(part, flags, 0o600)
-    except FileExistsError:
-        _safe_remove(part)
-        fd = os.open(part, flags, 0o600)
+    fd, part = tempfile.mkstemp(prefix=f".{prefix}.", suffix=".part", dir=d)
 
     try:
         with os.fdopen(fd, "wb") as f:
