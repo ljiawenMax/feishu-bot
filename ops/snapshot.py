@@ -6,13 +6,16 @@
 回滚等于删用户的东西。
 
 基线语义（关键，别改坏）：known-good = 「**某一轮任务开始之前**的状态」，由 bot.py 在调
-run_claude 前 take()、该轮 LLM 成功后 promote() 转正。不是「上次重启前」也不是「当前状态」：
+run_codex 前 take()、该轮 LLM 成功后 promote() 转正。不是「上次重启前」也不是「当前状态」：
 写坏配置的那一轮，它自己往往是成功的（正是它写坏的），拿完成时刻的状态当基线会把污染态存成
-known-good，回滚过去等于没回滚。任务前拍照让基线天然早于任何写操作，这个竞态从根上消掉。
+known-good，回滚过去等于没回滚。任务前拍照让基线天然早于任何写操作，避免保存本轮刚写坏的状态。自动转正还要求快照代码/配置与启动版本指纹一致，
+否则旧进程的成功不能证明磁盘上的新代码正常。
 
 去重靠 rsync --link-dest 硬链到上一份，除首份外每份只占改动量（整目录约 1.6M）。
 """
 
+import hashlib
+from pathlib import Path
 import fcntl
 import os
 import shutil
@@ -39,6 +42,34 @@ KEEP = 30
 #           记进历史——反而更诚实。注意这也意味着 .git/hooks 里的东西回滚不掉（gitsync 走
 #           --no-verify，影响有限）。
 EXCLUDES = [".venv/", ".git/", "__pycache__/", "*.pyc", ".mypy_cache/", ".pytest_cache/", ".rwtest"]
+
+
+_RUNTIME_FINGERPRINT = None
+
+
+def _fingerprint(root):
+    """仅哈希运行所依赖的代码/配置；不读取或输出凭证正文。"""
+    digest = hashlib.sha256()
+    paths = []
+    for directory, dirs, files in os.walk(root):
+        dirs[:] = sorted(d for d in dirs if d not in
+                         (".git", ".venv", "__pycache__", "tests", "docs", ".pytest_cache"))
+        for name in files:
+            if (name.endswith((".py", ".sh", ".toml")) or name.startswith(".env")
+                    or name in ("fbtool", "requirements.txt", "SKILL.md")):
+                paths.append(Path(directory) / name)
+    for path in sorted(paths):
+        digest.update(str(path.relative_to(root)).encode())
+        digest.update(b"\0")
+        digest.update(path.read_bytes())
+        digest.update(b"\0")
+    return digest.digest()
+
+
+def capture_runtime():
+    """启动完成、开启 worker 前固定磁盘版本，后续任务不能证明新改的代码可用。"""
+    global _RUNTIME_FINGERPRINT
+    _RUNTIME_FINGERPRINT = _fingerprint(ROOT)
 
 
 def _ensure_store():
@@ -89,7 +120,7 @@ def known_good_id():
 
 
 def take():
-    """拍一份快照，返回其 id。调用点：bot.py 在 run_claude **之前**。"""
+    """拍一份快照，返回其 id。调用点：bot.py 在 run_codex **之前**。"""
     with _Lock():
         prev = list_snapshots()
         sid = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
@@ -119,7 +150,13 @@ def promote(sid):
 def take_quiet():
     """给 bot.py 用：任何失败都不许影响正常任务。"""
     try:
-        return take()
+        if _RUNTIME_FINGERPRINT is None or _fingerprint(ROOT) != _RUNTIME_FINGERPRINT:
+            print("[snapshot] 磁盘代码/配置未由当前进程验证，跳过自动基线更新")
+            return None
+        sid = take()
+        if _fingerprint(os.path.join(SNAP_DIR, sid)) != _RUNTIME_FINGERPRINT:
+            return None
+        return sid
     except Exception as e:
         print(f"[snapshot][warn] take failed: {e}")
         return None
@@ -127,6 +164,10 @@ def take_quiet():
 
 def promote_quiet(sid):
     try:
+        if not sid or _RUNTIME_FINGERPRINT is None:
+            return False
+        if _fingerprint(os.path.join(SNAP_DIR, sid)) != _RUNTIME_FINGERPRINT:
+            return False
         return promote(sid)
     except Exception as e:
         print(f"[snapshot][warn] promote failed: {e}")
