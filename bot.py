@@ -208,6 +208,7 @@ class Bot:
                                    claude_sid=claude_sid, cwd=cwd, external=external, seed=seed, strict=True)
         if seed:
             entry["seed"] = seed
+            entry["_summary"] = seed
         return entry
 
     def set_current(self, entry):
@@ -556,11 +557,12 @@ class Bot:
         return GUARD_PROCEED
 
     def _do_compact(self, msg_id, reason=None, entry=None, job=None):
-        """把当前对话本地历史摘要成一段上下文，开一个新对话并把摘要设为其 seed
-        （下一条任务自动带上）。成功返回新会话条目；无历史或摘要失败返回 False。"""
+        """在原对话保存摘要并重置执行上下文，保留列表条目和 DB 行。
+        下一条任务自动带上 seed；成功返回原条目，无历史或摘要失败返回 False。"""
         with self.lock:
             entry = entry if entry is not None else self.current_entry()
             history = self._entry_history(entry)
+            previous_summary = (entry or {}).get("seed") or (entry or {}).get("_summary")
         if not history and entry and entry.get("id"):
             # 接管来的本机会话在 messages 表里没有任何历史（那些对话发生在终端里），
             # 本地历史为空就直接 return False 的话，护栏一触发就是死路：压缩压不动，
@@ -568,6 +570,9 @@ class Bot:
             # 退而求其次，从磁盘 session 文件读最近若干轮当摘要素材。
             history = core_compact.history_from_disk(entry["id"], self.entry_cwd(entry),
                                                      log=self._log)
+        if previous_summary:
+            history = [{"role": "assistant",
+                        "content": f"[上一段对话的压缩摘要]\n{previous_summary}"}] + history
         if not history:
             return False
         note = f"（{reason}）" if reason else ""
@@ -578,33 +583,14 @@ class Bot:
         if not summary:
             self._push_reply(msg_id, "上下文自动压缩失败，可手动 /new 开新对话", tag="compact")
             return False
-        with self.lock:  # 与 worker/命令的会话增删改互斥（同 cmd_new）
-            # 压缩后的新对话继承当前会话的工作目录：从接管来的本机会话压一次就被丢回
-            # bot 的 work_dir 的话，后半段对话会突然对着另一个项目说话。
-            # external 不继承——新会话是 bot 自己建的，/del 该删就删。
-            source = entry
-            entry = self.make_session(cwd=(source or {}).get("cwd"), seed=summary)
-            self.sessions["list"].append(entry)
-            # 发布新会话前转移正在执行的任务计数，防通知发送期间被 /del 删除。
-            if job is not None and job.get("entry") is source:
-                job["entry"] = entry
-                if source.get("_jobs", 0):
-                    source["_jobs"] -= 1
-                    entry["_jobs"] = entry.get("_jobs", 0) + 1
-            if self.current_entry() is source:
-                self.sessions["current"] = len(self.sessions["list"]) - 1
+        with self.lock:  # 先持久化，失败时不改变内存里的原会话
+            self.db(db.compact_session, entry["_row_id"], summary, strict=True)
+            entry.update(id=None, seed=summary, _summary=summary, _history=[], external=False)
+            # 当前任务和排队任务仍引用同一条目，无需转移；_jobs 继续保护删除。
+            # 压缩期间用户已切换会话时，不改变其选择和历史。
+            if self.current_entry() is entry:
                 self.sessions["history"] = []
-                self.set_current(entry)
-            # 已排队的续聊也使用压缩后的会话，不能再落回旧上下文。
-            task_queue = getattr(self, "task_queue", None)
-            if task_queue is not None:
-                with task_queue.mutex:
-                    for pending_job in task_queue.queue:
-                        if pending_job.get("entry") is source:
-                            pending_job["entry"] = entry
-                            source["_jobs"] -= 1
-                            entry["_jobs"] = entry.get("_jobs", 0) + 1
-        self._push_reply(msg_id, "✅ 已压缩并开新对话，后续在压缩摘要基础上继续。", tag="compact")
+        self._push_reply(msg_id, "✅ 已压缩当前对话，后续在压缩摘要基础上继续。", tag="compact")
         print(f"[{self.name}][compact] done reason={reason} summary_chars={len(summary)}")
         return entry
 

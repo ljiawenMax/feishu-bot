@@ -65,7 +65,7 @@ def find_by_sid(data, sid):
 def append_and_focus(data, entry, clear_history=True):
     """把新条目挂到列表末尾并切过去，返回条目总数。
 
-    `/new`、自动压缩、接管本机会话三处共用。clear_history=False 用于接管——
+    `/new`、接管本机会话共用；压缩复用原条目。clear_history=False 用于接管——
     那种会话的历史要从盘上读，不是清空。
     """
     data["list"].append(entry)

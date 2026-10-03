@@ -98,15 +98,17 @@ def load_state(s, chat_id):
         if conv.is_current:
             data["current"] = len(data["list"]) - 1
 
-    # 摘要与新会话在同一事务保存，首次续聊前重启也不会丢失上下文。
-    empty_rows = {entry["_row_id"]: entry for entry in data["list"] if not entry["id"]}
-    if empty_rows:
+    # 最新摘要随原会话恢复：未取得新 SID 时作为 seed，后续再次压缩时保留早期事实。
+    entries = {entry["_row_id"]: entry for entry in data["list"]}
+    if entries:
         summaries = s.execute(select(Message.session_id, Message.content)
                               .where(Message.chat_id == chat_id,
-                                     Message.session_id.in_(empty_rows), Message.role == "summary")
+                                     Message.session_id.in_(entries), Message.role == "summary")
                               .order_by(Message.id)).all()
         for row_id, summary in summaries:
-            empty_rows[row_id]["seed"] = summary
+            entries[row_id]["_summary"] = summary
+            if not entries[row_id]["id"]:
+                entries[row_id]["seed"] = summary
 
     # 为当前 session 重建对话历史（最近 40 条）
     if data["list"]:
@@ -163,6 +165,17 @@ def update_session(s, row_id, claude_sid=None, label=None):
     if not values:
         return
     s.execute(update(Conversation).where(Conversation.id == row_id).values(**values))
+
+
+def compact_session(s, row_id, summary):
+    """在原会话行保存摘要并重置执行 SID，同事务提交；历史消息保留。"""
+    conv = s.get(Conversation, row_id)
+    if conv is None:
+        raise ValueError(f"会话不存在：{row_id}")
+    conv.claude_session_id = None
+    # 下一轮创建的 Codex 上下文属于 bot，原接管会话的磁盘文件仍保留。
+    conv.external = False
+    append_message(s, row_id, conv.chat_id, None, "summary", summary)
 
 
 def set_session_model(s, row_id, model):

@@ -22,7 +22,7 @@ from core.locking import index_lock
 import db
 import feishu_api
 import feishu_claude
-from models import Base
+from models import Base, Conversation, Message
 import tool_bridge
 import uploads
 import wiki_index
@@ -149,7 +149,7 @@ class SessionRaceTests(unittest.TestCase):
         bot._do_compact.assert_called_once()
         bot.execute_codex.assert_not_called()
 
-    def test_compaction_keeps_cwd_and_selection_and_moves_queued_followups(self):
+    def test_compaction_keeps_original_entry_cwd_selection_and_queued_followups(self):
         bot = self.make_bot()
         source = bot.current_entry()
         with patch('bot.feishu_api.reply_message'):
@@ -163,15 +163,21 @@ class SessionRaceTests(unittest.TestCase):
             return '压缩摘要'
         with patch('bot.core_compact.summarize', side_effect=summarize) as run:
             compacted = bot._do_compact('m', entry=source)
+        self.assertIs(compacted, source)
+        self.assertEqual(len(bot.sessions['list']), 2)
         self.assertIs(bot.current_entry(), other)
+        self.assertEqual(bot.sessions['history'][0]['content'], '其他会话')
         self.assertEqual(compacted['cwd'], '/original/project')
         self.assertEqual(run.call_args.args[1], '/original/project')
         self.assertEqual(compacted['seed'], '压缩摘要')
         self.assertIs(bot.task_queue.get_nowait()['entry'], compacted)
-        self.assertEqual(source['_jobs'], 0)
         self.assertEqual(compacted['_jobs'], 1)
+        self.assertEqual(compacted['_row_id'], 7)
+        self.assertEqual(compacted['label'], '旧会话')
+        self.assertIsNone(compacted['id'])
+        self.assertIs(bot.db.call_args.args[0], db.compact_session)
         self.assertTrue(bot.db.call_args.kwargs['strict'])
-        self.assertEqual(bot.db.call_args.kwargs['seed'], '压缩摘要')
+        self.assertEqual(bot.db.call_args.args[1:], (7, '压缩摘要'))
 
     def test_compacted_session_cannot_be_deleted_while_announcing_it(self):
         bot = self.make_bot()
@@ -189,7 +195,63 @@ class SessionRaceTests(unittest.TestCase):
         with patch('bot.core_compact.summarize', return_value='摘要'), patch('bot.feishu_api.reply_message'):
             compacted = bot._do_compact('m', entry=source, job=job)
         self.assertIs(job['entry'], compacted)
-        self.assertEqual(source['_jobs'], 0)
+        self.assertIs(compacted, source)
+        self.assertEqual(source['_jobs'], 1)
+
+    def test_automatic_compaction_reuses_list_entry_and_sends_summary_to_execution(self):
+        bot = self.make_bot()
+        source = bot.current_entry()
+        source['model'] = 'gpt-test'
+        source['external'] = True
+        with self.execution(), patch.object(bot, '_context_pct', return_value=80), \
+             patch('bot.core_compact.summarize', return_value='关键事实'):
+            bot._execute_job({'text': '继续任务', 'msg_id': 'm', 'entry': source})
+        self.assertEqual(len(bot.sessions['list']), 1)
+        self.assertIs(bot.current_entry(), source)
+        self.assertEqual(source['_row_id'], 7)
+        self.assertEqual(source['model'], 'gpt-test')
+        self.assertFalse(source['external'])
+        self.assertEqual(bot.execute_codex.call_args.args[:2], ('继续任务', None))
+        self.assertIn('关键事实', bot.execute_codex.call_args.kwargs['run_text'])
+        self.assertEqual(bot.execute_codex.call_args.kwargs['history'], [])
+
+    def test_repeated_compaction_preserves_previous_summary_without_adding_entries(self):
+        bot = self.make_bot()
+        source = bot.current_entry()
+        with patch('bot.core_compact.summarize', side_effect=['第一份摘要', '第二份摘要']) as run:
+            bot._do_compact('m', entry=source)
+            bot._do_compact('m', entry=source)
+        self.assertEqual(run.call_count, 2)
+        self.assertIn('第一份摘要', run.call_args.args[0][0]['content'])
+        self.assertEqual(len(bot.sessions['list']), 1)
+        self.assertEqual(source['seed'], '第二份摘要')
+
+    def test_compaction_after_successful_followup_keeps_older_summary(self):
+        bot = self.make_bot()
+        source = bot.current_entry()
+        source['_summary'] = '早餐牛奶固定200ml'
+        with patch('bot.core_compact.summarize', return_value='新摘要') as run:
+            bot._do_compact('m', entry=source)
+        self.assertIn('早餐牛奶固定200ml', run.call_args.args[0][0]['content'])
+        self.assertEqual(run.call_args.args[0][1]['content'], '旧对话事实')
+
+    def test_failed_compaction_does_not_change_original_session(self):
+        for failure in ('summary', 'database'):
+            with self.subTest(failure=failure):
+                bot = self.make_bot()
+                source = bot.current_entry()
+                bot._entry_history(source)
+                before = dict(source)
+                if failure == 'database':
+                    bot.db.side_effect = OSError('database down')
+                with patch('bot.core_compact.summarize', return_value=None if failure == 'summary' else '摘要'):
+                    if failure == 'database':
+                        with self.assertRaises(OSError):
+                            bot._do_compact('m', entry=source)
+                    else:
+                        self.assertFalse(bot._do_compact('m', entry=source))
+                self.assertEqual(source, before)
+                self.assertEqual(len(bot.sessions['list']), 1)
 
     def test_db_failure_rolls_back_permission_toggle(self):
         bot = self.make_bot()
@@ -242,6 +304,89 @@ class PersistenceTests(unittest.TestCase):
             raise RuntimeError('simulate commit failure')
         with self.sessions() as s:
             self.assertEqual(db.load_state(s, 'chat')['sessions']['list'], [])
+
+    def test_compaction_and_restart_keep_row_metadata_summary_and_old_messages(self):
+        with self.sessions.begin() as s:
+            row = db.insert_session(s, 'chat', '饮食方案', 3, claude_sid='codex:old',
+                                    cwd='/project', external=True)
+            db.set_session_model(s, row, 'gpt-test')
+            db.set_current(s, 'chat', row)
+            db.append_message(s, row, 'chat', 'codex:old', 'user', '早餐牛奶200ml')
+            other = db.insert_session(s, 'chat', '其他项目', 4, claude_sid='codex:other')
+        with self.sessions.begin() as s:
+            db.compact_session(s, row, '关键事实')
+        with self.sessions() as s:
+            state = db.load_state(s, 'chat')['sessions']
+            original = state['list'][0]
+            self.assertEqual([e['_row_id'] for e in state['list']], [row, other])
+            self.assertEqual(state['current'], 0)
+            self.assertEqual(state['history'], [])
+            self.assertEqual((original['label'], original['cwd'], original['model']),
+                             ('饮食方案', '/project', 'gpt-test'))
+            self.assertFalse(original['external'])
+            self.assertIsNone(original['id'])
+            self.assertEqual(original['seed'], '关键事实')
+            self.assertEqual(s.get(Conversation, row).position, 3)
+            self.assertEqual(db.load_history(s, 'chat', 'codex:old')[0]['content'], '早餐牛奶200ml')
+        # 续聊后恢复最新摘要，第二次压缩仍更新同一行。
+        with self.sessions.begin() as s:
+            db.update_session(s, row, claude_sid='codex:new')
+            db.append_message(s, row, 'chat', 'codex:new', 'user', '继续')
+            db.append_message(s, row, 'chat', 'codex:new', 'assistant', '结果')
+        with self.sessions() as s:
+            state = db.load_state(s, 'chat')['sessions']
+            self.assertNotIn('seed', state['list'][0])
+            self.assertEqual(state['list'][0]['_summary'], '关键事实')
+            self.assertEqual([m['content'] for m in state['history']], ['继续', '结果'])
+        with self.sessions.begin() as s:
+            db.compact_session(s, row, '第二份摘要')
+        with self.sessions() as s:
+            state = db.load_state(s, 'chat')['sessions']
+            self.assertEqual(len(state['list']), 2)
+            self.assertEqual(state['list'][0]['seed'], '第二份摘要')
+            self.assertEqual(state['list'][0]['_row_id'], row)
+
+    def test_failed_compaction_transaction_keeps_old_sid_and_no_summary(self):
+        with self.sessions.begin() as s:
+            row = db.insert_session(s, 'chat', '原对话', 0, claude_sid='codex:old', external=True)
+        with self.assertRaises(RuntimeError), self.sessions.begin() as s:
+            db.compact_session(s, row, '摘要')
+            s.flush()
+            raise RuntimeError('simulate commit failure')
+        with self.sessions() as s:
+            original = db.load_state(s, 'chat')['sessions']['list'][0]
+            self.assertEqual(original['id'], 'codex:old')
+            self.assertTrue(original['external'])
+            self.assertNotIn('seed', original)
+            self.assertEqual(s.query(Message).count(), 0)
+
+    def test_automatic_compaction_persists_new_execution_sid_on_original_row(self):
+        with self.sessions.begin() as s:
+            row = db.insert_session(s, 'chat', '原对话', 0, claude_sid='codex:old')
+            db.set_current(s, 'chat', row)
+            db.append_message(s, row, 'chat', 'codex:old', 'user', '原事实')
+        bot = SessionRaceTests().make_bot()
+        bot.chat_id = 'chat'
+        bot.Session = self.sessions
+        bot.db = Bot.db.__get__(bot)
+        bot.execute_codex = Bot.execute_codex.__get__(bot)
+        bot.audit = Bot.audit.__get__(bot)
+        with self.sessions() as s:
+            bot.sessions = db.load_state(s, 'chat')['sessions']
+        with SessionRaceTests().execution(), patch.object(bot, '_context_pct', return_value=80), \
+             patch('bot.core_compact.summarize', return_value='原事实摘要'), \
+             patch('bot.codex_runner.run_codex', return_value=('结果', 'codex:new', 'gpt-test')) as run:
+            bot._execute_job({'text': '继续', 'msg_id': 'm', 'entry': bot.current_entry()})
+        self.assertIn('原事实摘要', run.call_args.args[0])
+        self.assertIsNone(run.call_args.args[3])
+        with self.sessions() as s:
+            state = db.load_state(s, 'chat')['sessions']
+            self.assertEqual(len(state['list']), 1)
+            self.assertEqual(state['list'][0]['_row_id'], row)
+            self.assertEqual(state['list'][0]['id'], 'codex:new')
+            self.assertEqual(state['list'][0]['_summary'], '原事实摘要')
+            self.assertNotIn('seed', state['list'][0])
+            self.assertEqual([m['content'] for m in state['history']], ['继续', '结果'])
 
 
 class DeliveryTests(unittest.TestCase):
