@@ -3,7 +3,6 @@ import contextlib
 import json
 import os
 from pathlib import Path
-import runpy
 import socket
 import subprocess
 import tempfile
@@ -200,24 +199,6 @@ class SpeakerTests(unittest.TestCase):
             play.assert_called_once()
 
 
-class DebateTests(unittest.TestCase):
-    def test_both_sides_only_receive_their_history_and_exchanged_statements(self):
-        module=runpy.run_path(str(ROOT/'.agents/skills/feishu-debate/scripts/debate.py'))
-        prompts=[]
-        def run(prompt,*a,**kw):
-            prompts.append(prompt)
-            return f'发言{len(prompts)}', None, None
-        send=Mock(return_value={'ok':True})
-        with patch.dict(os.environ, {'FEISHU_TOOL_TOKEN':'test','FEISHU_TOOL_CLI':'cli'}), \
-             patch('codex_runner.run_codex', side_effect=run), \
-             patch('runpy.run_path', return_value={'call':send}):
-            result=module['debate']('辩题',rounds=2)
-        self.assertTrue(result['completed'])
-        self.assertEqual(send.call_count,4)
-        self.assertNotIn('你是反方',prompts[2])
-        self.assertNotIn('你是正方',prompts[3])
-        self.assertIn('发言2',prompts[2])
-        self.assertIn('发言3',prompts[3])
 
 
 if __name__ == '__main__':

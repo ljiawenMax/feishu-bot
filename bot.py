@@ -24,6 +24,7 @@ import wiki_index
 import wiki_sync
 import tool_bridge
 from core.locking import index_lock
+from core import debate as core_debate
 from core import compact as core_compact
 from core import context as core_context
 from core import sessions as core_sessions
@@ -803,10 +804,14 @@ class Bot:
                     seed = entry.get("seed")
 
         # 压缩后首轮：把摘要拼进实际 prompt（审计/历史仍存用户原文 text）
+        debate_required = core_debate.required(text)
         run_text = text
         if seed:
             run_text = (f"[以下是上一段对话的压缩摘要，请据此延续上下文，无需复述]\n{seed}\n\n"
                         f"[用户新消息]\n{text}")
+        if debate_required:
+            run_text = ("[本轮要求真实的独立辩论：调用 feishu_bot 的 MCP debate 工具，各方五轮逐轮推送。"
+                        "工具失败则说明失败；不可自己扮演双方。]\n" + run_text)
         # 知识库 RAG：检索出的条目拼在用户消息之前。只改 run_text，text 原样进 history
         # 与审计——否则历史会被资料撑爆，压缩摘要也会跟着跑偏。
         reference = self._wiki_reference(text) if self.wiki_space_id and not tool_bridge._SERVER else ""
@@ -847,6 +852,14 @@ class Bot:
             stop.set()
 
         # LLM 响应审计：耗时 / 模型 / 是否出错 / 输出规模 / 新 session（同时落库）
+        debate = getattr(tools, 'debate', None)
+        if ((isinstance(debate, dict) and not debate.get('completed'))
+                or (debate_required and not result.startswith('[error]')
+                    and not (isinstance(debate, dict) and debate.get('completed')))):
+            sent = debate.get('sent', 0) if isinstance(debate, dict) else 0
+            error = (debate.get('error', '调用未完成') if isinstance(debate, dict)
+                     else '模型没有调用独立辩论工具')
+            result = f"[error] 独立辩论未完成（已推送 {sent}/10 条发言）：{error}"
         is_err = result.startswith("[error]")
         print(f"[{self.name}][llm] elapsed={self._human_elapsed(int(elapsed))} "
               f"model={used_model} error={is_err} timed_out={'超时' in result} chars={len(result)} "

@@ -20,7 +20,10 @@ def call(operation, arguments):
     if len(data) > MAX_REQUEST:
         raise ValueError('请求超过 64KB')
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as conn:
-        conn.settimeout(90)
+        timeout = 90
+        if operation == 'debate':
+            timeout = max(90, float(os.environ.get('FEISHU_TASK_TIMEOUT', '600')) + 15)
+        conn.settimeout(timeout)
         conn.connect(os.environ['FEISHU_BOT_SOCK'])
         conn.sendall(data)
         with conn.makefile('rb') as stream:
@@ -31,6 +34,10 @@ def call(operation, arguments):
 
 
 def main():
+    if sys.argv[1:] == ['--mcp']:
+        from core.mcp import serve
+        serve(call, sys.stdin, sys.stdout)
+        return 0
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest='operation', required=True)
     for name, field in [('send_file', 'path'), ('send_image', 'path'),
@@ -38,6 +45,8 @@ def main():
                         ('history_search', 'query'), ('speak', 'text')]:
         p = sub.add_parser(name)
         p.add_argument(field)
+    p = sub.add_parser('debate')
+    p.add_argument('--topic', required=True)
     p = sub.add_parser('list_uploads')
     p.add_argument('--limit', type=int, default=10)
     for name in ('restart_service', 'git_local_changes', 'compact_context'):

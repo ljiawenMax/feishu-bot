@@ -8,8 +8,10 @@ import socketserver
 import stat
 import subprocess
 import threading
+import time
 from pathlib import Path
 
+from core import debate as core_debate
 from core import git as core_git
 from core import uploads as core_uploads
 import db
@@ -27,14 +29,23 @@ class CallContext:
         self.cwd = bot.entry_cwd(entry) if entry is not None else bot.current_cwd()
         self.unsafe = bot.unsafe_mode if unsafe is None else unsafe
         self.restart = self.compact = False
+        self.debate = None
+        self.cancelled = threading.Event()
+        task_timeout = getattr(bot, 'task_timeout', 600)
+        if not isinstance(task_timeout, (int, float)):
+            task_timeout = 600
+        self.deadline = time.monotonic() + task_timeout
         self.files = 0
         self.lock = threading.Lock()
         self.env = {'FEISHU_CHAT_ID': self.chat_id, 'FEISHU_MSG_ID': msg_id,
                     'FEISHU_BOT_SOCK': str(socket_path), 'FEISHU_TOOL_TOKEN': secrets.token_hex(32),
                     'FEISHU_TOOL_CLI': str(ROOT / 'fbtool'),
+                    'FEISHU_TASK_TIMEOUT': str(task_timeout),
                     'FEISHU_DEBATE_SCRIPT': str(ROOT / '.agents/skills/feishu-debate/scripts/debate.py')}
 
     def dispatch(self, operation, args):
+        if self.cancelled.is_set():
+            raise ValueError('任务已结束')
         bot, msg_id = self.bot, self.msg_id
         if operation == 'send_text':
             text = args['text']
@@ -61,6 +72,37 @@ class CallContext:
             if not result:
                 raise RuntimeError('飞书附件发送失败')
             return {'sent': True, 'path': path}
+        if operation == 'debate':
+            topic = args.get('topic')
+            if not isinstance(topic, str) or not topic.strip() or len(topic) > 2000:
+                raise ValueError('辩题必须非空，且不超过 2000 字')
+            if self.debate is not None:
+                raise ValueError('本轮独立辩论已调用过，不重复启动')
+            self.debate = {'completed': False, 'sent': 0}
+
+            def emit(statement):
+                if self.cancelled.is_set():
+                    raise RuntimeError('任务已结束，不再推送辩论')
+                side, turn = statement['side'], statement['round']
+                tag = f"debate-{'pro' if side == '正方' else 'con'}-r{turn}"
+                bot.db(db.record_audit, self.chat_id, 'llm', tag, message_id=msg_id,
+                       model=statement['model'], elapsed_ms=statement['elapsed_ms'],
+                       chars=len(statement['text']), detail=statement['text'][:2000])
+                if not bot._push_reply(msg_id, f"🎙 {side} · 第{turn}/5轮\n\n{statement['text']}",
+                                       tag=tag, file_limit=0):
+                    raise RuntimeError(f'{side}第{turn}轮推送失败')
+                self.debate['sent'] += 1
+
+            try:
+                result = core_debate.run(topic.strip(), self.cwd, emit,
+                                         deadline=self.deadline, cancelled=self.cancelled)
+            except Exception as e:
+                self.debate['error'] = str(e)
+                bot.db(db.record_audit, self.chat_id, 'llm', 'debate-error',
+                       message_id=msg_id, ok=False, detail=str(e)[:2000])
+                raise
+            self.debate.update(result)
+            return result
         if operation == 'restart_service':
             if not self.unsafe or not bot.unsafe_mode:
                 raise ValueError('重启服务需要用户先开启 /unsafe')
@@ -182,6 +224,7 @@ def bind(bot, msg_id, entry=None, unsafe=None):
     try:
         yield ctx
     finally:
+        ctx.cancelled.set()
         if server:
             # 等待本轮已开始的工具完成后再失效；失效后不能外发。
             with ctx.lock, server.context_lock:

@@ -5,6 +5,7 @@ DB 保留历史列 claude_session_id；新 ID 加 codex: 前缀，防止把 Clau
 """
 
 import collections
+import time
 import sys
 import glob
 import json
@@ -103,7 +104,7 @@ def build_task_with_history(task, history):
 
 def run_codex(task, work_dir, timeout, session_id=None, permit=False, extra_dirs=None,
               history=None, model=None, unsafe=False, extra_system=None, report_actions=True,
-              tool_env=None, lightweight=False, parent_bound=False):
+              tool_env=None, lightweight=False, parent_bound=False, cancel_event=None):
     try:
         require_chatgpt_login()
     except (RuntimeError, subprocess.TimeoutExpired) as e:
@@ -122,7 +123,8 @@ def run_codex(task, work_dir, timeout, session_id=None, permit=False, extra_dirs
         instructions += (
             "\n\n本轮可用飞书工具：运行 \"$FEISHU_TOOL_CLI\" --help 查看入口。"
             "附件、知识库、压缩、重启、语音需求可读取 feishu-tools skill；"
-            "需要独立正反方辩论时读取 feishu-debate skill。"
+            "本轮已提供 feishu_bot MCP 工具，优先直接调用，沙箱内 CLI 可能无法连接 socket。需要独立正反方辩论时读取 feishu-debate skill，调用 MCP debate 工具。"
+            "脚本或工具失败时必须说明独立辩论未完成，不得自行扮演双方冒充独立辩论。"
         )
     if extra_dirs:
         # Codex 的 --add-dir 授予写权限，不能用于旧配置中承诺的只读资料目录。
@@ -134,6 +136,15 @@ def run_codex(task, work_dir, timeout, session_id=None, permit=False, extra_dirs
            "-c", "sandbox_workspace_write.writable_roots=[]",
            "-c", "sandbox_workspace_write.network_access=false",
            "-c", "developer_instructions=" + json.dumps(instructions, ensure_ascii=False)]
+    if tool_env and not lightweight:
+        cli = os.path.join(os.path.dirname(__file__), 'fbtool')
+        options = {'command': sys.executable, 'args': [cli, '--mcp'],
+                   'env_vars': sorted(tool_env), 'startup_timeout_sec': 10,
+                   'tool_timeout_sec': timeout + 15, 'required': True, 'enabled': True,
+                   # 仅预授权本机工具入口；具体群、外发和重启权限仍由 bot 校验。
+                   'default_tools_approval_mode': 'approve'}
+        for key, value in options.items():
+            cmd += ['-c', 'mcp_servers.feishu_bot.' + key + '=' + json.dumps(value)]
     if model:
         cmd += ["--model", model]
     if lightweight:
@@ -172,7 +183,28 @@ def run_codex(task, work_dir, timeout, session_id=None, permit=False, extra_dirs
                                 start_new_session=True)
         timed_out = False
         try:
-            stdout, stderr = proc.communicate(task, timeout=timeout)
+            if cancel_event is None:
+                stdout, stderr = proc.communicate(task, timeout=timeout)
+            else:
+                deadline = time.monotonic() + timeout
+                first = True
+                while True:
+                    if cancel_event.is_set():
+                        try:
+                            os.killpg(proc.pid, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+                        stdout, stderr = proc.communicate()
+                        return "[error] 任务已取消", None, None
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise subprocess.TimeoutExpired(cmd, timeout)
+                    try:
+                        stdout, stderr = proc.communicate(task if first else None,
+                                                         timeout=min(remaining, 1))
+                        break
+                    except subprocess.TimeoutExpired:
+                        first = False
         except subprocess.TimeoutExpired:
             timed_out = True
             try:

@@ -90,6 +90,18 @@ class RunnerTests(unittest.TestCase):
         self.assertNotIn('OPENAI_BASE_URL', env)
         self.assertEqual(env['CODEX_HOME'], '/auth-location')
 
+    def test_task_mcp_server_gets_only_task_capabilities_and_bounded_timeout(self):
+        tool_env = {'FEISHU_BOT_SOCK':'/socket', 'FEISHU_TOOL_TOKEN':'token'}
+        self.execute([{'type':'turn.completed'}], tool_env=tool_env)
+        self.assertIn('mcp_servers.feishu_bot.required=true', self.cmd)
+        self.assertIn('mcp_servers.feishu_bot.default_tools_approval_mode="approve"', self.cmd)
+        self.assertIn('mcp_servers.feishu_bot.tool_timeout_sec=45', self.cmd)
+        env_config = next(c for c in self.cmd if c.startswith('mcp_servers.feishu_bot.env_vars='))
+        self.assertEqual(json.loads(env_config.split('=',1)[1]), sorted(tool_env))
+        self.assertIn('sandbox_mode="read-only"', self.cmd)
+        self.execute([{'type':'turn.completed'}], lightweight=True)
+        self.assertFalse(any(c.startswith('mcp_servers.feishu_bot.') for c in self.cmd))
+
     def test_token_count_uses_reported_window_and_counts_cache_once(self):
         events = [
             {'type': 'turn_context', 'payload': {'model': 'gpt-test'}},
