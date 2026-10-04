@@ -150,8 +150,8 @@ MySQL 保存对话列表、名称、当前选中会话与审计，Codex 将完�
 | `bot.py` | 消息分发、任务与会话编排、附件和知识库接入 |
 | `codex_runner.py` | Codex 执行、JSONL 解析、会话与上下文读取 |
 | `claude_runner.py` | 旧会话只读兼容与共用提示/动作格式；业务不调用 Claude 执行 |
-| `core/` | 会话、上下文护栏、摘要、附件校验与 git 只读查询 |
-| `fbtool` / `tool_bridge.py` | 标准库 CLI、短期任务令牌、Unix socket 路由与回复后重启 |
+| `core/` | 会话、上下文护栏、摘要、附件校验、独立辩论、MCP 适配与 git 只读查询 |
+| `fbtool` / `tool_bridge.py` | 标准库 CLI/MCP、短期任务令牌、Unix socket 路由、独立辩论与回复后重启 |
 | `speaker.py` / `.agents/skills/` | 独立语音能力与按需加载的技能 |
 | `usage.py` | Codex 订阅用量 RPC 与缓存 |
 | `db.py` / `models.py` | MySQL ORM 与迁移、审计 |
@@ -164,9 +164,9 @@ MySQL 保存对话列表、名称、当前选中会话与审计，Codex 将完�
 .venv/bin/python -m compileall -q bot.py codex_runner.py usage.py core ops
 ```
 
-本机验证记录：CLI/socket 在当前 unsafe 模式下可用，轻量调用成功；
-只读沙箱的真实 shell 自测受到主机 bwrap loopback 权限限制（Operation not permitted）。
-程序不因此自动绕过沙箱，需要由部署环境解决 user namespace / sandbox 支持问题。
+本机只读沙箱已通过发行版 Bubblewrap 和专用 AppArmor 配置修复。Linux 沙箱禁止 Unix socket 时，任务通过 Codex 主进程启动的 `feishu_bot` MCP 适配器使用同名工具；CLI 保留为主机兼容入口。群、消息、短期令牌、附件计数与 `/unsafe` 仍由 bot 校验。
+
+发 `辩论话题：<辩题>` 可要求独立辩论，正反双方各五轮，逐条回复当前消息。双方使用独立的一次性 Codex 调用和各自历史；工具失败、超时或取消即停止，显式要求辩论但未调用工具时拒绝把模拟结果作为完成回执。修复过程及部署验证见 [2026-10-04 辩论执行修复](docs/DEBATE-2026-10-04.md)。
 语音已验证合成、SSH、sink 检测与缺 sink 错误；未进行实际有声播放。
 
 本次完整检查与回归验证记录见 [2026-10-03 检查报告](docs/REVIEW-2026-10-03.md)。
