@@ -39,6 +39,8 @@ def create_all(engine):
 def migrate(engine):
     """给已存在的表补列（create_all 不会改已存在表）。幂等。"""
     from sqlalchemy import text
+    # 维护合并会话时临时转发旧进程的最后一轮审计。重启后内存已重新加载，撤掉护栏。
+    cleanup_session_merge_guards(engine)
     adds = [
         ("sessions", "model", "VARCHAR(64)"),
         ("messages", "model", "VARCHAR(64)"),
@@ -70,6 +72,20 @@ def migrate(engine):
 
 def make_session_factory(engine):
     return sessionmaker(engine)
+
+
+def cleanup_session_merge_guards(engine):
+    """仅清理本项目会话合并工具创建的临时 INSERT 转发触发器。"""
+    import re
+    from sqlalchemy import text
+    with engine.begin() as c:
+        names = c.execute(text(
+            "SELECT TRIGGER_NAME FROM information_schema.triggers "
+            "WHERE TRIGGER_SCHEMA=DATABASE() AND EVENT_OBJECT_TABLE='messages'"
+        )).scalars().all()
+        for name in names:
+            if re.fullmatch(r"fb_merge_guard_[0-9a-f]{12}", name):
+                c.execute(text(f"DROP TRIGGER `{name}`"))
 
 
 # --------------------------------------------------------------- 数据访问
@@ -176,6 +192,42 @@ def compact_session(s, row_id, summary):
     # 下一轮创建的 Codex 上下文属于 bot，原接管会话的磁盘文件仍保留。
     conv.external = False
     append_message(s, row_id, conv.chat_id, None, "summary", summary)
+
+
+def merge_sessions(s, chat_id, root_id, source_ids, recover_sids=()):
+    """同事务合并已确认的压缩衍生条目，保留原始行和最新执行 SID。
+
+    调用方必须先核实继承链并备份；在线运行还需转发旧内存引用，提交后重启刷新。
+    recover_sids 只用于归回已删除衍生条目的孤立历史，不修改历史的执行 SID。
+    """
+    source_ids = set(source_ids)
+    if not source_ids or root_id in source_ids:
+        raise ValueError("必须提供与原始会话不同的衍生会话")
+    rows = s.scalars(select(Conversation)
+                     .where(Conversation.id.in_({root_id} | source_ids))
+                     .with_for_update()).all()
+    by_id = {row.id: row for row in rows}
+    if set(by_id) != {root_id} | source_ids or any(row.chat_id != chat_id for row in rows):
+        raise ValueError("会话不存在或不属于当前群")
+    root = by_id[root_id]
+    if any(row.cwd != root.cwd for row in rows):
+        raise ValueError("会话工作目录不同，拒绝合并")
+    # 保留当前选中分支的执行上下文；无选中分支时使用创建时间最近的后继。
+    selected = [row for row in rows if row.is_current]
+    if len(selected) > 1:
+        raise ValueError("存在多个当前会话，拒绝合并")
+    latest = selected[0] if selected else max(rows, key=lambda row: (row.created_at, row.id))
+    values = dict(claude_session_id=latest.claude_session_id, model=latest.model,
+                  external=latest.external, is_current=bool(selected))
+    affected = Message.session_id.in_(source_ids)
+    if recover_sids:
+        affected = affected | (Message.session_id.is_(None) & Message.claude_session_id.in_(recover_sids))
+    moved = s.execute(update(Message).where(Message.chat_id == chat_id, affected)
+                      .values(session_id=root_id)).rowcount
+    # 先释放来源行的 SID 唯一索引，再更新原始行；消息的 FK 已迁移，不会因删除而丢失归属。
+    s.execute(delete(Conversation).where(Conversation.id.in_(source_ids)))
+    s.execute(update(Conversation).where(Conversation.id == root_id).values(**values))
+    return {"root_id": root_id, "deleted": sorted(source_ids), "moved_messages": moved}
 
 
 def set_session_model(s, row_id, model):

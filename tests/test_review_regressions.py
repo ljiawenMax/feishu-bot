@@ -360,6 +360,61 @@ class PersistenceTests(unittest.TestCase):
             self.assertNotIn('seed', original)
             self.assertEqual(s.query(Message).count(), 0)
 
+    def test_merge_keeps_root_identity_latest_context_and_all_message_provenance(self):
+        with self.sessions.begin() as s:
+            root = db.insert_session(s, 'chat', '原始名称', 0, claude_sid='old')
+            child = db.insert_session(s, 'chat', '压缩对话', 1, claude_sid='latest', seed='摘要')
+            other = db.insert_session(s, 'other-chat', '别的群', 0, claude_sid='other')
+            db.set_current(s, 'chat', child)
+            db.append_message(s, root, 'chat', 'old', 'user', '原历史')
+            db.append_message(s, child, 'chat', 'latest', 'assistant', '新历史')
+            db.append_message(s, None, 'chat', 'deleted-child', 'user', '已删除分支历史')
+            db.append_message(s, other, 'other-chat', 'deleted-child', 'user', '不能改其他群')
+        with self.sessions.begin() as s:
+            root_created = s.get(Conversation, root).created_at
+            result = db.merge_sessions(s, 'chat', root, [child], ['deleted-child'])
+            self.assertEqual(result['moved_messages'], 3)
+        with self.sessions() as s:
+            state = db.load_state(s, 'chat')['sessions']
+            self.assertEqual(len(state['list']), 1)
+            self.assertEqual((state['list'][0]['_row_id'], state['list'][0]['label'], state['list'][0]['id']),
+                             (root, '原始名称', 'latest'))
+            self.assertEqual(s.get(Conversation, root).created_at, root_created)
+            self.assertTrue(s.get(Conversation, root).is_current)
+            self.assertIsNone(s.get(Conversation, child))
+            messages = s.query(Message).filter_by(chat_id='chat').all()
+            self.assertEqual({m.session_id for m in messages}, {root})
+            self.assertEqual({m.claude_session_id for m in messages}, {None, 'old', 'latest', 'deleted-child'})
+            self.assertEqual(s.query(Message).filter_by(chat_id='other-chat').one().session_id, other)
+
+    def test_merge_rejects_cross_chat_and_rolls_back_if_commit_fails(self):
+        with self.sessions.begin() as s:
+            root = db.insert_session(s, 'chat', 'root', 0, claude_sid='old')
+            child = db.insert_session(s, 'chat', 'child', 1, claude_sid='new')
+            other = db.insert_session(s, 'other', 'other', 0)
+            db.set_current(s, 'chat', child)
+            db.append_message(s, child, 'chat', 'new', 'user', '事实')
+        with self.assertRaises(ValueError), self.sessions.begin() as s:
+            db.merge_sessions(s, 'chat', root, [other])
+        with self.assertRaises(RuntimeError), self.sessions.begin() as s:
+            db.merge_sessions(s, 'chat', root, [child])
+            raise RuntimeError('simulate commit failure')
+        with self.sessions() as s:
+            self.assertEqual(s.get(Conversation, root).claude_session_id, 'old')
+            self.assertTrue(s.get(Conversation, child).is_current)
+            self.assertEqual(s.query(Message).one().session_id, child)
+
+    def test_startup_only_removes_session_merge_guards(self):
+        engine = Mock()
+        connection = Mock()
+        engine.begin.return_value = contextlib.nullcontext(connection)
+        connection.execute.return_value.scalars.return_value.all.return_value = [
+            'fb_merge_guard_0123456789ab', 'business_trigger', 'fb_merge_guard_invalid',
+            'fb_merge_guard_0123456789ab_extra']
+        db.cleanup_session_merge_guards(engine)
+        statements = [str(call.args[0]) for call in connection.execute.call_args_list]
+        self.assertEqual(statements[1:], ['DROP TRIGGER `fb_merge_guard_0123456789ab`'])
+
     def test_automatic_compaction_persists_new_execution_sid_on_original_row(self):
         with self.sessions.begin() as s:
             row = db.insert_session(s, 'chat', '原对话', 0, claude_sid='codex:old')
