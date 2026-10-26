@@ -28,6 +28,7 @@ from core import debate as core_debate
 from core import compact as core_compact
 from core import context as core_context
 from core import sessions as core_sessions
+from core import model_settings
 from core import uploads as core_uploads
 from ops import snapshot as ops_snapshot
 
@@ -59,10 +60,13 @@ HELP_TEXT = "\n".join([
     "/permit    — 开关工作区写权限（Codex 沙箱内可运行命令）",
     "/unsafe    — 开关最高权限（跳过全部权限校验，可执行 bash 命令，谨慎）",
     "/usage     — 查看 ChatGPT / Codex 订阅用量",
+    "/model [模型|default] — 查看或设置当前对话模型",
+    "/effort [档位|default] — 查看或设置当前对话推理强度",
     "/help      — 显示此帮助",
     "",
     "其余能力一律用自然语言：发文件、重启服务、压缩上下文（已自动）、",
     "查知识库等，直接说就行。",
+    "单次指定：这次用 gpt-6.1-sol，effort high，审查方案（不改变对话设置）。",
 ])
 
 # 知识库检索注入：每轮取 top_k 个条目、总字数上限（越大越费 context，见 CLAUDE.md）
@@ -156,6 +160,8 @@ class Bot:
             "/allsessions": self.cmd_allsessions,
             "/name": self.cmd_name,
             "/permit": self.cmd_permit,
+            "/model": self.cmd_model,
+            "/effort": self.cmd_effort,
         }
 
     # ------------------------------------------------------------------ DB
@@ -247,17 +253,18 @@ class Bot:
             if entry.get("_row_id"):
                 self.db(db.update_session, entry["_row_id"], claude_sid=session_id, label=new_label)
 
-    def audit(self, user_text, result, new_session_id, used_model=None, entry=None):
+    def audit(self, user_text, result, new_session_id, used_model=None, entry=None, effort=None):
         """把一轮对话（用户输入 + LLM 输出）写入审计表。"""
         entry = entry if entry is not None else self.current_entry()
         row_id = entry.get("_row_id") if entry else None
         sid = (entry.get("id") if entry else None) or new_session_id
         self.db(db.append_message, row_id, self.chat_id, sid, "user", user_text)
         self.db(db.append_message, row_id, self.chat_id, sid, "assistant", result,
-                result.startswith("[error]"), "超时" in result, model=used_model)
+                result.startswith("[error]"), "超时" in result, model=used_model, effort=effort)
 
     def execute_codex(self, text, session_id, history=None, first_task=None, run_text=None,
-                       extra_system=None, tool_env=None, entry=None, permissions=None):
+                       extra_system=None, tool_env=None, entry=None, permissions=None,
+                       settings=None, execution_info=None):
         """调用 Codex，处理超时/异常，成功时同步 session_id 到 DB。
         run_text 指定实际发给 Codex 的 prompt（默认同 text）：压缩后首轮会在 text 前
         拼上摘要，但审计/历史/标签仍用用户原文 text。extra_system 追加一段系统提示
@@ -267,17 +274,20 @@ class Bot:
         up = uploads.chat_dir(self.chat_id)
         extra_dirs = ([up] if os.path.isdir(up) else []) + self.extra_dirs
         entry = entry if entry is not None else self.current_entry()
-        model = entry.get("model") if entry else None
+        with self.lock:
+            choice = dict(entry or {})
         # 接管来的本机会话在它自己的原项目目录下跑；此时把本 bot 的 work_dir 也挂进去，
         # 免得「在飞书里续聊」反而读不到这个群平时的工作区。
         cwd = self.entry_cwd(entry)
         if cwd != self.work_dir and os.path.isdir(self.work_dir):
             extra_dirs = extra_dirs + [self.work_dir]
         try:
+            settings = settings or self.task_settings(choice)
             result, new_sid, used_model = codex_runner.run_codex(
                 run_text or text, cwd, self.task_timeout,
                 session_id, permit=permit, extra_dirs=extra_dirs, history=history,
-                model=model, unsafe=unsafe, extra_system=extra_system, tool_env=tool_env,
+                model=settings['model'], effort=settings['effort'], execution_info=execution_info,
+                unsafe=unsafe, extra_system=extra_system, tool_env=tool_env,
             )
             if new_sid and not result.startswith("[error]"):
                 self.update_session(new_sid, first_task=first_task, entry=entry)
@@ -288,6 +298,88 @@ class Bot:
         return result, new_sid, used_model
 
     # ------------------------------------------------------------- commands
+
+    def task_settings(self, entry, overrides=None):
+        cwd = self.entry_cwd(entry)
+        data = model_settings.catalog(cwd, for_task=True)
+        try:
+            return model_settings.resolve(entry, data, overrides)
+        except ValueError:
+            # 用户显式选择了旧目录里没有的新模型/档位时，查询一次最新目录。
+            # 仍按原选择校验，不静默换模型或降低 effort。
+            if not overrides:
+                raise
+            return model_settings.resolve(entry, model_settings.catalog(cwd, refresh=True), overrides)
+
+    def audit_preflight_failure(self, msg_id, stage, error):
+        detail = f'{type(error).__name__}: {error}'[:2000]
+        self._log(f'[preflight-error] stage={stage} message={msg_id} {detail}')
+        try:
+            self.db(db.record_audit, self.chat_id, 'preflight', stage,
+                    message_id=msg_id, ok=False, detail=detail, strict=True)
+        except Exception as e:
+            self._log(f'[preflight-audit-error] {type(e).__name__}: {e}')
+
+    def cmd_model(self, msg, arg):
+        self._cmd_settings(msg, arg, 'model')
+
+    def cmd_effort(self, msg, arg):
+        self._cmd_settings(msg, arg, 'effort')
+
+    def _cmd_settings(self, msg, arg, field):
+        self.pending = None
+        try:
+            if arg and not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,63}', arg):
+                raise ValueError(f'用法：/{field} <名称或 default>')
+            with self.lock:
+                entry = self.current_entry()
+                choice = dict(entry or {})
+                cwd = self.entry_cwd(entry)
+            data = model_settings.catalog(cwd, refresh=bool(arg))
+            if arg:
+                choice[field] = None if arg.lower() == 'default' else arg.lower()
+            try:
+                settings = model_settings.resolve(choice, data)
+            except ValueError as e:
+                if arg:
+                    raise
+                # 已保存的模型可能从账户目录中消失；仍允许查看目录并修正选择。
+                lines = [f'当前设置需要调整：{e}',
+                         f"已保存模型：{choice.get('model') or 'default'}",
+                         f"已保存 effort：{choice.get('effort') or 'default'}", '可选模型：']
+                lines.extend(m['model'] for m in data['models'])
+                feishu_api.reply_message(self.client, msg['id'], '\n'.join(lines))
+                return
+            if arg:
+                with self.lock:
+                    if entry is None:
+                        entry = self.make_session()
+                        core_sessions.append_and_focus(self.sessions, entry)
+                        self.set_current(entry)
+                    # DB 提交成功后才更新内存；失败时保留原设置。
+                    self.db(db.set_session_settings, entry['_row_id'], choice.get('model'),
+                            choice.get('effort'), strict=True)
+                    entry['model'], entry['effort'] = choice.get('model'), choice.get('effort')
+                lines = ['已保存当前对话设置；仅影响此后提交的任务。']
+            else:
+                lines = ['当前对话设置：']
+            lines += [f"模型：{settings['model']}（{settings['model_source']}）",
+                      f"effort：{settings['effort']}（{settings['effort_source']}）"]
+            if field == 'model':
+                lines.append('可选模型：')
+                lines.extend(m['model'] for m in data['models'])
+            else:
+                selected = next(m for m in data['models'] if m['model'] == settings['model'])
+                lines.append('可选 effort：' + ' / '.join(selected['efforts']))
+            if data.get('_warning'):
+                updated = time.strftime('%m-%d %H:%M', time.localtime(data['_cached_at']))
+                lines.append(f"{data['_warning']}（{updated} 更新）。")
+            lines.append(f'/{field} default 恢复默认；/new 新建对话沿用默认设置。')
+            reply = '\n'.join(lines)
+        except Exception as e:
+            self.audit_preflight_failure(msg['id'], f'{field}-command', e)
+            reply = f'[error] 设置未更改：{e}'
+        feishu_api.reply_message(self.client, msg['id'], reply)
 
     def cmd_sessions(self, msg, arg):
         data = self.sessions
@@ -515,13 +607,15 @@ class Bot:
               f"external={bool(removed.get('external'))}")
 
     @staticmethod
-    def _model_suffix(used_model, ctx_pct=None):
-        """成功结果末尾追加「（模型：… · ctx …% · 5h …% · 周 …%）」。
+    def _model_suffix(used_model, ctx_pct=None, effort=None):
+        """成功结果末尾追加模型、实际 effort、上下文与缓存用量。
         用量取自 usage 模块的缓存（只读、不阻塞），取不到时静默省略。"""
         parts = []
         if used_model:
             short = used_model
             parts.append(f"模型：{short}")
+        if effort:
+            parts.append(f'effort：{effort}')
         if ctx_pct is not None:
             parts.append(f"ctx {ctx_pct:.0f}%")
         u = usage.report_inline()
@@ -707,12 +801,15 @@ class Bot:
     def run_task(self, msg, text):
         """主线程只做入队 + 立即回执，真正执行在后台 worker，故长任务不冻结 bot。"""
         self.pending = None
-        # 先前上传、尚未被消费的文件在这里并进任务正文。拼进 text（而不是只改 run_text）
-        # 是有意的：路径很短，撑不爆 context，进了 history 之后续聊追问「刚那张图」才有依据。
-        attach = [] if COMPACT_REQUEST_RE.fullmatch(text) else self._drain_uploads()
-        if attach:
-            text = text.rstrip() + "\n" + self._attach_block(attach)
-        self._enqueue({"kind": "task", "text": text, "msg_id": msg["id"],
+        # 先解析本次设置，验证通过后由 _enqueue 消费附件并附到任务与审计正文。
+        try:
+            task_text, overrides = model_settings.parse_once(text)
+        except ValueError as e:
+            self.audit_preflight_failure(msg['id'], 'settings-parse', e)
+            feishu_api.reply_message(self.client, msg['id'], f'[error] {e}')
+            return
+        self._enqueue({"kind": "task", "text": text, "task_text": task_text,
+                       "overrides": overrides, "attach_uploads": True, "msg_id": msg["id"],
                        "sender_id": msg.get("sender_id")},
                       msg["id"], verb="执行")
 
@@ -726,12 +823,31 @@ class Bot:
                 self.set_current(entry)
             self._entry_history(entry)
             job["entry"] = entry
+            choice = dict(entry)
+        try:
+            task_text = job.get('task_text', job['text'])
+            if not COMPACT_REQUEST_RE.fullmatch(task_text):
+                job['execution_settings'] = self.task_settings(choice, job.get('overrides'))
+        except Exception as e:
+            self.audit_preflight_failure(msg_id, 'model-settings', e)
+            feishu_api.reply_message(self.client, msg_id, f'[error] 任务未提交，设置无效或查询失败：{e}')
+            return
+        if job.get('attach_uploads') and not COMPACT_REQUEST_RE.fullmatch(task_text):
+            attach = self._drain_uploads()
+            if attach:
+                block = '\n' + self._attach_block(attach)
+                job['text'] = job['text'].rstrip() + block
+                job['task_text'] = task_text.rstrip() + block
+        with self.lock:
             entry["_jobs"] = entry.get("_jobs", 0) + 1
             ahead = self.task_queue.qsize()
             self.task_queue.put(job)
         lines = [f"✅ 已接收，任务进入后台{verb}，完成后把结果发给你"]
         if ahead > 0:
             lines.append(f"（前面还有 {ahead} 个任务在排队）")
+        settings = job.get('execution_settings')
+        if settings:
+            lines.append(f"本次：{settings['model']} · effort {settings['effort']}")
         banner = self._permit_banner()
         if banner:
             lines.append(banner)
@@ -769,6 +885,7 @@ class Bot:
 
     def _execute_job(self, job):
         text, msg_id = job["text"], job["msg_id"]
+        task_text = job.get('task_text', text)
 
         # 锁内：准备会话状态、快照 history（短临界区，不含长调用）
         with self.lock:
@@ -787,7 +904,7 @@ class Bot:
             seed = entry.get("seed")
 
         # 硬闸触发后仍允许直接压缩，避免用户无法通过自然语言脱困。
-        if COMPACT_REQUEST_RE.fullmatch(text):
+        if COMPACT_REQUEST_RE.fullmatch(task_text):
             if not self._do_compact(msg_id, reason="用户请求", entry=entry, job=job):
                 self._push_reply(msg_id, "暂无可压缩的历史，或摘要失败；可发 /new 开新对话。", tag="compact")
             return
@@ -804,17 +921,17 @@ class Bot:
                     seed = entry.get("seed")
 
         # 压缩后首轮：把摘要拼进实际 prompt（审计/历史仍存用户原文 text）
-        debate_required = core_debate.required(text)
-        run_text = text
+        debate_required = core_debate.required(task_text)
+        run_text = task_text
         if seed:
             run_text = (f"[以下是上一段对话的压缩摘要，请据此延续上下文，无需复述]\n{seed}\n\n"
-                        f"[用户新消息]\n{text}")
+                        f"[用户新消息]\n{run_text}")
         if debate_required:
             run_text = ("[本轮要求真实的独立辩论：调用 feishu_bot 的 MCP debate 工具，各方五轮逐轮推送。"
                         "工具失败则说明失败；不可自己扮演双方。]\n" + run_text)
         # 知识库 RAG：检索出的条目拼在用户消息之前。只改 run_text，text 原样进 history
         # 与审计——否则历史会被资料撑爆，压缩摘要也会跟着跑偏。
-        reference = self._wiki_reference(text) if self.wiki_space_id and not tool_bridge._SERVER else ""
+        reference = self._wiki_reference(task_text) if self.wiki_space_id and not tool_bridge._SERVER else ""
         if reference:
             run_text = f"{reference}\n\n[用户新消息]\n{run_text}"
         # 群里可能多人共用一个 bot，把发言人 open_id 交给 GPT，便于按人分账/存档
@@ -834,6 +951,7 @@ class Bot:
         snap_id = ops_snapshot.take_quiet()
 
         stop = self._start_heartbeat(msg_id)
+        execution_info = {}
         try:
             with self.run_slot:
                 with self.lock:
@@ -846,6 +964,7 @@ class Bot:
                         extra_system=codex_runner.WIKI_SYSTEM_PROMPT if reference else None,
                         tool_env=tools.env if tool_bridge._SERVER else None,
                         entry=entry, permissions=permissions,
+                        settings=job.get('execution_settings'), execution_info=execution_info,
                     )
                     elapsed = time.time() - t0
         finally:
@@ -861,11 +980,12 @@ class Bot:
                      else '模型没有调用独立辩论工具')
             result = f"[error] 独立辩论未完成（已推送 {sent}/10 条发言）：{error}"
         is_err = result.startswith("[error]")
+        used_effort = execution_info.get('effort')
         print(f"[{self.name}][llm] elapsed={self._human_elapsed(int(elapsed))} "
               f"model={used_model} error={is_err} timed_out={'超时' in result} chars={len(result)} "
               f"sid={str(new_sid)[:8] + '…' if new_sid else '-'} | {result[:120].replace(chr(10), ' ')}")
         self.db(db.record_audit, self.chat_id, "llm", "task",
-                message_id=msg_id, ok=not is_err, model=used_model,
+                message_id=msg_id, ok=not is_err, model=used_model, effort=used_effort,
                 elapsed_ms=int(elapsed * 1000), chars=len(result), detail=result[:2000])
 
         # 本轮 LLM 成功 = 这轮开跑时的状态被真实流量证明可用 → 转正为回滚基线。
@@ -884,7 +1004,7 @@ class Bot:
                     self.sessions["history"] = updated
                 if seed:
                     entry.pop("seed", None)
-            self.audit(text, result, new_sid, used_model, entry=entry)
+            self.audit(text, result, new_sid, used_model, entry=entry, effort=used_effort)
 
         # 主动推送结果（带失败重试，避免网络抖动丢结果）+ context 占用提示/分级提醒
         banner = self._permit_banner()
@@ -892,7 +1012,7 @@ class Bot:
             suffix, warn = "", ""
         else:
             ctx_pct = self._context_pct(new_sid or session_id, entry=entry)
-            suffix = self._model_suffix(used_model, ctx_pct)
+            suffix = self._model_suffix(used_model, ctx_pct, effort=used_effort)
             warn = self._context_warning(ctx_pct)
         tail = "".join("\n\n" + x for x in (warn, banner) if x)
         if not is_err and tools.compact:

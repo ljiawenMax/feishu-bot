@@ -27,6 +27,7 @@ class BotExecutionTests(unittest.TestCase):
         bot.wiki_space_id = None
         bot._start_heartbeat = Mock(return_value=threading.Event())
         bot.execute_codex = Mock(return_value=('最终结果', 'codex:new-session', 'gpt-test'))
+        bot.task_settings = Mock(return_value={'model': 'gpt-test', 'effort': 'high'})
         bot.audit = Mock()
         bot.db = Mock()
         bot._push_reply = Mock(return_value=True)
@@ -44,7 +45,7 @@ class BotExecutionTests(unittest.TestCase):
                          [{'role': 'user', 'content': '旧对话事实'}])
         self.assertIn('最终结果', bot._push_reply.call_args.args[1])
         bot.audit.assert_called_once_with('当前项目进度', '最终结果', 'codex:new-session', 'gpt-test',
-                                          entry=bot.sessions['list'][0])
+                                          entry=bot.sessions['list'][0], effort=None)
         self.assertTrue(bot._start_heartbeat.return_value.is_set())
 
     def test_context_read_failure_is_logged_and_does_not_block_task(self):

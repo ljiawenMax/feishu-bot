@@ -198,7 +198,10 @@ def build_task_with_history(task, history):
 
 def run_codex(task, work_dir, timeout, session_id=None, permit=False, extra_dirs=None,
               history=None, model=None, unsafe=False, extra_system=None, report_actions=True,
-              tool_env=None, lightweight=False, parent_bound=False, cancel_event=None):
+              tool_env=None, lightweight=False, parent_bound=False, cancel_event=None,
+              effort=None, execution_info=None):
+    if execution_info is not None:
+        execution_info.clear()
     try:
         require_chatgpt_login()
     except (RuntimeError, subprocess.TimeoutExpired) as e:
@@ -241,6 +244,8 @@ def run_codex(task, work_dir, timeout, session_id=None, permit=False, extra_dirs
             cmd += ['-c', 'mcp_servers.feishu_bot.' + key + '=' + json.dumps(value)]
     if model:
         cmd += ["--model", model]
+    if effort:
+        cmd += ['-c', 'model_reasoning_effort=' + json.dumps(effort)]
     if lightweight:
         # 内部纯文本调用不载入用户的 MCP/apps/plugins，也不持久化摘要会话。
         # CLI 没有 Claude 的 --tools 参数；使用本机 CLI 支持的 feature 开关。
@@ -345,6 +350,9 @@ def run_codex(task, work_dir, timeout, session_id=None, permit=False, extra_dirs
         print(f"[codex][metadata-error] {e}")
         info = None
     used_model = (info or {}).get("model") or model
+    if execution_info is not None and completed and not timed_out:
+        # 优先使用本轮磁盘记录；不把请求值冒充实际值。
+        execution_info.update(model=(info or {}).get('model'), effort=(info or {}).get('effort'))
     if timed_out:
         result = f"[error] 任务超时（>{timeout}s），响应可能不完整\n{result}"
     elif proc.returncode or not completed:
@@ -371,20 +379,21 @@ def format_codex_error(message):
 def session_context(session_id, work_dir):
     if not _raw_id(session_id):
         return None
-    model, info, user_turns = None, None, 0
+    model, effort, info, user_turns = None, None, None, 0
     for event in _events(_session_path(session_id)):
         payload = event.get("payload") or {}
         if not isinstance(payload, dict):
             continue
         if event.get("type") == "turn_context":
             model = payload.get("model") or model
+            effort = payload.get('effort') or payload.get('reasoning_effort')
         elif event.get("type") == "event_msg":
             if payload.get("type") == "token_count" and payload.get("info"):
                 info = payload["info"]
             elif payload.get("type") == "user_message":
                 user_turns += 1
     if not info:
-        return {"model": model} if model else None
+        return {"model": model, "effort": effort} if model else None
     last = info.get("last_token_usage") or {}
     return {"input": last.get("input_tokens", 0), "cache_creation": 0,
             "cache_read": last.get("cached_input_tokens", 0),
@@ -392,7 +401,7 @@ def session_context(session_id, work_dir):
             # Codex input_tokens 已含 cached_input_tokens，不能重复加。
             "total_input": last.get("input_tokens", 0),
             "context_window": info.get("model_context_window"),
-            "model": model, "user_turns": user_turns}
+            "model": model, "effort": effort, "user_turns": user_turns}
 
 
 def list_all_sessions():

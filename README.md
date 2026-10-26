@@ -24,6 +24,27 @@ python3 -m venv .venv
 
 GPT 模型沿用 `~/.codex/config.toml` 的 `model` 设置；不设置时用 Codex 默认模型。模型是否可用取决于账户权限。本机迁移验证使用 `gpt-6.1-sol`。旧的 `MODELS` 配置不再使用，旧会话的 `opus` / `sonnet` / `haiku` / `fable` 选择会清除。
 
+普通任务支持按对话保存模型与推理强度；未设置时分别继承 Codex 的有效 `model` 与
+`model_reasoning_effort` 配置（包括工作目录下的项目配置）。`/model`、`/effort` 查询当前值、
+来源与可选项；加名称修改当前对话，加 `default` 恢复默认。设置保存到 MySQL，重启与压缩后保留，
+`/new` 创建的对话从默认设置开始。模型目录与档位通过官方 app-server `model/list` 获取，
+有效配置通过 `config/read` 获取，目录与默认值按 Codex 配置目录、工作目录分别缓存。
+普通任务直接复用已确认的设置，不因目录缓存超过 60 秒而重新请求网络。
+查看 `/model`、`/effort` 时按 60 秒刷新目录，修改设置时主动刷新；临时查询故障会保留旧目录并提示更新时间。
+已确认的快照保存到 `~/.cache/feishu-bot/model-settings/`（文件权限 600），重启后也能恢复。
+快照仅含模型目录、默认模型与 effort；配置文件变更会使旧快照失效，首次无缓存或配置变化后仍须成功确认设置。
+查询使用 `account/read` 的 `refreshToken=false`，不主动刷新登录凭证。
+查询无法完成且无有效缓存、参数无效等前置失败，会明确回执、保留待用附件，并写入 `audit_logs` 的
+`kind=preflight`，`tag` 区分模型设置、单次指令解析与命令失败；审计写入异常也不会阻止错误回执。
+目录列出的模型仍可能受到实时账户权限或额度限制，执行失败会原样报告，不自动换模型或重跑。
+
+单次指定示例：`这次用 gpt-6-luna，effort low，整理这段文字`，或
+`这次 effort high，审查方案`。仅识别消息开头的明确指令，不从引用、正文或旧对话中提取设置。
+单次指定优先于对话选择，执行后继续沿用原对话设置。任务入队时固定本次的模型与 effort，
+后续命令只影响此后提交的任务；执行时显式传入两项，确保 resume 不沿用上一次的单次覆盖。
+接收回执显示请求的设置，成功回复末尾显示实际执行记录中的模型与 effort；实际 effort 也写入审计。
+内部压缩摘要与独立辩论的轻量调用继续使用原有设置，不受普通任务的单次指定影响。
+
 参考：[官方认证说明](https://learn.chatgpt.com/docs/auth)、[非交互执行](https://learn.chatgpt.com/docs/non-interactive-mode)、[App Server](https://learn.chatgpt.com/docs/app-server)。
 
 ## 配置与启动
@@ -68,9 +89,11 @@ tail -f ~/run/log/feishu-bot-local.log
 | `/permit` | 切换工作区写权限，允许在 Codex 沙箱内运行命令 |
 | `/unsafe` | 切换完整文件系统与命令执行权限 |
 | `/usage` | 查询 ChatGPT / Codex 订阅额度窗口与重置时间 |
+| `/model [模型或 default]` | 查看可选模型或设置当前对话模型；default 恢复默认 |
+| `/effort [档位或 default]` | 查看当前模型支持的推理强度或设置当前对话 effort |
 
 其他需求直接用自然语言，例如分析附件、导出文件、检索知识库、压缩上下文或让正反方辩论。
-`/allsessions`、`/name`、`/permit` 按机主要求保留；`/debate` 编排已迁到 skill，命令总数为 9。
+`/allsessions`、`/name`、`/permit` 按机主要求保留；`/debate` 编排已迁到 skill，命令总数为 11。
 
 ## 自然语言能力
 

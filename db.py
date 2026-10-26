@@ -44,6 +44,9 @@ def migrate(engine):
     adds = [
         ("sessions", "model", "VARCHAR(64)"),
         ("messages", "model", "VARCHAR(64)"),
+        ("sessions", "effort", "VARCHAR(16)"),
+        ("messages", "effort", "VARCHAR(16)"),
+        ("audit_logs", "effort", "VARCHAR(16)"),
         ("sessions", "cwd", "VARCHAR(512)"),
         ("sessions", "external", "BOOLEAN NOT NULL DEFAULT FALSE"),
     ]
@@ -109,7 +112,7 @@ def load_state(s, chat_id):
     ).all()
     for conv in rows:
         data["list"].append({"id": conv.claude_session_id, "label": conv.label,
-                             "model": conv.model, "cwd": conv.cwd,
+                             "model": conv.model, "effort": conv.effort, "cwd": conv.cwd,
                              "external": bool(conv.external), "_row_id": conv.id})
         if conv.is_current:
             data["current"] = len(data["list"]) - 1
@@ -217,7 +220,7 @@ def merge_sessions(s, chat_id, root_id, source_ids, recover_sids=()):
     if len(selected) > 1:
         raise ValueError("存在多个当前会话，拒绝合并")
     latest = selected[0] if selected else max(rows, key=lambda row: (row.created_at, row.id))
-    values = dict(claude_session_id=latest.claude_session_id, model=latest.model,
+    values = dict(claude_session_id=latest.claude_session_id, model=latest.model, effort=latest.effort,
                   external=latest.external, is_current=bool(selected))
     affected = Message.session_id.in_(source_ids)
     if recover_sids:
@@ -235,6 +238,14 @@ def set_session_model(s, row_id, model):
     s.execute(update(Conversation).where(Conversation.id == row_id).values(model=model))
 
 
+def set_session_settings(s, row_id, model, effort):
+    """同事务保存会话两项选择；NULL 表示继承 Codex 默认配置。"""
+    result = s.execute(update(Conversation).where(Conversation.id == row_id)
+                       .values(model=model, effort=effort))
+    if not result.rowcount:
+        raise ValueError('会话已不存在')
+
+
 def set_current(s, chat_id, row_id):
     """把 row_id 置为当前 session，同 chat_id 下其余置 FALSE"""
     s.execute(
@@ -250,11 +261,11 @@ def delete_session(s, row_id):
 
 
 def append_message(s, session_row_id, chat_id, claude_sid,
-                   role, content, is_error=False, timed_out=False, model=None):
+                   role, content, is_error=False, timed_out=False, model=None, effort=None):
     s.add(Message(
         session_id=session_row_id, chat_id=chat_id,
         claude_session_id=claude_sid, role=role, content=content,
-        is_error=is_error, timed_out=timed_out, model=model,
+        is_error=is_error, timed_out=timed_out, model=model, effort=effort,
     ))
 
 
@@ -266,11 +277,11 @@ def record_upload(s, message_id, chat_id, resource_type, file_name, path, size, 
 
 
 def record_audit(s, chat_id, kind, tag, message_id=None, ok=True, code=None,
-                 model=None, elapsed_ms=None, chars=None, detail=None):
+                 model=None, elapsed_ms=None, chars=None, detail=None, effort=None):
     """审计：LLM 执行 / 飞书外发的响应信息落库。"""
     s.add(AuditLog(
         chat_id=chat_id, kind=kind, tag=tag, message_id=message_id, ok=ok,
-        code=code, model=model, elapsed_ms=elapsed_ms, chars=chars, detail=detail,
+        code=code, model=model, effort=effort, elapsed_ms=elapsed_ms, chars=chars, detail=detail,
     ))
 
 

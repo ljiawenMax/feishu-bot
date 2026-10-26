@@ -4,7 +4,7 @@
 
     {"list": [entry, ...], "current": <int 下标>, "history": [...]}
 
-entry = {"id": Codex session_id 或 None, "label": str, "model": None,
+entry = {"id": Codex session_id 或 None, "label": str, "model": None, "effort": None,
          "cwd": None 或接管来的原项目目录, "external": bool, "_row_id": DB 行号}
 
 本模块只动这个结构本身，**不碰 DB、不发飞书消息**：DB 写入（`insert_session` /
@@ -30,7 +30,7 @@ def new_entry(label=None, claude_sid=None, cwd=None, external=False):
     项目目录（`--resume` 必须在原目录下跑），external 标记「盘上的文件不属于我们」。
     """
     ts = time.strftime("%m-%d %H:%M")
-    return {"id": claude_sid, "label": label or f"新对话 {ts}", "model": None,
+    return {"id": claude_sid, "label": label or f"新对话 {ts}", "model": None, "effort": None,
             "cwd": cwd, "external": external, "_row_id": None}
 
 

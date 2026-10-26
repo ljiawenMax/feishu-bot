@@ -56,6 +56,7 @@ class Conversation(Base):
     claude_session_id: Mapped[str | None] = mapped_column(String(64))
     label: Mapped[str | None] = mapped_column(String(255))
     model: Mapped[str | None] = mapped_column(String(64))  # 该对话选定的模型，NULL=默认
+    effort: Mapped[str | None] = mapped_column(String(16))  # 该对话推理强度，NULL=默认
     # 该对话执行时的工作目录，NULL=用 bot 自己的 work_dir。只有「接管本机已有会话」时才非空：
     # claude --resume 按 cwd 反查 session 文件，不在原项目目录下跑必然 "No conversation found"。
     cwd: Mapped[str | None] = mapped_column(String(512))
@@ -85,6 +86,7 @@ class Message(Base):
     role: Mapped[str | None] = mapped_column(String(16))
     content: Mapped[str | None] = mapped_column(LONGTEXT)
     model: Mapped[str | None] = mapped_column(String(64))  # 该轮实际所用模型
+    effort: Mapped[str | None] = mapped_column(String(16))  # 该轮实际推理强度
     is_error: Mapped[bool] = mapped_column(Boolean, default=False)
     timed_out: Mapped[bool] = mapped_column(Boolean, default=False)
     created_at: Mapped["DateTime"] = mapped_column(DateTime, server_default=func.now())
@@ -107,6 +109,7 @@ class AuditLog(Base):
     ok: Mapped[bool] = mapped_column(Boolean, default=True)
     code: Mapped[int | None] = mapped_column(Integer)          # 飞书返回 code
     model: Mapped[str | None] = mapped_column(String(64))      # LLM 实际所用模型
+    effort: Mapped[str | None] = mapped_column(String(16))     # LLM 实际推理强度
     elapsed_ms: Mapped[int | None] = mapped_column(Integer)    # LLM 耗时
     chars: Mapped[int | None] = mapped_column(Integer)         # 输出/发送字符数
     detail: Mapped[str | None] = mapped_column(LONGTEXT)       # 飞书 msg/sent_id 或 LLM 摘要/错误
