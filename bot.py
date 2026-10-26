@@ -23,6 +23,7 @@ import usage
 import wiki_index
 import wiki_sync
 import tool_bridge
+from input_conversion import InputConverter
 from core.locking import index_lock
 from core import debate as core_debate
 from core import compact as core_compact
@@ -84,6 +85,7 @@ class Bot:
         self.app_id = bot_cfg["app_id"]
         self.app_secret = bot_cfg["app_secret"]
         self.chat_id = bot_cfg["chat_id"]
+        self.input_converter = InputConverter(bot_cfg.get("input_zh_tw", True), log=self._log)
         # 一 chat 一 work_dir；省略时回退家目录，配置值支持 ~
         self.work_dir = os.path.expanduser(bot_cfg.get("work_dir") or "~")
         # 额外的只读参考资料目录（通过提示提供路径）：让 GPT 能读 work_dir 之外的代码/资料，
@@ -833,9 +835,12 @@ class Bot:
             feishu_api.reply_message(self.client, msg_id, f'[error] 任务未提交，设置无效或查询失败：{e}')
             return
         if job.get('attach_uploads') and not COMPACT_REQUEST_RE.fullmatch(task_text):
+            # 正文与自动附带的路径/文件元信息分开，后者不经过语言转换。
+            job['user_task_text'] = task_text
             attach = self._drain_uploads()
             if attach:
                 block = '\n' + self._attach_block(attach)
+                job['upload_context'] = block
                 job['text'] = job['text'].rstrip() + block
                 job['task_text'] = task_text.rstrip() + block
         with self.lock:
@@ -922,7 +927,8 @@ class Bot:
 
         # 压缩后首轮：把摘要拼进实际 prompt（审计/历史仍存用户原文 text）
         debate_required = core_debate.required(task_text)
-        run_text = task_text
+        run_text = (self.input_converter.convert(job.get('user_task_text', task_text))
+                    + job.get('upload_context', ''))
         if seed:
             run_text = (f"[以下是上一段对话的压缩摘要，请据此延续上下文，无需复述]\n{seed}\n\n"
                         f"[用户新消息]\n{run_text}")

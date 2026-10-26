@@ -3,3 +3,4 @@ SQLAlchemy==2.0.51
 PyMySQL==1.2.0
 lark-oapi==1.7.1
 numpy==2.5.1
+OpenCC==1.4.2

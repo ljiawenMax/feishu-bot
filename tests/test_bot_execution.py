@@ -4,6 +4,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 from bot import Bot
+from input_conversion import InputConverter
 
 
 class StopWorker(BaseException):
@@ -14,6 +15,7 @@ class BotExecutionTests(unittest.TestCase):
     def make_bot(self):
         bot = Bot.__new__(Bot)
         bot.name = 'test'
+        bot.input_converter = InputConverter(enabled=False)
         bot.chat_id = 'test-chat'
         bot.work_dir = '/tmp'
         bot.sessions = {'list': [{'id': 'legacy-session', 'label': '旧会话', 'model': None}],
