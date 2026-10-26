@@ -4,112 +4,20 @@
 回复末尾只读缓存，避免每轮启动 app-server 或额外请求。
 """
 
-import json
-import queue
-import signal
-import os
-import subprocess
 import threading
 import time
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-from codex_runner import cli_env
+from codex_runner import NoCredentials, TokenExpired, RateLimited, read_account_data
 
 _cache = {"data": None, "ts": 0.0, "sub": None}
 _lock = threading.Lock()
 _blocked_until = 0.0
 
 
-class NoCredentials(Exception):
-    pass
-
-
-class TokenExpired(Exception):
-    pass
-
-
-class RateLimited(Exception):
-    pass
-
-
 def fetch_usage(timeout=20):
-    """短生命周期 stdio RPC：初始化、确认订阅身份、读取额度、关闭进程。"""
-    try:
-        proc = subprocess.Popen(["codex", "app-server", "-c", 'model_provider="openai"'],
-                                env=cli_env(), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                stderr=subprocess.DEVNULL, text=True, start_new_session=True)
-    except FileNotFoundError:
-        raise NoCredentials("未安装 Codex CLI，请先安装并执行 codex login") from None
-    incoming = queue.Queue()
-
-    def read():
-        try:
-            for line in proc.stdout:
-                try:
-                    incoming.put(json.loads(line))
-                except json.JSONDecodeError:
-                    continue
-        finally:
-            incoming.put(None)
-
-    reader = threading.Thread(target=read, daemon=True)
-    reader.start()
-    deadline = time.monotonic() + timeout
-
-    def send(message):
-        proc.stdin.write(json.dumps(message) + "\n")
-        proc.stdin.flush()
-
-    def rpc(method, ident, params=None):
-        send({"method": method, "id": ident, "params": params or {}})
-        while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise TimeoutError("Codex 用量查询超时")
-            try:
-                message = incoming.get(timeout=remaining)
-            except queue.Empty:
-                raise TimeoutError("Codex 用量查询超时") from None
-            if message is None:
-                raise RuntimeError("Codex app-server 已退出")
-            if not isinstance(message, dict):
-                continue
-            if message.get("id") != ident:
-                continue  # 忽略异步通知；这里不启用会触发审批的任务
-            if "error" in message:
-                detail = message["error"].get("message", "用量查询失败")
-                lower = detail.lower()
-                if "401" in lower or "unauthorized" in lower:
-                    raise TokenExpired("登录已失效，请执行 codex login 重新登录")
-                if "429" in lower or "rate limit" in lower:
-                    raise RateLimited(detail)
-                raise RuntimeError(detail)
-            return message.get("result") or {}
-
-    try:
-        rpc("initialize", 1, {"clientInfo": {"name": "feishu_bot", "version": "1.0"}})
-        send({"method": "initialized", "params": {}})
-        account = rpc("account/read", 2, {"refreshToken": True}).get("account") or {}
-        if account.get("type") != "chatgpt":
-            raise NoCredentials("请在运行服务的用户下执行 codex login，以 ChatGPT 订阅登录")
-        data = rpc("account/rateLimits/read", 3)
-        return data, account.get("planType")
-    finally:
-        try:
-            proc.stdin.close()
-        except OSError:
-            pass
-        try:
-            proc.wait(timeout=1)
-        except subprocess.TimeoutExpired:
-            try:
-                os.killpg(proc.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            proc.wait()
-        reader.join(timeout=1)
-        proc.stdout.close()
+    return read_account_data(lambda rpc: rpc("account/rateLimits/read", 3), timeout=timeout)
 
 
 def _windows(data):

@@ -596,8 +596,8 @@ class ProcessAndSnapshotTests(unittest.TestCase):
         proc.stdin.close.side_effect = BrokenPipeError('already exited')
         proc.wait.side_effect = [subprocess.TimeoutExpired('app-server', 1), 0]
         proc.pid = 123
-        with patch('usage.subprocess.Popen', return_value=proc), \
-             patch('usage.os.killpg') as kill, \
+        with patch('codex_runner.subprocess.Popen', return_value=proc), \
+             patch('codex_runner.os.killpg') as kill, \
              self.assertRaises(RuntimeError) as error:
             usage.fetch_usage()
         self.assertNotIsInstance(error.exception, BrokenPipeError)
